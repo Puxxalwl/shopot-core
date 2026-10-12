@@ -1,0 +1,7 @@
+build/
+*.db
+*.db-wal
+*.db-shm
+identity.key
+dl-*/
+.vscode/

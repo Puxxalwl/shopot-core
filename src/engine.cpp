@@ -1,0 +1,288 @@
+#include "engine_impl.hpp"
+
+#include "transport/rtc.hpp"
+
+#include <nlohmann/json.hpp>
+#include <sodium.h>
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+
+namespace shopot {
+
+namespace {
+std::int64_t now_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+} // namespace
+
+Message Engine::Impl::to_public(const MessageRow& m) {
+  Message out;
+  out.id = m.id;
+  out.contact_id = m.contact_id;
+  out.outgoing = m.outgoing;
+  out.ts = m.ts;
+  out.status = m.status;
+  switch (m.kind) {
+    case MsgKind::Text:
+      out.kind = MsgKind::Text;
+      out.text = m.body;
+      break;
+    case MsgKind::File:
+    case MsgKind::Voice: {
+      out.kind = m.kind;
+      try {
+        const auto j = nlohmann::json::parse(m.body);
+        out.file_id = j.value("file", "");
+        out.file_name = j.value("name", "");
+        out.mime = j.value("mime", "");
+        out.file_size = j.value("size", 0ULL);
+      } catch (...) {
+      }
+      break;
+    }
+  }
+  return out;
+}
+
+FileProgress Engine::Impl::file_progress_of(const FileRow& f) {
+  FileProgress p;
+  p.file_id = f.id;
+  p.contact_id = f.contact_id;
+  p.total_bytes = f.size;
+  const double frac = f.total_chunks ? double(f.received_chunks) / f.total_chunks : 0.0;
+  p.done_bytes = std::min<std::uint64_t>(f.size, std::uint64_t(frac * f.size));
+  p.incoming = !f.outgoing;
+  p.finished = f.state == FileState::Done;
+  return p;
+}
+
+// ------------------------------------------------------------------ Engine
+
+std::string Engine::generate_mnemonic() {
+  crypto::init();
+  return crypto::mnemonic_generate();
+}
+
+bool Engine::validate_mnemonic(const std::string& phrase) {
+  crypto::init();
+  return crypto::mnemonic_validate(phrase);
+}
+
+Engine::Engine(Config cfg, const std::string& mnemonic, Events events) {
+  crypto::init();
+  if (!crypto::mnemonic_validate(mnemonic))
+    throw std::invalid_argument("invalid mnemonic");
+  impl_ = std::make_unique<Impl>(std::move(cfg), mnemonic, std::move(events));
+}
+
+Engine::~Engine() = default;
+
+std::string Engine::my_bundle() const { return impl_->id.bundle_b64(); }
+std::string Engine::my_fingerprint() const { return impl_->id.fingerprint(); }
+
+std::int64_t Engine::add_contact(const std::string& bundle, const std::string& name) {
+  crypto::Arr<32> enc, sign;
+  if (!crypto::Identity::bundle_parse(bundle, enc, sign))
+    throw std::invalid_argument("bad contact bundle");
+  if (enc == impl_->id.enc_pk) throw std::invalid_argument("cannot add yourself");
+  return impl_->db.add_contact(enc, sign, name);
+}
+
+std::vector<Contact> Engine::contacts() const {
+  std::vector<Contact> out;
+  for (const ContactRow& r : impl_->db.contacts()) {
+    Contact c;
+    c.id = r.id;
+    c.name = r.name;
+    std::array<std::uint8_t, 64> raw{};
+    std::memcpy(raw.data(), r.enc_pk.data(), 32);
+    std::memcpy(raw.data() + 32, r.sign_pk.data(), 32);
+    c.bundle = crypto::b64e(raw.data(), raw.size());
+    c.fingerprint = crypto::Identity::fingerprint_of(r.enc_pk, r.sign_pk);
+    std::lock_guard lk(impl_->mu_);
+    auto it = impl_->sessions_.find(r.id);
+    c.online = it != impl_->sessions_.end() && it->second->established();
+    out.push_back(std::move(c));
+  }
+  return out;
+}
+
+void Engine::rename_contact(std::int64_t contact_id, const std::string& name) {
+  impl_->db.rename_contact(contact_id, name);
+}
+
+void Engine::remove_contact(std::int64_t contact_id) {
+  {
+    std::lock_guard lk(impl_->mu_);
+    if (auto it = impl_->sessions_.find(contact_id); it != impl_->sessions_.end()) {
+      it->second->stop();
+      impl_->sessions_.erase(it);
+    }
+  }
+  impl_->db.remove_contact(contact_id);
+}
+
+// ------------------------------------------------------------------ signaling
+
+std::string Engine::make_offer(std::int64_t contact_id) {
+#ifdef SHOPOT_WITH_RTC
+  auto ch = rtc_make_offer(impl_->cfg.stun_server);
+  std::string code = ch->local_code();
+  impl_->attach_channel(contact_id, std::move(ch));
+  return code;
+#else
+  (void)contact_id;
+  throw std::runtime_error("built without RTC transport (SHOPOT_WITH_RTC=OFF)");
+#endif
+}
+
+std::string Engine::handle_offer(std::int64_t contact_id, const std::string& offer_code) {
+#ifdef SHOPOT_WITH_RTC
+  auto ch = rtc_make_answer(offer_code, impl_->cfg.stun_server);
+  std::string code = ch->local_code();
+  impl_->attach_channel(contact_id, std::move(ch));
+  return code;
+#else
+  (void)contact_id; (void)offer_code;
+  throw std::runtime_error("built without RTC transport (SHOPOT_WITH_RTC=OFF)");
+#endif
+}
+
+void Engine::handle_answer(std::int64_t contact_id, const std::string& answer_code) {
+#ifdef SHOPOT_WITH_RTC
+  std::lock_guard lk(impl_->mu_);
+  auto it = impl_->sessions_.find(contact_id);
+  if (it == impl_->sessions_.end())
+    throw std::runtime_error("no pending offer for this contact");
+  auto* ch = dynamic_cast<RtcChannel*>(it->second->channel());
+  if (!ch) throw std::runtime_error("pending channel is not RTC");
+  rtc_apply_answer(*ch, answer_code);
+#else
+  (void)contact_id; (void)answer_code;
+  throw std::runtime_error("built without RTC transport (SHOPOT_WITH_RTC=OFF)");
+#endif
+}
+
+void Engine::disconnect(std::int64_t contact_id) {
+  std::lock_guard lk(impl_->mu_);
+  if (auto it = impl_->sessions_.find(contact_id); it != impl_->sessions_.end()) {
+    it->second->stop();
+    impl_->sessions_.erase(it);
+  }
+}
+
+// ------------------------------------------------------------------ messaging
+
+std::string Engine::send_text(std::int64_t contact_id, const std::string& text) {
+  if (!impl_->db.contact(contact_id)) throw std::invalid_argument("unknown contact");
+  const std::string msg_id = crypto::new_id();
+
+  MessageRow m;
+  m.id = msg_id;
+  m.contact_id = contact_id;
+  m.outgoing = true;
+  m.kind = MsgKind::Text;
+  m.ts = now_ms();
+  m.status = MsgStatus::Queued;
+  m.body = text;
+  impl_->db.put_message(m);
+
+  const nlohmann::json j = {{"t", "text"}, {"id", msg_id}, {"ts", m.ts}, {"body", text}};
+  const std::string s = j.dump();
+  impl_->db.outbox_put(msg_id, contact_id, crypto::Bytes(s.begin(), s.end()));
+
+  if (auto s2 = impl_->established_session(contact_id)) s2->kick();
+  return msg_id;
+}
+
+std::string Engine::send_file(std::int64_t contact_id, const std::string& path,
+                              const std::string& mime, MsgKind kind) {
+  if (!impl_->db.contact(contact_id)) throw std::invalid_argument("unknown contact");
+  if (kind == MsgKind::Text) kind = MsgKind::File;
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in) throw std::runtime_error("cannot open file: " + path);
+  const std::uint64_t size = static_cast<std::uint64_t>(in.tellg());
+  in.seekg(0);
+
+  crypto_hash_sha256_state hst;
+  crypto_hash_sha256_init(&hst);
+  std::vector<char> buf(1 << 20);
+  while (in) {
+    in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+    const auto got = in.gcount();
+    if (got > 0) crypto_hash_sha256_update(&hst, reinterpret_cast<const std::uint8_t*>(buf.data()),
+                                           static_cast<std::size_t>(got));
+  }
+  crypto::Arr<32> hash;
+  crypto_hash_sha256_final(&hst, hash.data());
+
+  const std::string msg_id = crypto::new_id();
+  const std::string file_id = crypto::new_id();
+  const std::uint32_t total = std::max<std::uint32_t>(
+      1, static_cast<std::uint32_t>((size + kChunkSize - 1) / kChunkSize));
+  const std::string name = std::filesystem::path(path).filename().string();
+  const bool voice = kind == MsgKind::Voice;
+  const std::int64_t ts = now_ms();
+
+  FileRow f;
+  f.id = file_id;
+  f.msg_id = msg_id;
+  f.contact_id = contact_id;
+  f.outgoing = true;
+  f.voice = voice;
+  f.name = name;
+  f.mime = mime;
+  f.size = size;
+  f.hash = hash;
+  f.total_chunks = total;
+  f.state = FileState::Sending;
+  f.local_path = path;
+  impl_->db.file_put(f);
+
+  const nlohmann::json meta = {{"t", "file"},   {"id", msg_id}, {"ts", ts},
+                               {"file", file_id}, {"name", name}, {"mime", mime},
+                               {"size", size},    {"total", total},
+                               {"hash", crypto::b64e(hash.data(), hash.size())},
+                               {"voice", voice}};
+
+  MessageRow m;
+  m.id = msg_id;
+  m.contact_id = contact_id;
+  m.outgoing = true;
+  m.kind = voice ? MsgKind::Voice : MsgKind::File;
+  m.ts = ts;
+  m.status = MsgStatus::Queued;
+  m.body = meta.dump();
+  impl_->db.put_message(m);
+
+  const std::string s = meta.dump();
+  impl_->db.outbox_put(msg_id, contact_id, crypto::Bytes(s.begin(), s.end()));
+
+  if (auto s2 = impl_->established_session(contact_id)) s2->kick();
+  return msg_id;
+}
+
+std::vector<Message> Engine::history(std::int64_t contact_id, std::size_t limit,
+                                     std::int64_t before_ts) const {
+  std::vector<Message> out;
+  for (const MessageRow& m : impl_->db.history(contact_id, limit, before_ts))
+    out.push_back(Impl::to_public(m));
+  return out;
+}
+
+void Engine::wipe() {
+  {
+    std::lock_guard lk(impl_->mu_);
+    for (auto& [cid, s] : impl_->sessions_) s->stop();
+    impl_->sessions_.clear();
+  }
+  impl_->db.wipe();
+}
+
+} // namespace shopot
