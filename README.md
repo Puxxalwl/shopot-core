@@ -113,6 +113,13 @@ auto hist  = engine.history(cid, 50);           // newest first
 All callbacks fire on one serialized dispatcher thread. All API calls are
 thread-safe.
 
+## Documentation
+
+- [docs/PROTOCOL.md](docs/PROTOCOL.md) — full wire protocol v1 spec (interoperable reimplementations)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — modules, threading, data flow, porting guide
+- [SECURITY.md](SECURITY.md) — reporting, crypto inventory, hardening
+- [CONTRIBUTING.md](CONTRIBUTING.md) — build, ground rules, PRs
+
 ## Protocol (v1)
 
 | layer      | choice                                                        |
