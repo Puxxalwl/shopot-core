@@ -62,7 +62,34 @@ cmake --build build -j
 Options: `SHOPOT_WITH_RTC=OFF` (core only, transport-agnostic),
 `SHOPOT_BUILD_CLI=OFF`, `SHOPOT_BUILD_TESTS=OFF`.
 
+## Download (no compiler needed)
+
+Ready-made binaries are attached to each
+[GitHub release](https://github.com/Puxxalwl/shopot-core/releases) — Linux x64
+and macOS arm64, built by CI on every version tag. Unpack and run:
+
+```bash
+tar xzf shopot-cli-linux-x64.tar.gz && ./shopot-cli-linux-x64/shopot-cli
+```
+
 ## Try it: two terminals
+
+In a real terminal `shopot-cli` opens the full-screen chat interface —
+contact list, scrolling history with day marks, delivery ticks (✓ sent,
+✓✓ delivered, … queued), photo/file/voice cards with live progress bars,
+attachment field (Ctrl+O), one-command invites. Pipes/scripts get the classic
+line REPL automatically (`--plain` forces it anywhere).
+
+```bash
+./build/shopot-cli --db alice.db --dl dl-alice   # pick "new", write down words
+./build/shopot-cli --db bob.db   --dl dl-bob     # same
+```
+
+TUI keys: **Tab** — switch chat · **↑↓ / PgUp / PgDn / wheel** — history ·
+**Ctrl+O** — attach file or photo · **/invite**, **/addi**, **/fp**, **/auto**,
+**/voice <path>**, **/help**, **/quit**.
+
+The same flow through the plain REPL:
 
 ```bash
 ./build/shopot-cli --db alice.db --dl dl-alice   # pick "new", write down words

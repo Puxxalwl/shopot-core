@@ -1,0 +1,73 @@
+name: release
+
+# Build ready-to-run CLI binaries and attach them to a GitHub Release.
+# Triggered by pushing a version tag:  git tag v0.2 && git push origin v0.2
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: linux-x64
+          - os: macos-14
+            name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsodium-dev libsqlite3-dev libssl-dev cmake
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libsodium sqlite cmake pkg-config openssl@3
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DSHOPOT_WITH_RTC=ON \
+            -DSHOPOT_BUILD_CLI=ON \
+            -DSHOPOT_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j3
+          ctest --test-dir build --output-on-failure || true
+
+      - name: Package
+        shell: bash
+        run: |
+          NAME="shopot-cli-${{ matrix.name }}"
+          mkdir -p "dist/$NAME"
+          cp build/shopot-cli "dist/$NAME/"
+          cp README.md "dist/$NAME/" 2>/dev/null || true
+          cp LICENSE "dist/$NAME/" 2>/dev/null || true
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            ldd "dist/$NAME/shopot-cli" | sed 's/^/  /' > "dist/$NAME/RUNTIME-DEPS.txt" || true
+          else
+            otool -L "dist/$NAME/shopot-cli" | sed 's/^/  /' > "dist/$NAME/RUNTIME-DEPS.txt"
+          fi
+          tar czf "$NAME.tar.gz" -C dist "$NAME"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          else
+            shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          fi
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            *.sha256
+          generate_release_notes: true

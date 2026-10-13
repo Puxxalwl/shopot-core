@@ -51,8 +51,15 @@ if(SHOPOT_WITH_RTC)
 endif()
 
 if(SHOPOT_BUILD_CLI AND SHOPOT_WITH_RTC)
-  add_executable(shopot-cli cli/main.cpp)
-  target_link_libraries(shopot-cli PRIVATE shopot-core)
+  FetchContent_Declare(ftxui
+    GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
+    GIT_TAG v5.0.0
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(ftxui)
+  add_executable(shopot-cli cli/main.cpp cli/plain.cpp cli/tui.cpp)
+  target_link_libraries(shopot-cli PRIVATE shopot-core
+    ftxui::component ftxui::dom ftxui::screen)
+  target_compile_options(shopot-cli PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 if(SHOPOT_BUILD_TESTS)
