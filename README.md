@@ -122,6 +122,7 @@ thread-safe.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — modules, threading, data flow, porting guide
 - [SECURITY.md](SECURITY.md) — reporting, crypto inventory, hardening
 - [CONTRIBUTING.md](CONTRIBUTING.md) — build, ground rules, PRs
+- [scripts/](scripts/) — one-command end-to-end runs: manual codes and automatic rendezvous
 
 ## Protocol (v2)
 
