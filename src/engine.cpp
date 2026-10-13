@@ -138,16 +138,28 @@ void Engine::remove_contact(std::int64_t contact_id) {
 // ------------------------------------------------------------------ signaling
 
 #ifdef SHOPOT_WITH_RTC
-std::string Engine::Impl::rtc_offer(std::int64_t contact_id) {
+std::string Engine::Impl::rtc_offer(std::int64_t contact_id, const std::string& sid) {
   auto ch = rtc_make_offer(cfg.stun_server);
   std::string code = ch->local_code();
+  // stamp a per-search session id into the code: retained relay traffic from
+  // older, already-dead searches must never be answered or applied
+  auto j = nlohmann::json::parse(crypto::b64d(code));
+  j["sid"] = sid;
+  const std::string s = j.dump();
+  code = crypto::b64e(reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
   attach_channel(contact_id, std::move(ch));
   return code;
 }
 
 std::string Engine::Impl::rtc_answer(std::int64_t contact_id, const std::string& offer_code) {
+  const auto off = nlohmann::json::parse(crypto::b64d(offer_code));
+  const std::string sid = off.value("sid", "");
   auto ch = rtc_make_answer(offer_code, cfg.stun_server);
   std::string code = ch->local_code();
+  auto j = nlohmann::json::parse(crypto::b64d(code));
+  j["sid"] = sid;  // echo: lets the initiator drop answers to stale offers
+  const std::string s = j.dump();
+  code = crypto::b64e(reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
   attach_channel(contact_id, std::move(ch));
   return code;
 }
@@ -165,7 +177,7 @@ void Engine::Impl::rtc_apply(std::int64_t contact_id, const std::string& answer_
 
 std::string Engine::make_offer(std::int64_t contact_id) {
 #ifdef SHOPOT_WITH_RTC
-  return impl_->rtc_offer(contact_id);
+  return impl_->rtc_offer(contact_id, crypto::new_id());
 #else
   (void)contact_id;
   throw std::runtime_error("built without RTC transport (SHOPOT_WITH_RTC=OFF)");
@@ -198,18 +210,159 @@ void Engine::connect_auto(std::int64_t contact_id, std::int64_t timeout_ms) {
     throw std::runtime_error("automatic rendezvous disabled: Config::relays is empty");
   {
     std::lock_guard lk(impl_->mu_);
+    if (impl_->auto_inflight_.count(contact_id)) return;  // a search is already running
     // reap finished workers so the vector cannot grow unbounded
     impl_->auto_workers_.erase(
         std::remove_if(impl_->auto_workers_.begin(), impl_->auto_workers_.end(),
                        [](std::thread& t) { return !t.joinable(); }),
         impl_->auto_workers_.end());
-    impl_->auto_workers_.emplace_back(
-        [impl = impl_.get(), contact_id, timeout_ms] { impl->auto_connect(contact_id, timeout_ms); });
+    impl_->auto_workers_.emplace_back([impl = impl_.get(), contact_id, timeout_ms] {
+      impl->auto_connect(contact_id, timeout_ms);
+      {
+        std::lock_guard lk(impl->mu_);
+        impl->auto_inflight_.erase(contact_id);
+      }
+    });
+    impl_->auto_inflight_.insert(contact_id);
   }
 #else
   (void)timeout_ms;
   throw std::runtime_error("built without RTC transport (SHOPOT_WITH_RTC=OFF)");
 #endif
+}
+
+std::string Engine::make_invite() {
+  crypto::Arr<16> secret{};
+  randombytes_buf(secret.data(), secret.size());
+  impl_->db.invite_put(secret);
+  return signal::make_invite_code(impl_->id.enc_pk, impl_->id.sign_pk, secret);
+}
+
+std::int64_t Engine::accept_invite(const std::string& code, const std::string& name) {
+  const auto p = signal::parse_invite_code(code);
+  if (p.sign_pk == impl_->id.sign_pk) throw std::invalid_argument("that invite is your own");
+  std::string final_name = name;
+  if (final_name.empty())
+    final_name = "friend-" + crypto::Identity::fingerprint_of(p.enc_pk, p.sign_pk).substr(0, 8);
+  const std::int64_t cid = impl_->db.add_contact(p.enc_pk, p.sign_pk, final_name);
+  impl_->db.contact_invite_secret_set(cid, p.secret);
+  return cid;
+}
+
+void Engine::listen_invites(std::int64_t timeout_ms) {
+#ifdef SHOPOT_WITH_RTC
+  if (impl_->cfg.relays.empty())
+    throw std::runtime_error("automatic rendezvous disabled: Config::relays is empty");
+  if (impl_->db.invites_unused().empty()) return;  // nothing to listen on
+  if (impl_->invites_inflight_.exchange(true)) return;  // listener already running
+  {
+    std::lock_guard lk(impl_->mu_);
+    impl_->auto_workers_.erase(
+        std::remove_if(impl_->auto_workers_.begin(), impl_->auto_workers_.end(),
+                       [](std::thread& t) { return !t.joinable(); }),
+        impl_->auto_workers_.end());
+    impl_->auto_workers_.emplace_back([impl = impl_.get(), timeout_ms] {
+      impl->listen_invites(timeout_ms);
+      impl->invites_inflight_.store(false);
+    });
+  }
+#else
+  (void)timeout_ms;
+  throw std::runtime_error("built without RTC transport (SHOPOT_WITH_RTC=OFF)");
+#endif
+}
+
+void Engine::Impl::listen_invites(std::int64_t timeout_ms) {
+  const char* ctx = "invite-listen";
+  try {
+#ifdef SHOPOT_WITH_RTC
+    const auto pending = db.invites_unused();
+    if (pending.empty()) return;
+
+    signal::MqttSignaling sig(cfg.relays);
+    if (!sig.ok()) {
+      for (int i = 0; i < 100 && !sig.ok() && !stopping_.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!sig.ok()) {
+      if (ev.on_error) ev.on_error(0, std::string(ctx) + ": no relay reachable");
+      return;
+    }
+
+    // topic -> invite index
+    std::vector<std::pair<std::string, std::size_t>> topics;
+    topics.reserve(pending.size());
+    for (std::size_t i = 0; i < pending.size(); ++i)
+      topics.emplace_back(signal::invite_topic_for(id.sign_pk, pending[i].secret), i);
+    for (const auto& [t, i] : topics) sig.subscribe(t);
+    if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
+      std::fprintf(stderr, "[signal] listening on %zu invite topic(s)\n", topics.size());
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    std::vector<bool> done(pending.size(), false);
+    while (!stopping_.load() && std::chrono::steady_clock::now() < deadline) {
+      bool all_done = true;
+      for (bool f : done) all_done = all_done && f;
+      if (all_done) return;
+
+      for (const auto& [t, p] : sig.poll(200)) {
+        std::size_t idx = pending.size();
+        for (const auto& [topic, i] : topics)
+          if (topic == t && !done[i]) idx = i;
+        if (idx == pending.size()) continue;
+        try {
+          const auto j = nlohmann::json::parse(
+              signal::open_code(signal::invite_key_for(pending[idx].secret), p,
+                                signal::kInviteMaxAgeSeconds));
+          if (j.value("t", "") != "join") continue;
+          crypto::Arr<32> jenc{}, jsign{};
+          if (!crypto::Identity::bundle_parse(j.value("bundle", ""), jenc, jsign)) continue;
+          if (jsign == id.sign_pk) continue;  // someone echoing our own bundle
+
+          // duplicate join (idempotent re-bond) or a brand-new peer?
+          std::int64_t cid = 0;
+          std::string name;
+          for (const auto& row : db.contacts()) {
+            if (row.sign_pk == jsign) {
+              cid = row.id;
+              name = row.name;
+              break;
+            }
+          }
+          if (cid == 0) {
+            name = "friend-" + crypto::Identity::fingerprint_of(jenc, jsign).substr(0, 8);
+            cid = db.add_contact(jenc, jsign, name);
+          }
+          if (!db.invite_bind(pending[idx].id, cid)) continue;  // invite already bound
+
+          const std::string welcome = std::string("{\"t\":\"welcome\",\"bundle\":\"") +
+                                      id.bundle_b64() + "\",\"ts\":" +
+                                      std::to_string(signal::now_unix_s()) + "}";
+          sig.publish(t, signal::seal_code_ts(signal::invite_key_for(pending[idx].secret), welcome,
+                                              signal::now_unix_s()));
+          sig.flush_pending(5000);  // the welcome MUST leave before we move on
+          done[idx] = true;
+          if (ev.on_contact_added) dispatch([this, cid, name] { ev.on_contact_added(cid, name); });
+          if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
+            std::fprintf(stderr, "[signal] invite redeemed by contact %lld\n", (long long)cid);
+
+          // both sides know both bundles now — straight into the normal dance
+          if (!established_session(cid))
+            auto_connect(cid, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  deadline - std::chrono::steady_clock::now())
+                                  .count());
+        } catch (...) {
+        }  // stale/tampered/foreign join: ignore
+      }
+    }
+#else
+    (void)timeout_ms; (void)ctx;
+#endif
+  } catch (const std::exception& e) {
+#ifdef SHOPOT_WITH_RTC
+    if (ev.on_error) ev.on_error(0, std::string(ctx) + ": " + e.what());
+#endif
+  }
 }
 
 void Engine::Impl::auto_connect(std::int64_t contact_id, std::int64_t timeout_ms) {
@@ -223,9 +376,6 @@ void Engine::Impl::auto_connect(std::int64_t contact_id, std::int64_t timeout_ms
     const std::string topic = signal::topic_for(room);
     const crypto::Arr<32> key = signal::key_for(room);
     const bool initiator = id.sign_pk < c->sign_pk;
-    if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
-      std::fprintf(stderr, "[signal] role=%s topic=%.16s...\n", initiator ? "initiator" : "responder",
-                   topic.c_str());
 
     signal::MqttSignaling sig(cfg.relays);
     if (!sig.ok()) {  // the worker may still be dialing the first relay
@@ -236,14 +386,64 @@ void Engine::Impl::auto_connect(std::int64_t contact_id, std::int64_t timeout_ms
       if (ev.on_error) ev.on_error(contact_id, std::string(ctx) + ": no relay reachable");
       return;
     }
-    sig.subscribe(topic);
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    // ---- invite prelude (acceptor side): bond over the invite topic first;
+    // the inviter does not know our bundle until our sealed join arrives.
+    if (const auto pending = db.contact_invite_secret(contact_id)) {
+      const std::string it = signal::invite_topic_for(c->sign_pk, *pending);
+      const crypto::Arr<32> ikey = signal::invite_key_for(*pending);
+      sig.subscribe(it);
+      if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
+        std::fprintf(stderr, "[signal] redeeming invite on %.16s...\n", it.c_str());
+      auto next_pub = std::chrono::steady_clock::time_point::min();
+      bool welcomed = established_session(contact_id) != nullptr;
+      while (!stopping_.load() && !welcomed && std::chrono::steady_clock::now() < deadline) {
+        for (const auto& [t, p] : sig.poll(100)) {
+          (void)t;
+          try {
+            const auto j = nlohmann::json::parse(
+                signal::open_code(ikey, p, signal::kInviteMaxAgeSeconds));
+            if (j.value("t", "") != "welcome") continue;
+            crypto::Arr<32> wenc{}, wsign{};
+            if (!crypto::Identity::bundle_parse(j.value("bundle", ""), wenc, wsign) ||
+                wsign != c->sign_pk)
+              continue;  // not our inviter
+            welcomed = true;
+          } catch (...) {
+          }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!welcomed && now >= next_pub) {  // re-seal: fresh ts each attempt
+          const std::string join = std::string("{\"t\":\"join\",\"bundle\":\"") +
+                                   id.bundle_b64() + "\",\"ts\":" +
+                                   std::to_string(signal::now_unix_s()) + "}";
+          sig.publish(it, signal::seal_code_ts(ikey, join, signal::now_unix_s()));
+          next_pub = now + std::chrono::seconds(10);
+        }
+      }
+      if (!welcomed) {
+        if (ev.on_error)
+          ev.on_error(contact_id, std::string(ctx) + ": inviter not reached (invite stays pending)");
+        return;  // the secret stays pending: the next auto retries
+      }
+      db.contact_invite_secret_clear(contact_id);
+      if (std::getenv("SHOPOT_SIGNAL_DEBUG")) std::fprintf(stderr, "[signal] invite redeemed\n");
+    }
+
+    const std::string role_trace =
+        std::string("role=") + (initiator ? "initiator" : "responder");
+    if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
+      std::fprintf(stderr, "[signal] %s topic=%.16s...\n", role_trace.c_str(), topic.c_str());
+    sig.subscribe(topic);
+
     auto next_pub = std::chrono::steady_clock::time_point::min();
 
     if (initiator) {
-      const std::string offer = rtc_offer(contact_id);
+      const std::string sid = crypto::new_id();  // this search generation
+      const std::string offer = rtc_offer(contact_id, sid);
       if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
         std::fprintf(stderr, "[signal] offer ready (%zu B)\n", offer.size());
       while (!stopping_.load() && std::chrono::steady_clock::now() < deadline) {
@@ -254,6 +454,7 @@ void Engine::Impl::auto_connect(std::int64_t contact_id, std::int64_t timeout_ms
             const std::string code = signal::open_code(key, p);
             const auto j = nlohmann::json::parse(crypto::b64d(code));
             if (j.value("type", "") != "answer") continue;
+            if (j.value("sid", "") != sid) continue;  // answer to a dead offer
             if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
               std::fprintf(stderr, "[signal] answer accepted, applying\n");
             rtc_apply(contact_id, code);

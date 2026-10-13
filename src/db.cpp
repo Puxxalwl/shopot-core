@@ -40,6 +40,14 @@ Db::Db(const std::string& path, const crypto::Arr<32>& storage_key) : key_(stora
   exec("PRAGMA synchronous=NORMAL;");
   exec("PRAGMA foreign_keys=ON;");
   exec(R"SQL(
+CREATE TABLE IF NOT EXISTS invites(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  secret BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0,
+  contact_id INTEGER NOT NULL DEFAULT 0);
+)SQL");
+  exec(R"SQL(
 CREATE TABLE IF NOT EXISTS meta(
   k TEXT PRIMARY KEY,
   v BLOB NOT NULL);
@@ -84,6 +92,12 @@ CREATE TABLE IF NOT EXISTS chunks(
   data BLOB NOT NULL,
   PRIMARY KEY(file_id, idx));
 )SQL");
+  try {
+    // migration (after schema): invites ride on contacts until the first
+    // rendezvous. ALTER fails on a column that already exists - fine.
+    exec("ALTER TABLE contacts ADD COLUMN invite_secret BLOB");
+  } catch (...) {
+  }
 }
 
 Db::~Db() {
@@ -221,6 +235,81 @@ void Db::remove_contact(std::int64_t id) {
     sqlite3_bind_int64(st.p, 1, id);
     sqlite3_step(st.p);
   }
+}
+
+// ------------------------------------------------------------------ invites
+
+void Db::invite_put(const crypto::Arr<16>& secret) {
+  const crypto::Bytes sealed = seal_col(secret.data(), secret.size());
+  Stmt st;
+  sqlite3_prepare_v2(db_, "INSERT INTO invites(secret,created_at) VALUES(?,?)", -1, &st.p, nullptr);
+  bind_blob(st.p, 1, sealed.data(), sealed.size());
+  sqlite3_bind_int64(st.p, 2, now_ms());
+  if (sqlite3_step(st.p) != SQLITE_DONE) throw std::runtime_error("invite_put failed");
+}
+
+std::vector<InviteRow> Db::invites_unused() {
+  Stmt st;
+  sqlite3_prepare_v2(db_, "SELECT id,secret,created_at FROM invites WHERE used=0 ORDER BY id", -1,
+                     &st.p, nullptr);
+  std::vector<InviteRow> out;
+  while (sqlite3_step(st.p) == SQLITE_ROW) {
+    InviteRow r;
+    r.id = sqlite3_column_int64(st.p, 0);
+    const auto* sb = static_cast<const std::uint8_t*>(sqlite3_column_blob(st.p, 1));
+    const int sn = sqlite3_column_bytes(st.p, 1);
+    const crypto::Bytes plain = open_col(crypto::Bytes(sb, sb + sn));
+    if (plain.size() == 16) std::memcpy(r.secret.data(), plain.data(), 16);
+    r.created_at = sqlite3_column_int64(st.p, 2);
+    r.used = false;
+    out.push_back(std::move(r));
+  }
+  return out;
+}
+
+bool Db::invite_bind(std::int64_t invite_id, std::int64_t contact_id) {
+  Stmt st;
+  sqlite3_prepare_v2(db_, "UPDATE invites SET used=1,contact_id=? WHERE id=? AND used=0", -1,
+                     &st.p, nullptr);
+  sqlite3_bind_int64(st.p, 1, contact_id);
+  sqlite3_bind_int64(st.p, 2, invite_id);
+  return sqlite3_step(st.p) == SQLITE_DONE && sqlite3_changes(db_) > 0;
+}
+
+void Db::contact_invite_secret_set(std::int64_t contact_id, const crypto::Arr<16>& secret) {
+  const crypto::Bytes sealed = seal_col(secret.data(), secret.size());
+  Stmt st;
+  sqlite3_prepare_v2(db_, "UPDATE contacts SET invite_secret=? WHERE id=?", -1, &st.p, nullptr);
+  bind_blob(st.p, 1, sealed.data(), sealed.size());
+  sqlite3_bind_int64(st.p, 2, contact_id);
+  sqlite3_step(st.p);
+}
+
+std::optional<crypto::Arr<16>> Db::contact_invite_secret(std::int64_t contact_id) {
+  Stmt st;
+  sqlite3_prepare_v2(db_, "SELECT invite_secret FROM contacts WHERE id=?", -1, &st.p, nullptr);
+  sqlite3_bind_int64(st.p, 1, contact_id);
+  if (sqlite3_step(st.p) != SQLITE_ROW) return std::nullopt;
+  if (sqlite3_column_type(st.p, 0) == SQLITE_NULL) return std::nullopt;
+  const auto* sb = static_cast<const std::uint8_t*>(sqlite3_column_blob(st.p, 0));
+  const int sn = sqlite3_column_bytes(st.p, 0);
+  if (sn <= 0) return std::nullopt;
+  try {
+    const crypto::Bytes plain = open_col(crypto::Bytes(sb, sb + sn));
+    if (plain.size() != 16) return std::nullopt;
+    crypto::Arr<16> secret{};
+    std::memcpy(secret.data(), plain.data(), 16);
+    return secret;
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+void Db::contact_invite_secret_clear(std::int64_t contact_id) {
+  Stmt st;
+  sqlite3_prepare_v2(db_, "UPDATE contacts SET invite_secret=NULL WHERE id=?", -1, &st.p, nullptr);
+  sqlite3_bind_int64(st.p, 1, contact_id);
+  sqlite3_step(st.p);
 }
 
 // ------------------------------------------------------------------ messages

@@ -75,6 +75,11 @@ are format-identical and interchangeable.
 
 - Roles are deterministic: the side with the bytewise-smaller `sign` key
   publishes an `offer`, the other responds with an `answer`.
+- Every offer carries a random `sid` (session id) stamped into its code; the
+  answer echoes it. An initiator accepts only the answer whose `sid` matches
+  its CURRENT search — retained answers to older, dead searches are dropped.
+  This keeps repeated rendezvous rounds (auto-reconnect) free of zombie
+  offer/answer pairings.
 - Payloads are published retained and re-sealed (fresh `ts`) every 10 s
   while waiting, so a peer arriving late gets a usable offer instantly.
 - Receivers reject payloads older than 120 s, foreign-room payloads
@@ -87,6 +92,41 @@ that two IPs published/subscribed to the same topic around the same time —
 the same level of metadata a STUN server sees. It cannot read, forge or
 correlate the traffic to any identity. Relays are configurable; an empty
 relay list disables automatic discovery and manual codes keep working.
+
+### Signaling (invites — one-way onboarding)
+
+An invite replaces the two-way bundle exchange: only ONE string ever changes
+hands, and the acceptor's bundle travels sealed over the rendezvous.
+
+```
+code   = "shopot://i/" ‖ b64url( enc_pk(32) ‖ sign_pk(32) ‖ secret(16) )
+topic  = hex( SHA-256("shopot-invite-v1" ‖ inviter_sign_pk ‖ secret)[0..16] )
+skey   = HKDF-SHA256(ikm=secret, salt="shopot-invite-v1")
+```
+
+The `secret` is a **capability**: topic and key derive from it, so only the
+holder of the code can find the room or speak in it. Knowing someone's public
+bundle alone reveals nothing about their invites. Codes are one-shot (the
+inviter marks them used on first redemption), revocable (delete = stop
+listening), and regenerable.
+
+Redemption, over the invite topic with the same sealed `ts ‖ AEAD` framing:
+
+```json
+acceptor -> {"t":"join",    "bundle":"<acceptor bundle>", "ts":unix}
+inviter  -> {"t":"welcome", "bundle":"<inviter bundle>",  "ts":unix}
+```
+
+- Freshness window for invite payloads is 30 days (not 120 s): a join may sit
+  retained until the inviter next comes online, so the ADD step works fully
+  offline; only the P2P session still needs both sides running.
+- The acceptor verifies the welcome is signed under the `sign` key already
+  bound in the invite; the inviter refuses a join echoing its own bundle and
+  refuses re-binding a used invite.
+- After `welcome` both sides know both bundles, derive the normal room
+  topic and fall through to the standard rendezvous dance.
+- What a relay learns: an unguessable topic hash, a sealed blob, timing. The
+  invite secret never reaches it.
 
 ## 3. Framing
 

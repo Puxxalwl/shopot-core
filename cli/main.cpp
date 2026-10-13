@@ -10,7 +10,9 @@
 // itself; delete that file to require the words on every start.
 #include "shopot/shopot.hpp"
 
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -18,6 +20,7 @@
 #include <mutex>
 #include <sstream>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -61,7 +64,10 @@ void print_help() {
   fp                          show your safety number
   contacts                    list contacts (* = online)
   add <name> <bundle>         add a contact
-  auto <id>                   automatic connect via public relay (both sides)
+  invite                      one-time invite code (share with one person)
+  addi <code> [name]          accept someone's invite
+  auto [id]                   connect: with id - that peer, without - redeem
+                              invites + connect all offline contacts
   offer <id>                  create a connection code for contact
   answer <id> <code>          accept their code, prints yours to send back
   accept <id> <code>          complete the connection with their answer
@@ -135,11 +141,31 @@ int main(int argc, char** argv) {
   ev.on_error = [](std::int64_t cid, const std::string& e) {
     say("[" + std::to_string(cid) + "] error: " + e);
   };
+  ev.on_contact_added = [](std::int64_t cid, const std::string& name) {
+    say("new contact from invite: id=" + std::to_string(cid) + " (" + name + ")" +
+        "  - connect with: auto " + std::to_string(cid));
+  };
 
   shopot::Engine engine(cfg, mnemonic, ev);
   say("shopot-cli ready. your bundle: " + engine.my_bundle());
   print_help();
   std::cout << "> " << std::flush;
+
+  // background keeper: keep searching for offline peers while the CLI runs,
+  // so exit/re-enter with the same DB is enough for queued messages to flush.
+  std::atomic<bool> keeper_run{true};
+  std::thread keeper([&engine, &keeper_run] {
+    while (keeper_run.load()) {
+      try {
+        engine.listen_invites();  // no-op when there are no pending invites
+        for (const auto& c : engine.contacts())
+          if (!c.online) engine.connect_auto(c.id);
+      } catch (...) {
+      }
+      for (int i = 0; i < 100 && keeper_run.load(); ++i)  // 10 s, interruptible
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
 
   std::string line;
   while (std::getline(std::cin, line)) {
@@ -163,6 +189,16 @@ int main(int argc, char** argv) {
         ss >> name >> bundle;
         const auto id = engine.add_contact(bundle, name);
         say("added contact id=" + std::to_string(id));
+      } else if (cmd == "invite") {
+        say("one-time invite code (share with one person):\n" + engine.make_invite());
+      } else if (cmd == "addi") {
+        std::string code, name;
+        ss >> code;
+        std::getline(ss, name);
+        if (!name.empty() && name[0] == ' ') name.erase(0, 1);
+        const auto id = engine.accept_invite(code, name);
+        say("added pending invite as contact id=" + std::to_string(id) +
+            "  - connect with: auto " + std::to_string(id));
       } else if (cmd == "offer") {
         std::int64_t id;
         ss >> id;
@@ -180,9 +216,15 @@ int main(int argc, char** argv) {
         say("answer applied, connecting...");
       } else if (cmd == "auto") {
         std::int64_t id;
-        ss >> id;
-        engine.connect_auto(id);
-        say("searching the peer via relay... (run 'auto' on both sides)");
+        if (ss >> id) {
+          engine.connect_auto(id);
+          say("searching the peer via relay... (run 'auto' on both sides)");
+        } else {
+          engine.listen_invites();  // redeem any pending invites we issued
+          for (const auto& c : engine.contacts())
+            if (!c.online) engine.connect_auto(c.id);
+          say("searching: pending invites + all offline contacts");
+        }
       } else if (cmd == "msg") {
         std::int64_t id;
         ss >> id;
@@ -223,5 +265,7 @@ int main(int argc, char** argv) {
     }
     std::cout << "> " << std::flush;
   }
+  keeper_run.store(false);
+  keeper.join();
   return 0;
 }

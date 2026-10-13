@@ -85,6 +85,9 @@ struct Events {
   std::function<void(std::int64_t contact_id, const Message&, const std::string& local_path)>
       on_file_ready;
   std::function<void(std::int64_t contact_id, const std::string& error)> on_error;
+  /// A pending invite was redeemed: a new contact appeared (name is
+  /// provisional, rename at will). Fired on the inviter's side.
+  std::function<void(std::int64_t contact_id, const std::string& name)> on_contact_added;
 };
 
 // ------------------------------------------------------------------ engine
@@ -139,6 +142,22 @@ public:
   /// runs on a worker for up to timeout_ms; outcome arrives through
   /// on_presence / on_error. Requires non-empty Config::relays.
   void connect_auto(std::int64_t contact_id, std::int64_t timeout_ms = 120000);
+
+  /// --- invites (one-way onboarding) ---------------------------------------
+  /// Generate a one-time invite code: "shopot://i/<bundle + random secret>".
+  /// Whoever holds the code can add THIS side and reach it over the
+  /// rendezvous relay — the holder's own bundle arrives sealed on the first
+  /// connect, so only ONE string ever changes hands. Codes are capabilities:
+  /// treat them like keys, share per-person, regenerate freely.
+  std::string make_invite();
+  /// Accept an invite code from someone else; returns the new contact id.
+  /// The contact starts in "pending invite" state and completes the bond on
+  /// the next connect_auto.
+  std::int64_t accept_invite(const std::string& code, const std::string& name);
+  /// Inviter side: listen on all unused invite topics, redeem any join that
+  /// arrives (adding the contact), then connect to it. Non-blocking worker,
+  /// outcomes via on_contact_added / on_presence / on_error.
+  void listen_invites(std::int64_t timeout_ms = 120000);
 
   // messaging — safe to call while the peer is offline; payloads wait in the
   // encrypted outbox and are flushed automatically when a session establishes.

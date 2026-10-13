@@ -14,6 +14,7 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace shopot {
 
@@ -32,6 +33,8 @@ struct Engine::Impl {
   std::queue<std::function<void()>> eq_;
   std::thread eq_thread_;
   std::vector<std::thread> auto_workers_;  // rendezvous workers, joined in ~Impl
+  std::unordered_set<std::int64_t> auto_inflight_;  // contacts with a live search
+  std::atomic<bool> invites_inflight_{false};       // one invite listener at a time
   std::atomic<bool> stopping_{false};
 
   Impl(Config c, const std::string& mnemonic, Events events)
@@ -118,11 +121,12 @@ struct Engine::Impl {
 
 #ifdef SHOPOT_WITH_RTC
   // programmatic variants of the manual signaling dance (used by connect_auto)
-  std::string rtc_offer(std::int64_t contact_id);
+  std::string rtc_offer(std::int64_t contact_id, const std::string& sid);
   std::string rtc_answer(std::int64_t contact_id, const std::string& offer_code);
   void rtc_apply(std::int64_t contact_id, const std::string& answer_code);
 #endif
   void auto_connect(std::int64_t contact_id, std::int64_t timeout_ms);
+  void listen_invites(std::int64_t timeout_ms);
 
   void attach_channel(std::int64_t contact_id, std::unique_ptr<IChannel> ch) {
     std::lock_guard lk(mu_);

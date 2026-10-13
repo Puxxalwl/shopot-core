@@ -170,6 +170,9 @@ automatic rendezvous adds one more observer: the public relay, which learns
 - [x] **Automatic rendezvous** — both peers press "connect" and find each
       other via public MQTT-over-TLS relays; topic and keys derive from the
       pairwise room hash, so relays see only an opaque hash and a sealed blob
+- [x] One-way invite codes (onboarding with a single string, offline-safe)
+- [x] Automatic reconnect keeper (exit/re-enter with the same db and queued
+      messages flush on their own)
 - [ ] Alternative rendezvous backends: Nostr relays / BitTorrent trackers
       (pluggable `ISignaling` interface is in place)
 - [ ] File transfer resume across sessions (chunk bitmaps already stored)

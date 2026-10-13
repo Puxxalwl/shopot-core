@@ -367,6 +367,50 @@ static void test_signal() {
 
   // truncation: parser waits for more bytes instead of overrunning
   CHECK(signal::mqtt_parse_one(pub.data(), pub.size() - 1, p) == 0);
+
+  // ---- invite codes: capability format ----
+  const auto ienc = crypto::random32();
+  const auto isign = crypto::random32();
+  crypto::Arr<16> isec{};
+  randombytes_buf(isec.data(), isec.size());
+  const std::string icode = signal::make_invite_code(ienc, isign, isec);
+  CHECK(icode.rfind("shopot://i/", 0) == 0);
+  const auto parts = signal::parse_invite_code(icode);
+  CHECK(parts.enc_pk == ienc);
+  CHECK(parts.sign_pk == isign);
+  CHECK(parts.secret == isec);
+  const auto bare = signal::parse_invite_code(icode.substr(11));  // bare form works too
+  CHECK(bare.secret == isec);
+
+  bool ithrew = false;
+  try {
+    signal::parse_invite_code("shopot://i/Tooshort");
+  } catch (...) {
+    ithrew = true;
+  }
+  CHECK(ithrew);  // wrong length is rejected
+
+  // invite topic/key: derived from the secret, deterministic, secret-bound
+  CHECK(signal::invite_topic_for(isign, isec) == signal::invite_topic_for(isign, isec));
+  CHECK(signal::invite_topic_for(isign, isec).size() == 32);
+  crypto::Arr<16> isec2{};
+  randombytes_buf(isec2.data(), isec2.size());
+  CHECK(signal::invite_topic_for(isign, isec) != signal::invite_topic_for(isign, isec2));
+  CHECK(signal::invite_key_for(isec) == signal::invite_key_for(isec));
+  CHECK(signal::invite_key_for(isec) != signal::invite_key_for(isec2));
+
+  // invite payloads tolerate the long redemption window (offline redemption)
+  const auto ikey = signal::invite_key_for(isec);
+  const std::string join = "{\"t\":\"join\"}";
+  const auto fresh = signal::seal_code_ts(ikey, join, signal::now_unix_s() - 86400);
+  CHECK(signal::open_code(ikey, fresh, signal::kInviteMaxAgeSeconds) == join);
+  threw = false;
+  try {
+    signal::open_code(ikey, fresh);  // default 120 s window must reject it
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
 }
 
 // live round-trip against a real public broker; network-gated so CI stays hermetic

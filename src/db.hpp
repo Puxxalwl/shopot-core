@@ -44,6 +44,15 @@ struct OutboxRow {
   crypto::Bytes payload;  // envelope JSON plaintext in memory; sealed at rest
 };
 
+// inviter-side capability: secret binds a "shopot://i/" code until redeemed
+struct InviteRow {
+  std::int64_t id = 0;
+  crypto::Arr<16> secret{};  // plaintext in memory; sealed at rest
+  std::int64_t created_at = 0;
+  bool used = false;
+  std::int64_t contact_id = 0;  // 0 until someone redeems it
+};
+
 enum class FileState : int { Sending = 0, Receiving = 1, Done = 2, Failed = 3 };
 
 struct FileRow {
@@ -81,6 +90,17 @@ public:
   std::optional<ContactRow> contact(std::int64_t id);
   void rename_contact(std::int64_t id, const std::string& name);
   void remove_contact(std::int64_t id);
+
+  // invites (inviter side; secrets sealed)
+  void invite_put(const crypto::Arr<16>& secret);
+  std::vector<InviteRow> invites_unused();
+  bool invite_bind(std::int64_t invite_id, std::int64_t contact_id);  // marks used
+
+  // acceptor side: pending invite secret rides on the contact until first
+  // successful rendezvous, then it is cleared
+  void contact_invite_secret_set(std::int64_t contact_id, const crypto::Arr<16>& secret);
+  std::optional<crypto::Arr<16>> contact_invite_secret(std::int64_t contact_id);
+  void contact_invite_secret_clear(std::int64_t contact_id);
 
   // messages
   void put_message(const MessageRow& m);  // INSERT OR IGNORE (dedupe by id)
