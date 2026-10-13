@@ -40,6 +40,7 @@ jobs:
             -DSHOPOT_WITH_RTC=ON \
             -DSHOPOT_BUILD_CLI=ON \
             -DSHOPOT_BUILD_TESTS=ON \
+            -DSHOPOT_STATIC_DEPS=ON \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j3
           ctest --test-dir build --output-on-failure || true
