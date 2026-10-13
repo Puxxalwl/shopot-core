@@ -36,14 +36,24 @@ jobs:
 
       - name: Build
         run: |
+          set -o pipefail
           cmake -B build \
             -DSHOPOT_WITH_RTC=ON \
             -DSHOPOT_BUILD_CLI=ON \
             -DSHOPOT_BUILD_TESTS=ON \
             -DSHOPOT_STATIC_DEPS=ON \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j3
+            -DCMAKE_BUILD_TYPE=Release 2>&1 | tee /tmp/build.log
+          cmake --build build -j3 2>&1 | tee -a /tmp/build.log
           ctest --test-dir build --output-on-failure || true
+      - name: Dump failure
+        if: failure()
+        run: |
+          {
+            echo '### build errors'
+            echo '```'
+            grep -B4 -A12 -iE 'error|undefined reference' /tmp/build.log | tail -150
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package
         shell: bash

@@ -76,11 +76,22 @@ if(SHOPOT_WITH_RTC)
   if(SHOPOT_STATIC_DEPS AND UNIX AND NOT APPLE)
     find_library(A_SSL NAMES libssl.a)
     find_library(A_CRYPTO NAMES libcrypto.a)
-    if(A_SSL)
-      set_target_properties(OpenSSL::SSL PROPERTIES IMPORTED_LOCATION "${A_SSL}")
+    if(A_SSL AND TARGET OpenSSL::SSL)
+      # config-specific locations (e.g. _RELEASE) would win over the base one
+      set_target_properties(OpenSSL::SSL PROPERTIES
+        IMPORTED_LOCATION "${A_SSL}"
+        IMPORTED_LOCATION_RELEASE "${A_SSL}"
+        IMPORTED_LOCATION_RELWITHDEBINFO "${A_SSL}"
+        IMPORTED_LOCATION_MINSIZEREL "${A_SSL}"
+        IMPORTED_LOCATION_DEBUG "${A_SSL}")
     endif()
-    if(A_CRYPTO)
-      set_target_properties(OpenSSL::Crypto PROPERTIES IMPORTED_LOCATION "${A_CRYPTO}")
+    if(A_CRYPTO AND TARGET OpenSSL::Crypto)
+      set_target_properties(OpenSSL::Crypto PROPERTIES
+        IMPORTED_LOCATION "${A_CRYPTO}"
+        IMPORTED_LOCATION_RELEASE "${A_CRYPTO}"
+        IMPORTED_LOCATION_RELWITHDEBINFO "${A_CRYPTO}"
+        IMPORTED_LOCATION_MINSIZEREL "${A_CRYPTO}"
+        IMPORTED_LOCATION_DEBUG "${A_CRYPTO}")
     endif()
     # a static libssl.a no longer carries its zlib dependency (a .so would
     # have it as DT_NEEDED), so append libz after the OpenSSL archives
