@@ -89,7 +89,13 @@ void Session::wire_callbacks() {
   ch_->set_callbacks(std::move(cbs));
 }
 
-Session::~Session() { stop(); }
+Session::~Session() {
+  stop();
+  // the ratchet wipes itself; the handshake secret only survives pre-establish
+  std::lock_guard lk(mu_);
+  sodium_memzero(eph_sk_.data(), eph_sk_.size());
+  peer_eph_ = {};
+}
 
 void Session::start() {
   wire_callbacks();  // here, not in the ctor: callbacks need a live shared_ptr
@@ -151,7 +157,13 @@ void Session::maybe_establish() {
     std::lock_guard lk(mu_);
     if (established_ || !have_eph_ || !have_peer_eph_) return;
     try {
-      session_key_ = crypto::session_key(eph_sk_, peer_eph_, room_);
+      // v2: the handshake secret becomes the ratchet root; every frame after
+      // this gets its own message key, and the DH keys rotate alternately.
+      const crypto::Arr<32> root = crypto::session_key(eph_sk_, peer_eph_, room_);
+      const crypto::DoubleRatchet::Role role =
+          id_.sign_pk < contact_.sign_pk ? crypto::DoubleRatchet::Role::Initiator
+                                         : crypto::DoubleRatchet::Role::Responder;
+      ratchet_ = crypto::DoubleRatchet::bootstrap(root, role, eph_sk_, peer_eph_);
     } catch (const std::exception& e) {
       if (ev_.error) ev_.error(contact_.id, std::string("key agreement: ") + e.what());
       return;
@@ -161,7 +173,40 @@ void Session::maybe_establish() {
   }
   established_.store(true);
   if (ev_.presence) ev_.presence(contact_.id, true);
-  kick();  // flush outbox + pending files
+  kick();  // flush outbox + pending files (establishment is the only full flush)
+}
+
+// ------------------------------------------------------------------ v2 frames
+// body layout for 0x11/0x12: dh(32) || pn(4BE) || n(4BE) || nonce(24) || ct
+
+crypto::Bytes Session::ratchet_seal(const std::uint8_t* data, std::size_t len) {
+  std::lock_guard lk(mu_);
+  const crypto::DoubleRatchet::Sealed s = ratchet_.encrypt(data, len);
+  crypto::Bytes out;
+  out.reserve(40 + s.body.size());
+  out.insert(out.end(), s.dh.begin(), s.dh.end());
+  for (int b = 3; b >= 0; --b) out.push_back(static_cast<std::uint8_t>(s.pn >> (b * 8)));
+  for (int b = 3; b >= 0; --b) out.push_back(static_cast<std::uint8_t>(s.n >> (b * 8)));
+  out.insert(out.end(), s.body.begin(), s.body.end());
+  return out;
+}
+
+crypto::Bytes Session::ratchet_open(const std::uint8_t* data, std::size_t len) {
+  constexpr std::size_t kHdr = 40;
+  if (len < kHdr + crypto_secretbox_NONCEBYTES + crypto_secretbox_MACBYTES)
+    throw std::runtime_error("frame too short");
+  crypto::Arr<32> dh;
+  std::memcpy(dh.data(), data, 32);
+  const std::uint32_t pn = (static_cast<std::uint32_t>(data[32]) << 24) |
+                           (static_cast<std::uint32_t>(data[33]) << 16) |
+                           (static_cast<std::uint32_t>(data[34]) << 8) |
+                           static_cast<std::uint32_t>(data[35]);
+  const std::uint32_t n = (static_cast<std::uint32_t>(data[36]) << 24) |
+                          (static_cast<std::uint32_t>(data[37]) << 16) |
+                          (static_cast<std::uint32_t>(data[38]) << 8) |
+                          static_cast<std::uint32_t>(data[39]);
+  std::lock_guard lk(mu_);
+  return ratchet_.decrypt(dh, pn, n, data + kHdr, len - kHdr);
 }
 
 // ------------------------------------------------------------------ rx
@@ -185,13 +230,10 @@ void Session::on_channel_message(const std::uint8_t* data, std::size_t len) {
 
 void Session::handle_envelope(const std::uint8_t* data, std::size_t len) {
   crypto::Bytes plain;
-  {
-    std::lock_guard lk(mu_);
-    try {
-      plain = crypto::open(session_key_, data, len);
-    } catch (...) {
-      return;  // forged/corrupt frame: drop silently
-    }
+  try {
+    plain = ratchet_open(data, len);
+  } catch (...) {
+    return;  // forged/corrupt frame or ratchet desync: drop silently
   }
   nlohmann::json j;
   try {
@@ -262,32 +304,30 @@ void Session::handle_envelope(const std::uint8_t* data, std::size_t len) {
 }
 
 void Session::handle_chunk(const std::uint8_t* data, std::size_t len) {
-  // file_id(16) || idx(4BE) || nonce(24) || sealed chunk
-  if (len < 16 + 4 + crypto_secretbox_NONCEBYTES + crypto_secretbox_MACBYTES) return;
+  // v2: the AEAD covers file_id(16) || idx(4BE) || chunk data — tampered
+  // routing fields are rejected by authentication instead of corrupting slots
+  crypto::Bytes plain;
+  try {
+    plain = ratchet_open(data, len);
+  } catch (...) {
+    return;
+  }
+  if (plain.size() < 20 || plain.size() - 20 > kChunkSize) return;
+
   crypto::Arr<16> fid_raw;
-  std::memcpy(fid_raw.data(), data, 16);
-  const std::uint32_t idx = (static_cast<std::uint32_t>(data[16]) << 24) |
-                            (static_cast<std::uint32_t>(data[17]) << 16) |
-                            (static_cast<std::uint32_t>(data[18]) << 8) |
-                            static_cast<std::uint32_t>(data[19]);
+  std::memcpy(fid_raw.data(), plain.data(), 16);
+  const std::uint32_t idx = (static_cast<std::uint32_t>(plain[16]) << 24) |
+                            (static_cast<std::uint32_t>(plain[17]) << 16) |
+                            (static_cast<std::uint32_t>(plain[18]) << 8) |
+                            static_cast<std::uint32_t>(plain[19]);
   const std::string fid = crypto::hex_lower(fid_raw.data(), fid_raw.size());
 
   auto f = db_.file_get(fid);
   if (!f || f->state != FileState::Receiving || idx >= f->total_chunks) return;
 
-  crypto::Bytes plain;
-  {
-    std::lock_guard lk(mu_);
-    try {
-      plain = crypto::open(session_key_, data + 20, len - 20);
-    } catch (...) {
-      return;
-    }
-  }
-  if (plain.size() > kChunkSize) return;
-
+  const crypto::Bytes chunk(plain.begin() + 20, plain.end());
   const bool is_new = !db_.chunk_has(fid, idx);  // sender may restart a transfer
-  db_.chunk_put(fid, idx, plain);
+  db_.chunk_put(fid, idx, chunk);
   if (!is_new) return;
   const std::uint32_t have = f->received_chunks + 1;
   f->received_chunks = have;
@@ -330,12 +370,12 @@ void Session::complete_file(FileRow& f) {
     // tell the sender
     const nlohmann::json j = {{"t", "fdone"}, {"file", f.id}};
     const std::string s = j.dump();
-    crypto::Bytes sealed;
-    {
-      std::lock_guard lk(mu_);
-      sealed = crypto::seal(session_key_, s);
+    try {
+      const crypto::Bytes sealed =
+          ratchet_seal(reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
+      tx_push(TxItem{.kind = TxItem::Frame, .frame = frame_bytes(kFrameEnvelope, sealed)});
+    } catch (...) {
     }
-    tx_push(TxItem{.kind = TxItem::Frame, .frame = frame_bytes(kFrameEnvelope, sealed)});
 
     if (ev_.file_progress) ev_.file_progress(f);
     if (ev_.file_ready) ev_.file_ready(f);
@@ -348,23 +388,25 @@ void Session::complete_file(FileRow& f) {
 // ------------------------------------------------------------------ tx
 
 void Session::ack(const std::string& ref) {
+  if (!established_.load()) return;
   const nlohmann::json j = {{"t", "ack"}, {"ref", ref}};
   const std::string s = j.dump();
   crypto::Bytes sealed;
-  {
-    std::lock_guard lk(mu_);
-    if (!established_) return;
-    sealed = crypto::seal(session_key_, s);
+  try {
+    sealed = ratchet_seal(reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
+  } catch (...) {
+    return;
   }
   tx_push(TxItem{.kind = TxItem::Frame, .frame = frame_bytes(kFrameEnvelope, sealed)});
 }
 
 void Session::send_payload(const std::string& msg_id, const crypto::Bytes& envelope_plain) {
+  if (!established_.load()) return;
   crypto::Bytes sealed;
-  {
-    std::lock_guard lk(mu_);
-    if (!established_) return;
-    sealed = crypto::seal(session_key_, envelope_plain);
+  try {
+    sealed = ratchet_seal(envelope_plain.data(), envelope_plain.size());
+  } catch (...) {
+    return;  // ratchet unavailable: payload stays in the outbox for the next flush
   }
   tx_push(TxItem{.kind = TxItem::Frame, .frame = frame_bytes(kFrameEnvelope, sealed)});
   db_.set_message_status(msg_id, MsgStatus::Sent);
@@ -440,17 +482,23 @@ void Session::do_pump(const FileRow& file) {
     const std::size_t got = static_cast<std::size_t>(in.gcount());
     if (got == 0 && i + 1 < file.total_chunks) break;  // truncated source
 
+    // v2: fid and idx travel inside the AEAD as part of the plaintext
+    crypto::Bytes inner;
+    inner.reserve(20 + got);
+    inner.insert(inner.end(), fid_raw.begin(), fid_raw.end());
+    for (int b = 3; b >= 0; --b) inner.push_back(static_cast<std::uint8_t>(i >> (b * 8)));
+    inner.insert(inner.end(), buf.begin(), buf.begin() + got);
+
+    if (!established_.load()) return;
     crypto::Bytes sealed;
-    {
-      std::lock_guard lk(mu_);
-      if (!established_) return;
-      sealed = crypto::seal(session_key_, buf.data(), got);
+    try {
+      sealed = ratchet_seal(inner.data(), inner.size());
+    } catch (...) {
+      return;
     }
     crypto::Bytes frame;
-    frame.reserve(1 + 16 + 4 + sealed.size());
+    frame.reserve(1 + sealed.size());
     frame.push_back(kFrameChunk);
-    frame.insert(frame.end(), fid_raw.begin(), fid_raw.end());
-    for (int b = 3; b >= 0; --b) frame.push_back(static_cast<std::uint8_t>(i >> (b * 8)));
     frame.insert(frame.end(), sealed.begin(), sealed.end());
 
     while (ch_->buffered_amount() > kBufferedHigh && !closed_) wait_writable();

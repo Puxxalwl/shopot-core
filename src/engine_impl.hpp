@@ -5,6 +5,8 @@
 #include "session.hpp"
 #include "shopot/shopot.hpp"
 
+#include <sodium.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -47,6 +49,11 @@ struct Engine::Impl {
     stopping_.store(true);
     eq_cv_.notify_one();
     if (eq_thread_.joinable()) eq_thread_.join();
+    // identity secrets never outlive the engine: wipe X25519/Ed25519 keys
+    // and the DB storage key
+    sodium_memzero(id.enc_sk.data(), id.enc_sk.size());
+    sodium_memzero(id.sign_sk.data(), id.sign_sk.size());
+    sodium_memzero(id.storage.data(), id.storage.size());
   }
 
   void dispatch(std::function<void()> fn) {

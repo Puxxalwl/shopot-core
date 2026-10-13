@@ -273,6 +273,77 @@ static void test_db() {
   std::filesystem::remove(path);
 }
 
+static void test_ratchet() {
+  // handshake-style ephemeral keys
+  const crypto::Arr<32> ea = crypto::random32();
+  const crypto::Arr<32> eb = crypto::random32();
+  crypto::Arr<32> pa{}, pb{};
+  crypto_scalarmult_base(pa.data(), ea.data());
+  crypto_scalarmult_base(pb.data(), eb.data());
+  const crypto::Arr<32> root = crypto::random32();
+
+  // rekey_after=8 forces dozens of alternating DH rotations over the run
+  auto ra = crypto::DoubleRatchet::bootstrap(root, crypto::DoubleRatchet::Role::Initiator, ea,
+                                             pb, 8);
+  auto rb = crypto::DoubleRatchet::bootstrap(root, crypto::DoubleRatchet::Role::Responder, eb,
+                                             pa, 8);
+
+  for (int i = 0; i < 300; ++i) {
+    const std::string ma = "a->b " + std::to_string(i);
+    const auto sa = ra.encrypt(reinterpret_cast<const std::uint8_t*>(ma.data()), ma.size());
+    const auto pt = rb.decrypt(sa.dh, sa.pn, sa.n, sa.body.data(), sa.body.size());
+    CHECK(std::string(pt.begin(), pt.end()) == ma);
+
+    const std::string mb = "b->a " + std::to_string(i);
+    const auto sb = rb.encrypt(reinterpret_cast<const std::uint8_t*>(mb.data()), mb.size());
+    const auto pt2 = ra.decrypt(sb.dh, sb.pn, sb.n, sb.body.data(), sb.body.size());
+    CHECK(std::string(pt2.begin(), pt2.end()) == mb);
+  }
+
+  // the same plaintext never seals to the same ciphertext
+  const auto c1 = ra.encrypt("same");
+  const auto c2 = ra.encrypt("same");
+  CHECK(c1.body != c2.body);
+
+  // out-of-order within a chain exercises the skipped-key cache
+  auto r2a = crypto::DoubleRatchet::bootstrap(root, crypto::DoubleRatchet::Role::Initiator, ea,
+                                              pb, 64);
+  auto r2b = crypto::DoubleRatchet::bootstrap(root, crypto::DoubleRatchet::Role::Responder, eb,
+                                              pa, 64);
+  const auto o0 = r2a.encrypt("zero");
+  const auto o1 = r2a.encrypt("one");
+  const auto o2 = r2a.encrypt("two");
+  const auto p1 = r2b.decrypt(o1.dh, o1.pn, o1.n, o1.body.data(), o1.body.size());
+  CHECK(std::string(p1.begin(), p1.end()) == "one");
+  const auto p0 = r2b.decrypt(o0.dh, o0.pn, o0.n, o0.body.data(), o0.body.size());
+  CHECK(std::string(p0.begin(), p0.end()) == "zero");
+  const auto p2 = r2b.decrypt(o2.dh, o2.pn, o2.n, o2.body.data(), o2.body.size());
+  CHECK(std::string(p2.begin(), p2.end()) == "two");
+
+  // tamper detection
+  auto tp = ra.encrypt("tamper me");
+  tp.body[tp.body.size() / 2] ^= 0x01;
+  bool threw = false;
+  try {
+    rb.decrypt(tp.dh, tp.pn, tp.n, tp.body.data(), tp.body.size());
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  // replay of a consumed index is rejected
+  const auto rp = ra.encrypt("once");
+  const auto ok = rb.decrypt(rp.dh, rp.pn, rp.n, rp.body.data(), rp.body.size());
+  CHECK(std::string(ok.begin(), ok.end()) == "once");
+  threw = false;
+  try {
+    rb.decrypt(rp.dh, rp.pn, rp.n, rp.body.data(), rp.body.size());
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+}
+
 static void test_protocol_loopback() {
   const std::string db_a = "/tmp/shopot-test-a.sqlite", db_b = "/tmp/shopot-test-b.sqlite";
   std::filesystem::remove(db_a);
@@ -421,7 +492,68 @@ static void test_protocol_loopback() {
           std::string((std::istreambuf_iterator<char>(got)), std::istreambuf_iterator<char>()));
   }
 
-  // 4. disconnect / presence
+  // 4. throughput bench: 32 MiB over loopback — measures the full engine path
+  // (ratchet crypto + framing + sqlite chunk writes + assembly), not the network
+  {
+    const std::string bsrc = "/tmp/shopot-bench.bin";
+    constexpr std::uint64_t kBytes = 32ULL << 20;
+    {
+      std::ofstream out(bsrc, std::ios::binary);
+      const std::vector<char> pat(1 << 20, 0x5A);
+      for (std::uint64_t i = 0; i < (kBytes >> 20); ++i) out.write(pat.data(), pat.size());
+    }
+    crypto::Arr<32> bhash{};
+    {
+      std::ifstream in(bsrc, std::ios::binary);
+      crypto_hash_sha256_state hst;
+      crypto_hash_sha256_init(&hst);
+      std::vector<char> hbuf(1 << 20);
+      while (in) {
+        in.read(hbuf.data(), static_cast<std::streamsize>(hbuf.size()));
+        if (in.gcount() > 0)
+          crypto_hash_sha256_update(&hst, reinterpret_cast<const std::uint8_t*>(hbuf.data()),
+                                    static_cast<std::size_t>(in.gcount()));
+      }
+      crypto_hash_sha256_final(&hst, bhash.data());
+    }
+    const std::uint32_t btotal =
+        static_cast<std::uint32_t>((kBytes + kChunkSize - 1) / kChunkSize);
+    FileRow bf;
+    bf.id = crypto::new_id();
+    bf.msg_id = "bench1";
+    bf.contact_id = cid_b_in_a;
+    bf.outgoing = true;
+    bf.name = "bench.bin";
+    bf.mime = "application/octet-stream";
+    bf.size = kBytes;
+    bf.hash = bhash;
+    bf.total_chunks = btotal;
+    bf.state = FileState::Sending;
+    bf.local_path = bsrc;
+    dba.file_put(bf);
+    {
+      const std::string meta = std::string(R"({"t":"file","id":"bench1","ts":3,"file":")") +
+                               bf.id +
+                               R"(","name":"bench.bin","mime":"application/octet-stream","size":)" +
+                               std::to_string(kBytes) + R"(,"total":)" + std::to_string(btotal) +
+                               R"(,"hash":")" + crypto::b64e(bhash.data(), bhash.size()) +
+                               R"(","voice":false})";
+      dba.outbox_put("bench1", cid_b_in_a, crypto::Bytes(meta.begin(), meta.end()));
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    sa->kick();
+    CHECK(wait_for([&] {
+      std::lock_guard lk(mu);
+      return ready_in_b.id == bf.id && ready_in_b.state == FileState::Done;
+    }, 120000));
+    const auto t1 = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    std::printf("bench: %u MiB in %.2f s = %.1f MiB/s (loopback: ratchet+framing+sqlite)\n",
+                static_cast<unsigned>(kBytes >> 20), secs, double(kBytes >> 20) / secs);
+    std::filesystem::remove(bsrc);
+  }
+
+  // 5. disconnect / presence
   sa->stop();
   CHECK(wait_for([&] {
     std::lock_guard lk(mu);
@@ -439,6 +571,8 @@ int main() {
   std::cout << "crypto: ok\n";
   test_db();
   std::cout << "db: ok\n";
+  test_ratchet();
+  std::cout << "ratchet: ok\n";
   test_protocol_loopback();
   std::cout << "protocol(loopback): ok\n";
   if (g_failures) {

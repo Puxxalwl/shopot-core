@@ -28,13 +28,15 @@ struct IChannel {
   virtual void close() = 0;
 };
 
-// Wire framing: first byte selects the handler.
+// Wire framing (v2): first byte selects the handler. 0x11/0x12 bodies carry a
+// 40-byte double-ratchet header — dh(32) || pn(4BE) || n(4BE) — before the
+// sealed payload; a fresh message key protects every single frame.
 inline constexpr std::uint8_t kFrameControl = 0x10;   // plaintext JSON (hello handshake)
-inline constexpr std::uint8_t kFrameEnvelope = 0x11;  // nonce(24) || sealed JSON envelope
-inline constexpr std::uint8_t kFrameChunk = 0x12;     // file_id(16) || idx(4BE) || nonce(24) || sealed chunk
+inline constexpr std::uint8_t kFrameEnvelope = 0x11;  // ratchet hdr || nonce(24) || sealed JSON
+inline constexpr std::uint8_t kFrameChunk = 0x12;     // ratchet hdr || sealed(file_id(16) || idx(4BE) || data)
 
-inline constexpr std::size_t kChunkSize = 16 * 1024;
-inline constexpr std::size_t kBufferedHigh = 1024 * 1024;  // pause pumping above this
-inline constexpr std::size_t kBufferedLow = 256 * 1024;    // resume below this
+inline constexpr std::size_t kChunkSize = 64 * 1024;        // v2: 4x fewer frames per byte
+inline constexpr std::size_t kBufferedHigh = 2 * 1024 * 1024;  // pause pumping above this
+inline constexpr std::size_t kBufferedLow = 512 * 1024;        // resume below this
 
 } // namespace shopot

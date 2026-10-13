@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -77,6 +78,75 @@ Hello hello_parse(const Bytes& frame, const Arr<32>& room, const Arr<32>& peer_s
 /// Derive the 32-byte session key from our ephemeral secret and the peer's
 /// ephemeral public key, bound to the room hash. Throws on low-order shared secret.
 Arr<32> session_key(const Arr<32>& eph_sk, const Arr<32>& peer_epub, const Arr<32>& room);
+
+// ---------------------------------------------------------------- ratchet
+
+/// Signal-style double ratchet adapted to shopot's session model.
+///
+/// Bootstrap: both send chains are derived directly from the handshake shared
+/// secret (no extra round trip, either side may speak first). Afterwards a
+/// message key is evolved for EVERY frame (forward secrecy per message) and
+/// the DH keys rotate on a strictly alternating schedule: a side may re-key
+/// only after it observed the peer's latest ratchet key, so re-keys can never
+/// cross in flight. Re-key after rekey_after sends (default 256).
+///
+/// All secrets are wiped in the destructor.
+class DoubleRatchet {
+public:
+  static constexpr std::uint32_t kRekeyAfter = 256;
+  static constexpr std::size_t kMaxSkip = 128;
+
+  enum class Role { Initiator, Responder };  // Initiator = lexicographically smaller sign key
+
+  struct Sealed {
+    Arr<32> dh;        // our current ratchet public key (header)
+    std::uint32_t pn;  // length of the previous send chain
+    std::uint32_t n;   // index in the current send chain
+    Bytes body;        // nonce(24) || ciphertext (XSalsa20-Poly1305 under the message key)
+  };
+
+  /// role decides which bootstrap chain is "send"; own_eph_* / peer_eph are
+  /// the handshake keys (the responder reuses its handshake key as first
+  /// inbound DH secret; the initiator reuses it for its first re-key step).
+  static DoubleRatchet bootstrap(const Arr<32>& root, Role role, const Arr<32>& own_eph_sk,
+                                 const Arr<32>& peer_eph_pub,
+                                 std::uint32_t rekey_after = kRekeyAfter);
+
+  Sealed encrypt(const std::uint8_t* data, std::size_t len);
+  Sealed encrypt(std::string_view s) {
+    return encrypt(reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
+  }
+  /// Throws std::runtime_error on authentication failure or desync.
+  Bytes decrypt(const Arr<32>& dh, std::uint32_t pn, std::uint32_t n, const std::uint8_t* body,
+                std::size_t len);
+
+  DoubleRatchet() = default;
+  ~DoubleRatchet();
+  DoubleRatchet(DoubleRatchet&&) noexcept;
+  DoubleRatchet& operator=(DoubleRatchet&&) noexcept;
+  DoubleRatchet(const DoubleRatchet&) = delete;
+  DoubleRatchet& operator=(const DoubleRatchet&) = delete;
+
+private:
+  Arr<32> root_{};
+  Arr<32> dhs_sk_{};   // our current ratchet secret (handshake key until first re-key)
+  Arr<32> dhs_pk_{};
+  Arr<32> cks_{};      // send chain key
+  Arr<32> ckr_{};      // receive chain key
+  Arr<32> send_remote_{};  // peer pub our send chain is bound to
+  Arr<32> recv_remote_{};  // peer pub our receive chain expects
+  bool have_cks_ = false, have_ckr_ = false;
+  bool may_rekey_ = false;  // observed a peer pub newer than send_remote_
+  std::uint32_t ns_ = 0, nr_ = 0, pn_ = 0;
+  std::uint32_t rekey_after_ = kRekeyAfter;
+  std::map<std::pair<Arr<32>, std::uint32_t>, Arr<32>> skipped_;  // (dh, n) -> message key
+
+  Arr<32> chain_step(Arr<32>& ck);  // ck' = HMAC(ck, 0x01); returns mk = HMAC(ck, 0x02)
+  void dh_ratchet_send();
+  void dh_ratchet_recv(const Arr<32>& dh, std::uint32_t pn);
+  void skip_to(const Arr<32>& dh, std::uint32_t until);
+  void wipe();
+};
 
 // ---------------------------------------------------------------- AEAD
 

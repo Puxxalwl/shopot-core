@@ -115,32 +115,40 @@ thread-safe.
 
 ## Documentation
 
-- [docs/PROTOCOL.md](docs/PROTOCOL.md) — full wire protocol v1 spec (interoperable reimplementations)
+- [docs/PROTOCOL.md](docs/PROTOCOL.md) — full wire protocol v2 spec (interoperable reimplementations)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — modules, threading, data flow, porting guide
 - [SECURITY.md](SECURITY.md) — reporting, crypto inventory, hardening
 - [CONTRIBUTING.md](CONTRIBUTING.md) — build, ground rules, PRs
 
-## Protocol (v1)
+## Protocol (v2)
 
 | layer      | choice                                                        |
 |------------|---------------------------------------------------------------|
 | identity   | BIP-39 entropy → HKDF → X25519 + Ed25519 + storage key        |
 | handshake  | hello: ephemeral X25519, Ed25519-signed, room-hash bound      |
-| session    | XSalsa20-Poly1305, random 24-byte nonces, forward secrecy     |
+| session    | **double ratchet**: fresh key per message, alternating DH rotation every 256 sends (post-compromise healing) |
+| AEAD       | XSalsa20-Poly1305, random 24-byte nonces                       |
 | transport  | WebRTC DataChannel (reliable, ordered), STUN-only NAT traversal |
-| wire       | frame type byte; JSON envelopes; binary 16 KiB chunks          |
+| wire       | ratchet header per frame; JSON envelopes; 64 KiB binary chunks |
 | storage    | SQLite (WAL); every sensitive blob sealed with the storage key |
 | integrity  | SHA-256 per file, verified before delivery to the app          |
 
 Wire frames: `0x10` hello (plaintext JSON, signed) · `0x11` sealed envelope
-(text / ack / file-meta / file-done) · `0x12` sealed file chunk.
+(text / ack / file-meta / file-done) · `0x12` sealed file chunk — the latter
+two carry a 40-byte ratchet header; chunk routing fields live inside the AEAD.
+
+Measured engine throughput (loopback, full path incl. ratchet + SQLite):
+**~32 MiB/s**; live-path sends are O(1) — the outbox re-flush runs only once
+per session establishment, so long offline queues never degrade live chat.
 
 ## Threat model — honest version
 
-**Defeats:** mass surveillance (E2E + forward secrecy), server breaches (no
-servers), history seizure of *one* device (DB is encrypted; the key comes from
-the mnemonic), account takeovers (no accounts), metadata collection (no
-contacts/graph on any server).
+**Defeats:** mass surveillance (E2E + **per-message forward secrecy** via the
+double ratchet), server breaches (no servers), history seizure of *one* device
+(DB is encrypted; the key comes from the mnemonic), account takeovers (no
+accounts), metadata collection (no contacts/graph on any server). A
+mid-session leak of ratchet state heals at the next DH rotation
+(post-compromise security).
 
 **Does not defeat:** a compromised endpoint (nothing can), physical access to
 an unlocked device, a global passive adversary correlating *timing* of the two
@@ -149,9 +157,11 @@ exchange (defeated by comparing fingerprints out-of-band).
 
 ## Roadmap
 
+- [x] **Double Ratchet** — fresh message key per frame, alternating DH
+      rotation (post-compromise healing), race-free by construction
+- [x] **64 KiB chunks + O(1) live sends** — 32 MiB/s engine path on loopback
 - [ ] Pluggable rendezvous (`ISignaling`): Nostr relays / BitTorrent trackers
       for automatic reconnects without code exchange
-- [ ] Double Ratchet (per-message key evolution)
 - [ ] File transfer resume across sessions (chunk bitmaps already stored)
 - [ ] Tor onion-service transport (no STUN, no IP leakage at all)
 - [ ] Voice messages: engine-level opus framing helpers

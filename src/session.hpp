@@ -49,8 +49,14 @@ public:
 
   /// Seal and send one outbox payload right now (must be established).
   void send_payload(const std::string& msg_id, const crypto::Bytes& envelope_plain);
+  /// Start pumping one pending outgoing file right now (must be established).
+  void send_file_now(const FileRow& f) { tx_push(TxItem{.kind = TxItem::PumpFile, .file = f}); }
   /// Ask the tx thread to re-scan the outbox and pending files.
   void kick();
+
+  // v2 frame helpers (ratchet-sealed): [dh(32)][pn(4)][n(4)][nonce(24)][ct]
+  crypto::Bytes ratchet_seal(const std::uint8_t* data, std::size_t len);
+  crypto::Bytes ratchet_open(const std::uint8_t* data, std::size_t len);
 
 private:
   struct TxItem {
@@ -90,7 +96,7 @@ private:
   bool have_eph_ = false;
   bool have_peer_eph_ = false;
   crypto::Arr<32> peer_eph_{};
-  crypto::Arr<32> session_key_{};
+  crypto::DoubleRatchet ratchet_{};  // v2: per-message keys, DH re-key every 256 sends
 
   std::atomic<bool> established_{false};
   std::atomic<bool> closed_{false};

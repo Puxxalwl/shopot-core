@@ -197,7 +197,11 @@ std::string Engine::send_text(std::int64_t contact_id, const std::string& text) 
   const std::string s = j.dump();
   impl_->db.outbox_put(msg_id, contact_id, crypto::Bytes(s.begin(), s.end()));
 
-  if (auto s2 = impl_->established_session(contact_id)) s2->kick();
+  // live path: send exactly this payload — O(1). The outbox stays as the
+  // durable retry log (full flush happens once per session establishment),
+  // so a long offline queue no longer re-sends on every new message.
+  if (auto sess = impl_->established_session(contact_id))
+    sess->send_payload(msg_id, crypto::Bytes(s.begin(), s.end()));
   return msg_id;
 }
 
@@ -264,7 +268,11 @@ std::string Engine::send_file(std::int64_t contact_id, const std::string& path,
   const std::string s = meta.dump();
   impl_->db.outbox_put(msg_id, contact_id, crypto::Bytes(s.begin(), s.end()));
 
-  if (auto s2 = impl_->established_session(contact_id)) s2->kick();
+  // live path: meta + chunks go straight out, no full outbox re-flush
+  if (auto sess = impl_->established_session(contact_id)) {
+    sess->send_payload(msg_id, crypto::Bytes(s.begin(), s.end()));
+    sess->send_file_now(f);
+  }
   return msg_id;
 }
 

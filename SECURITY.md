@@ -24,16 +24,19 @@ availability. We aim to acknowledge within 72 hours.
 
 | primitive | implementation | used for |
 |-----------|----------------|----------|
-| X25519    | libsodium      | identity encryption key, ephemeral ECDH |
+| X25519    | libsodium      | identity encryption key, ephemeral ECDH, ratchet DH steps |
 | Ed25519   | libsodium      | identity signatures (handshake auth) |
 | XSalsa20-Poly1305 | libsodium | AEAD for envelopes, chunks, at-rest records |
+| Double ratchet | own code on libsodium HMAC | per-message keys, alternating DH rotation (PCS) |
 | HKDF-SHA256 | built on libsodium HMAC | key derivation |
 | SHA-256   | libsodium      | fingerprints, room hash, file integrity |
 | BIP-39    | own code (tests cover checksum) | mnemonic ↔ entropy |
 
 Design rules: no custom primitives, random 24-byte nonces (safe for
-XSalsa20), ephemeral session keys erased after use, authentication failures
-drop frames silently without oracle behaviour.
+XSalsa20), message keys used exactly once and wiped, ratchet rotations
+strictly alternating (race-free by construction), identity/ratchet/storage
+secrets wiped when their owning objects die, authentication failures drop
+frames silently without oracle behaviour.
 
 ## Hardening notes for app developers
 

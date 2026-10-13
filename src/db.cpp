@@ -1,6 +1,7 @@
 #include "db.hpp"
 
 #include <sqlite3.h>
+#include <sodium.h>
 
 #include <chrono>
 #include <cstring>
@@ -84,7 +85,10 @@ CREATE TABLE IF NOT EXISTS chunks(
 )SQL");
 }
 
-Db::~Db() { sqlite3_close(db_); }
+Db::~Db() {
+  sqlite3_close(db_);
+  sodium_memzero(key_.data(), key_.size());  // the storage key never outlives the store
+}
 
 void Db::exec(const char* sql) {
   char* err = nullptr;

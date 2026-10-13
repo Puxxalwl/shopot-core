@@ -309,6 +309,188 @@ Arr<32> session_key(const Arr<32>& eph_sk, const Arr<32>& peer_epub, const Arr<3
   return key;
 }
 
+// ------------------------------------------------------------------ ratchet
+
+namespace {
+Arr<32> hmac_sha256(const Arr<32>& key, const std::uint8_t* data, std::size_t len) {
+  Arr<32> out;
+  crypto_auth_hmacsha256_state st;
+  crypto_auth_hmacsha256_init(&st, key.data(), key.size());
+  crypto_auth_hmacsha256_update(&st, data, len);
+  crypto_auth_hmacsha256_final(&st, out.data());
+  return out;
+}
+Arr<32> hmac_byte(const Arr<32>& key, std::uint8_t b) { return hmac_sha256(key, &b, 1); }
+
+Arr<32> hkdf_info(const Arr<32>& ikm, const Arr<32>& salt, std::string_view info) {
+  // standard HKDF-SHA256, single 32-byte expand block
+  Arr<32> prk;
+  crypto_auth_hmacsha256_state ex;
+  crypto_auth_hmacsha256_init(&ex, salt.data(), salt.size());
+  crypto_auth_hmacsha256_update(&ex, ikm.data(), ikm.size());
+  crypto_auth_hmacsha256_final(&ex, prk.data());
+  crypto_auth_hmacsha256_state st;
+  crypto_auth_hmacsha256_init(&st, prk.data(), prk.size());
+  crypto_auth_hmacsha256_update(&st, reinterpret_cast<const std::uint8_t*>(info.data()), info.size());
+  const std::uint8_t one = 1;
+  crypto_auth_hmacsha256_update(&st, &one, 1);
+  Arr<32> okm;
+  crypto_auth_hmacsha256_final(&st, okm.data());
+  sodium_memzero(prk.data(), prk.size());
+  return okm;
+}
+} // namespace
+
+DoubleRatchet DoubleRatchet::bootstrap(const Arr<32>& root, Role role, const Arr<32>& own_eph_sk,
+                                       const Arr<32>& peer_eph_pub, std::uint32_t rekey_after) {
+  DoubleRatchet r;
+  r.root_ = root;
+  r.dhs_sk_ = own_eph_sk;
+  crypto_scalarmult_base(r.dhs_pk_.data(), r.dhs_sk_.data());
+  r.rekey_after_ = std::max<std::uint32_t>(1, rekey_after);
+
+  // Shared secret of the handshake drives both one-direction bootstrap chains
+  // (same value both sides already proved possession of).
+  Arr<32> dh;
+  if (crypto_scalarmult(dh.data(), own_eph_sk.data(), peer_eph_pub.data()) != 0)
+    throw std::runtime_error("ratchet: low-order public key");
+
+  r.send_remote_ = peer_eph_pub;
+  r.recv_remote_ = peer_eph_pub;
+  if (role == Role::Initiator) {
+    r.cks_ = hkdf_info(dh, root, "shopot-chain-i2r");
+    r.ckr_ = hkdf_info(dh, root, "shopot-chain-r2i");
+    r.may_rekey_ = true;  // first mover: may rotate DH first
+  } else {
+    r.cks_ = hkdf_info(dh, root, "shopot-chain-r2i");
+    r.ckr_ = hkdf_info(dh, root, "shopot-chain-i2r");
+    r.may_rekey_ = false;
+  }
+  r.have_cks_ = true;
+  r.have_ckr_ = true;
+  sodium_memzero(dh.data(), dh.size());
+  return r;
+}
+
+Arr<32> DoubleRatchet::chain_step(Arr<32>& ck) {
+  Arr<32> mk = hmac_byte(ck, 0x02);
+  ck = hmac_byte(ck, 0x01);
+  return mk;
+}
+
+DoubleRatchet::~DoubleRatchet() { wipe(); }
+DoubleRatchet::DoubleRatchet(DoubleRatchet&&) noexcept = default;
+DoubleRatchet& DoubleRatchet::operator=(DoubleRatchet&&) noexcept = default;
+
+void DoubleRatchet::wipe() {
+  sodium_memzero(root_.data(), root_.size());
+  sodium_memzero(dhs_sk_.data(), dhs_sk_.size());
+  sodium_memzero(dhs_pk_.data(), dhs_pk_.size());
+  sodium_memzero(cks_.data(), cks_.size());
+  sodium_memzero(ckr_.data(), ckr_.size());
+  sodium_memzero(send_remote_.data(), send_remote_.size());
+  sodium_memzero(recv_remote_.data(), recv_remote_.size());
+  for (auto& [k, v] : skipped_) sodium_memzero(v.data(), v.size());
+  skipped_.clear();
+  have_cks_ = false;
+  have_ckr_ = false;
+  may_rekey_ = false;
+  ns_ = nr_ = pn_ = 0;
+}
+
+void DoubleRatchet::dh_ratchet_send() {
+  // generate a fresh ratchet key and advance the root
+  randombytes_buf(dhs_sk_.data(), dhs_sk_.size());
+  crypto_scalarmult_base(dhs_pk_.data(), dhs_sk_.data());
+  Arr<32> dh;
+  if (crypto_scalarmult(dh.data(), dhs_sk_.data(), send_remote_.data()) != 0)
+    throw std::runtime_error("ratchet: low-order remote key");
+  pn_ = ns_;
+  ns_ = 0;
+  root_ = hkdf_info(dh, root_, "shopot-rk2");
+  cks_ = hkdf_info(dh, root_, "shopot-ck2");
+  sodium_memzero(dh.data(), dh.size());
+  may_rekey_ = false;  // wait for the peer's next key before rotating again
+}
+
+void DoubleRatchet::dh_ratchet_recv(const Arr<32>& dh_pub, std::uint32_t pn) {
+  // finish the old receive chain first (ordered delivery normally leaves nothing)
+  if (have_ckr_) skip_to(recv_remote_, pn);
+  Arr<32> dh;
+  if (crypto_scalarmult(dh.data(), dhs_sk_.data(), dh_pub.data()) != 0)
+    throw std::runtime_error("ratchet: low-order header key");
+  root_ = hkdf_info(dh, root_, "shopot-rk2");
+  ckr_ = hkdf_info(dh, root_, "shopot-ck2");
+  recv_remote_ = dh_pub;
+  // the peer's CURRENT key is dh_pub now: our next send-side rotation must
+  // DH against it, otherwise the peer cannot derive our new chain.
+  send_remote_ = dh_pub;
+  nr_ = 0;
+  have_ckr_ = true;
+  may_rekey_ = true;  // peer rotated: we may answer with our rotation
+  sodium_memzero(dh.data(), dh.size());
+}
+
+void DoubleRatchet::skip_to(const Arr<32>& dh, std::uint32_t until) {
+  if (skipped_.size() >= kMaxSkip) return;  // bounded memory over unbounded channels
+  while (nr_ < until) {
+    Arr<32> mk = chain_step(ckr_);
+    skipped_[{dh, nr_}] = mk;
+    ++nr_;
+    if (skipped_.size() >= kMaxSkip) return;
+  }
+}
+
+DoubleRatchet::Sealed DoubleRatchet::encrypt(const std::uint8_t* data, std::size_t len) {
+  if (!have_cks_) throw std::runtime_error("ratchet: no send chain");
+  // rotate only on the alternating schedule: after we observed the peer's
+  // latest key. Re-keys can therefore never cross in flight.
+  if (may_rekey_ && ns_ >= rekey_after_) dh_ratchet_send();
+
+  Arr<32> mk = chain_step(cks_);
+  const std::uint32_t n = ns_;
+  ++ns_;
+
+  Sealed out;
+  out.dh = dhs_pk_;
+  out.pn = pn_;
+  out.n = n;
+  out.body = seal(mk, data, len);
+  sodium_memzero(mk.data(), mk.size());
+  return out;
+}
+
+Bytes DoubleRatchet::decrypt(const Arr<32>& dh, std::uint32_t pn, std::uint32_t n,
+                             const std::uint8_t* body, std::size_t len) {
+  // 1. skipped-message fast path
+  const auto skip_it = skipped_.find({dh, n});
+  if (skip_it != skipped_.end()) {
+    Arr<32> mk = skip_it->second;
+    skipped_.erase(skip_it);
+    Bytes pt = open(mk, body, len);
+    sodium_memzero(mk.data(), mk.size());
+    return pt;
+  }
+
+  // 2. new remote ratchet key → advance the receive DH
+  if (dh != recv_remote_) dh_ratchet_recv(dh, pn);
+
+  // 3. advance the receive chain to n
+  if (n > nr_) skip_to(dh, n);
+  if (n < nr_) throw std::runtime_error("ratchet: stale index");
+  Arr<32> mk = chain_step(ckr_);
+  ++nr_;
+  Bytes pt;
+  try {
+    pt = open(mk, body, len);
+  } catch (...) {
+    sodium_memzero(mk.data(), mk.size());
+    throw;
+  }
+  sodium_memzero(mk.data(), mk.size());
+  return pt;
+}
+
 // ------------------------------------------------------------------ AEAD
 
 Bytes seal(const Arr<32>& key, const std::uint8_t* data, std::size_t len) {
