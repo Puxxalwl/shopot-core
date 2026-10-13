@@ -72,6 +72,12 @@ and macOS arm64, built by CI on every version tag. Unpack and run:
 tar xzf shopot-cli-linux-x64.tar.gz && ./shopot-cli-linux-x64/shopot-cli
 ```
 
+Runtime deps are the stock system libraries: libsqlite3 and openssl are
+preinstalled everywhere; on Fedora/RHEL add `sudo dnf install libsodium`,
+on Debian/Ubuntu `sudo apt install libsodium23` (macOS: `brew install
+libsodium`). `RUNTIME-DEPS.txt` inside each archive lists the exact
+libraries the binary was linked against.
+
 ## Try it: two terminals
 
 In a real terminal `shopot-cli` opens the full-screen chat interface —
