@@ -50,7 +50,43 @@ Connection codes are base64url-nopad of UTF-8 JSON:
 
 Codes are generated only after ICE gathering completes (bounded to 8 s, host
 candidates alone are acceptable). Codes are single-use. There is intentionally
-no rendezvous server; the application transports codes.
+no rendezvous server of our own; the application transports codes.
+
+### Signaling (automatic rendezvous)
+
+Two peers that already added each other can connect with zero code exchange.
+Any public MQTT broker (MQTT 3.1.1 over TLS WebSocket, subprotocol `mqtt`)
+acts as a dumb mailbox:
+
+```
+room   = SHA-256("shopot-room-v1" || min(sign) || max(sign))     // shared already
+topic  = hex( SHA-256("shopot-signal-v1" || room)[0..16] )       // 32 hex chars
+skey   = HKDF-SHA256(ikm=room, salt="shopot-signal-v1")
+```
+
+Both sides subscribe to `topic` and publish sealed signaling payloads:
+
+```
+payload = ts(8, big-endian unix seconds) ‖ XSalsa20-Poly1305(skey, code)
+```
+
+where `code` is exactly the manual base64url code — the two signaling modes
+are format-identical and interchangeable.
+
+- Roles are deterministic: the side with the bytewise-smaller `sign` key
+  publishes an `offer`, the other responds with an `answer`.
+- Payloads are published retained and re-sealed (fresh `ts`) every 10 s
+  while waiting, so a peer arriving late gets a usable offer instantly.
+- Receivers reject payloads older than 120 s, foreign-room payloads
+  (authentication failure) and tampered payloads — all silently.
+- After the answer is applied, the session is fully peer-to-peer; the relay
+  is no longer involved.
+
+**What the relay learns:** an opaque topic hash, an opaque sealed blob, and
+that two IPs published/subscribed to the same topic around the same time —
+the same level of metadata a STUN server sees. It cannot read, forge or
+correlate the traffic to any identity. Relays are configurable; an empty
+relay list disables automatic discovery and manual codes keep working.
 
 ## 3. Framing
 

@@ -4,6 +4,7 @@
 #include "db.hpp"
 #include "session.hpp"
 #include "shopot/shopot.hpp"
+#include "transport/isignaling.hpp"
 
 #include <sodium.h>
 
@@ -30,6 +31,7 @@ struct Engine::Impl {
   std::condition_variable eq_cv_;
   std::queue<std::function<void()>> eq_;
   std::thread eq_thread_;
+  std::vector<std::thread> auto_workers_;  // rendezvous workers, joined in ~Impl
   std::atomic<bool> stopping_{false};
 
   Impl(Config c, const std::string& mnemonic, Events events)
@@ -41,12 +43,14 @@ struct Engine::Impl {
   }
 
   ~Impl() {
+    stopping_.store(true);  // tell auto-connect workers to bail before teardown
+    for (auto& w : auto_workers_)
+      if (w.joinable()) w.join();
     {
       std::lock_guard lk(mu_);
       for (auto& [cid, s] : sessions_) s->stop();
       sessions_.clear();
     }
-    stopping_.store(true);
     eq_cv_.notify_one();
     if (eq_thread_.joinable()) eq_thread_.join();
     // identity secrets never outlive the engine: wipe X25519/Ed25519 keys
@@ -111,6 +115,14 @@ struct Engine::Impl {
     };
     return sev;
   }
+
+#ifdef SHOPOT_WITH_RTC
+  // programmatic variants of the manual signaling dance (used by connect_auto)
+  std::string rtc_offer(std::int64_t contact_id);
+  std::string rtc_answer(std::int64_t contact_id, const std::string& offer_code);
+  void rtc_apply(std::int64_t contact_id, const std::string& answer_code);
+#endif
+  void auto_connect(std::int64_t contact_id, std::int64_t timeout_ms);
 
   void attach_channel(std::int64_t contact_id, std::unique_ptr<IChannel> ch) {
     std::lock_guard lk(mu_);

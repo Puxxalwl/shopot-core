@@ -63,6 +63,14 @@ struct Config {
   /// Public STUN server used for NAT traversal. Set to an empty string to
   /// disable STUN entirely (LAN, Tor or static-IP deployments).
   std::string stun_server = "stun:stun.l.google.com:19302";
+  /// Rendezvous relays for automatic discovery (MQTT over TLS WebSocket).
+  /// Both peers derive the same opaque topic and key from their shared room
+  /// hash, so a relay sees only a hash and a sealed blob — it cannot read,
+  /// forge or correlate anything beyond "two anonymous IPs attempted a
+  /// connection around the same time" (same level as STUN). Empty list
+  /// disables automatic discovery; manual code exchange always works.
+  std::vector<std::string> relays = {"wss://broker.emqx.io:8084/mqtt",
+                                     "wss://test.mosquitto.org:8081"};
 };
 
 struct Events {
@@ -122,6 +130,15 @@ public:
   std::string handle_offer(std::int64_t contact_id, const std::string& offer_code);
   void handle_answer(std::int64_t contact_id, const std::string& answer_code);
   void disconnect(std::int64_t contact_id);
+
+  /// --- signaling (automatic, relay-based) ---------------------------------
+  /// Both peers call this; whoever is the deterministic initiator publishes
+  /// its offer under the pairwise relay topic, the responder answers, and the
+  /// session establishes by itself. No code exchange at all — the only prior
+  /// step is having added each other's bundle once. Non-blocking: the search
+  /// runs on a worker for up to timeout_ms; outcome arrives through
+  /// on_presence / on_error. Requires non-empty Config::relays.
+  void connect_auto(std::int64_t contact_id, std::int64_t timeout_ms = 120000);
 
   // messaging — safe to call while the peer is offline; payloads wait in the
   // encrypted outbox and are flushed automatically when a session establishes.

@@ -1,14 +1,21 @@
 #include "engine_impl.hpp"
 
+#ifdef SHOPOT_WITH_RTC
+#include "transport/mqtt.hpp"
 #include "transport/rtc.hpp"
+#endif
 
 #include <nlohmann/json.hpp>
 #include <sodium.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <thread>
 
 namespace shopot {
 
@@ -130,12 +137,35 @@ void Engine::remove_contact(std::int64_t contact_id) {
 
 // ------------------------------------------------------------------ signaling
 
+#ifdef SHOPOT_WITH_RTC
+std::string Engine::Impl::rtc_offer(std::int64_t contact_id) {
+  auto ch = rtc_make_offer(cfg.stun_server);
+  std::string code = ch->local_code();
+  attach_channel(contact_id, std::move(ch));
+  return code;
+}
+
+std::string Engine::Impl::rtc_answer(std::int64_t contact_id, const std::string& offer_code) {
+  auto ch = rtc_make_answer(offer_code, cfg.stun_server);
+  std::string code = ch->local_code();
+  attach_channel(contact_id, std::move(ch));
+  return code;
+}
+
+void Engine::Impl::rtc_apply(std::int64_t contact_id, const std::string& answer_code) {
+  std::lock_guard lk(mu_);
+  auto it = sessions_.find(contact_id);
+  if (it == sessions_.end())
+    throw std::runtime_error("no pending offer for this contact");
+  auto* ch = dynamic_cast<RtcChannel*>(it->second->channel());
+  if (!ch) throw std::runtime_error("pending channel is not RTC");
+  rtc_apply_answer(*ch, answer_code);
+}
+#endif
+
 std::string Engine::make_offer(std::int64_t contact_id) {
 #ifdef SHOPOT_WITH_RTC
-  auto ch = rtc_make_offer(impl_->cfg.stun_server);
-  std::string code = ch->local_code();
-  impl_->attach_channel(contact_id, std::move(ch));
-  return code;
+  return impl_->rtc_offer(contact_id);
 #else
   (void)contact_id;
   throw std::runtime_error("built without RTC transport (SHOPOT_WITH_RTC=OFF)");
@@ -144,10 +174,7 @@ std::string Engine::make_offer(std::int64_t contact_id) {
 
 std::string Engine::handle_offer(std::int64_t contact_id, const std::string& offer_code) {
 #ifdef SHOPOT_WITH_RTC
-  auto ch = rtc_make_answer(offer_code, impl_->cfg.stun_server);
-  std::string code = ch->local_code();
-  impl_->attach_channel(contact_id, std::move(ch));
-  return code;
+  return impl_->rtc_answer(contact_id, offer_code);
 #else
   (void)contact_id; (void)offer_code;
   throw std::runtime_error("built without RTC transport (SHOPOT_WITH_RTC=OFF)");
@@ -156,17 +183,120 @@ std::string Engine::handle_offer(std::int64_t contact_id, const std::string& off
 
 void Engine::handle_answer(std::int64_t contact_id, const std::string& answer_code) {
 #ifdef SHOPOT_WITH_RTC
-  std::lock_guard lk(impl_->mu_);
-  auto it = impl_->sessions_.find(contact_id);
-  if (it == impl_->sessions_.end())
-    throw std::runtime_error("no pending offer for this contact");
-  auto* ch = dynamic_cast<RtcChannel*>(it->second->channel());
-  if (!ch) throw std::runtime_error("pending channel is not RTC");
-  rtc_apply_answer(*ch, answer_code);
+  impl_->rtc_apply(contact_id, answer_code);
 #else
   (void)contact_id; (void)answer_code;
   throw std::runtime_error("built without RTC transport (SHOPOT_WITH_RTC=OFF)");
 #endif
+}
+
+void Engine::connect_auto(std::int64_t contact_id, std::int64_t timeout_ms) {
+  if (!impl_->db.contact(contact_id)) throw std::invalid_argument("unknown contact");
+  if (impl_->established_session(contact_id)) return;  // already online
+#ifdef SHOPOT_WITH_RTC
+  if (impl_->cfg.relays.empty())
+    throw std::runtime_error("automatic rendezvous disabled: Config::relays is empty");
+  {
+    std::lock_guard lk(impl_->mu_);
+    // reap finished workers so the vector cannot grow unbounded
+    impl_->auto_workers_.erase(
+        std::remove_if(impl_->auto_workers_.begin(), impl_->auto_workers_.end(),
+                       [](std::thread& t) { return !t.joinable(); }),
+        impl_->auto_workers_.end());
+    impl_->auto_workers_.emplace_back(
+        [impl = impl_.get(), contact_id, timeout_ms] { impl->auto_connect(contact_id, timeout_ms); });
+  }
+#else
+  (void)timeout_ms;
+  throw std::runtime_error("built without RTC transport (SHOPOT_WITH_RTC=OFF)");
+#endif
+}
+
+void Engine::Impl::auto_connect(std::int64_t contact_id, std::int64_t timeout_ms) {
+  const char* ctx = "auto-connect";
+  try {
+#ifdef SHOPOT_WITH_RTC
+    const auto c = db.contact(contact_id);
+    if (!c) return;
+    if (established_session(contact_id)) return;
+    const crypto::Arr<32> room = crypto::room_hash(id.sign_pk, c->sign_pk);
+    const std::string topic = signal::topic_for(room);
+    const crypto::Arr<32> key = signal::key_for(room);
+    const bool initiator = id.sign_pk < c->sign_pk;
+    if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
+      std::fprintf(stderr, "[signal] role=%s topic=%.16s...\n", initiator ? "initiator" : "responder",
+                   topic.c_str());
+
+    signal::MqttSignaling sig(cfg.relays);
+    if (!sig.ok()) {  // the worker may still be dialing the first relay
+      for (int i = 0; i < 100 && !sig.ok() && !stopping_.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!sig.ok()) {
+      if (ev.on_error) ev.on_error(contact_id, std::string(ctx) + ": no relay reachable");
+      return;
+    }
+    sig.subscribe(topic);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    auto next_pub = std::chrono::steady_clock::time_point::min();
+
+    if (initiator) {
+      const std::string offer = rtc_offer(contact_id);
+      if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
+        std::fprintf(stderr, "[signal] offer ready (%zu B)\n", offer.size());
+      while (!stopping_.load() && std::chrono::steady_clock::now() < deadline) {
+        if (established_session(contact_id)) return;
+        for (const auto& [t, p] : sig.poll(100)) {
+          (void)t;
+          try {
+            const std::string code = signal::open_code(key, p);
+            const auto j = nlohmann::json::parse(crypto::b64d(code));
+            if (j.value("type", "") != "answer") continue;
+            if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
+              std::fprintf(stderr, "[signal] answer accepted, applying\n");
+            rtc_apply(contact_id, code);
+            return;  // presence arrives from the channel itself
+          } catch (...) {
+          }  // foreign, tampered or stale relay traffic: ignore
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_pub) {  // re-seal so the retained blob stays fresh
+          sig.publish(topic, signal::seal_code(key, offer));
+          next_pub = now + std::chrono::seconds(10);
+        }
+      }
+    } else {
+      while (!stopping_.load() && std::chrono::steady_clock::now() < deadline) {
+        if (established_session(contact_id)) return;
+        for (const auto& [t, p] : sig.poll(100)) {
+          (void)t;
+          try {
+            const std::string code = signal::open_code(key, p);
+            const auto j = nlohmann::json::parse(crypto::b64d(code));
+            if (j.value("type", "") != "offer") continue;
+            if (std::getenv("SHOPOT_SIGNAL_DEBUG"))
+              std::fprintf(stderr, "[signal] offer received, answering\n");
+            const std::string answer = rtc_answer(contact_id, code);
+            sig.publish(topic, signal::seal_code(key, answer));
+            sig.flush_pending(5000);  // the answer MUST leave before we go away
+            return;
+          } catch (...) {
+          }
+        }
+      }
+    }
+    if (!stopping_.load() && !established_session(contact_id) && ev.on_error)
+      ev.on_error(contact_id, std::string(ctx) + ": peer not reached (timeout)");
+#else
+    (void)contact_id; (void)timeout_ms; (void)ctx;
+#endif
+  } catch (const std::exception& e) {
+#ifdef SHOPOT_WITH_RTC
+    if (ev.on_error) ev.on_error(contact_id, std::string(ctx) + ": " + e.what());
+#endif
+  }
 }
 
 void Engine::disconnect(std::int64_t contact_id) {

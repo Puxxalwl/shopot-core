@@ -4,12 +4,16 @@
 #include "db.hpp"
 #include "session.hpp"
 #include "transport/channel.hpp"
+#include "transport/mqtt_packets.hpp"
+#include "transport/mqtt.hpp"
+#include "transport/isignaling.hpp"
 
 #include <sodium.h>
 
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -272,6 +276,129 @@ static void test_db() {
     CHECK(threw);
   }
   std::filesystem::remove(path);
+}
+
+static void test_signal() {
+  // rendezvous derivation: both peers compute identical topic and key from
+  // the shared room hash alone
+  const auto ra = crypto::room_hash(crypto::random32(), crypto::random32());
+  const auto rb = crypto::room_hash(crypto::random32(), crypto::random32());
+  CHECK(signal::topic_for(ra) == signal::topic_for(ra));
+  CHECK(signal::topic_for(ra).size() == 32);
+  CHECK(signal::topic_for(ra) != signal::topic_for(rb));
+  CHECK(signal::key_for(ra) == signal::key_for(ra));
+  CHECK(signal::key_for(ra) != signal::key_for(rb));
+
+  // code sealing round-trip
+  const std::string code =
+      "eyJ0eXBlIjoib2ZmZXIiLCJzZHAiOiJ2MCIsImNhbmRpZGF0ZXMiOltdfQ";
+  const auto key = signal::key_for(ra);
+  const auto sealed_now = signal::seal_code(key, code);
+  CHECK(signal::open_code(key, sealed_now) == code);
+  CHECK(signal::seal_code(key, code) != sealed_now);  // fresh nonce each time
+
+  // staleness: codes older than the window are rejected even when sealed
+  const std::int64_t old_ts = signal::now_unix_s() - signal::kMaxAgeSeconds - 1;
+  bool threw = false;
+  try {
+    signal::open_code(key, signal::seal_code_ts(key, code, old_ts));
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  // tamper: flipping a payload bit must fail authentication
+  std::string tampered = sealed_now;
+  tampered[tampered.size() / 2] ^= 0x01;
+  threw = false;
+  try {
+    signal::open_code(key, tampered);
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  // foreign room: a different key cannot open the payload
+  threw = false;
+  try {
+    signal::open_code(signal::key_for(rb), sealed_now);
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  // ---- MQTT packet framing ----
+  const auto pub = signal::mqtt_publish("shopot/topic", "hello world", true);
+  CHECK(pub[0] == 0x31);  // PUBLISH, QoS 0, retain
+  signal::MqttPacket p;
+  CHECK(signal::mqtt_parse_one(pub.data(), pub.size(), p) == pub.size());
+  CHECK((p.type_flags >> 4) == 3);
+  CHECK(p.topic == "shopot/topic");
+  CHECK(p.payload == "hello world");
+
+  // stream: two packets back-to-back parse sequentially
+  const auto pub2 = signal::mqtt_publish("t2", "x", false);
+  std::vector<std::uint8_t> stream = pub;
+  stream.insert(stream.end(), pub2.begin(), pub2.end());
+  std::size_t used = signal::mqtt_parse_one(stream.data(), stream.size(), p);
+  CHECK(used == pub.size());
+  used += signal::mqtt_parse_one(stream.data() + used, stream.size() - used, p);
+  CHECK(used == stream.size());
+  CHECK(p.payload == "x");
+
+  // CONNECT: protocol name and version present, clean session flag set
+  const auto con = signal::mqtt_connect("shopot-abcd1234", 60);
+  signal::MqttPacket cp;
+  CHECK(signal::mqtt_parse_one(con.data(), con.size(), cp) == con.size());
+  CHECK((cp.type_flags >> 4) == 1);
+  CHECK(cp.payload.size() > 10);
+  CHECK(std::memcmp(cp.payload.data() + 2, "MQTT", 4) == 0);
+  CHECK(cp.payload[6] == 0x04);  // level 4 = MQTT 3.1.1
+  CHECK((cp.payload[7] & 0x02) != 0);
+
+  // SUBSCRIBE + PINGREQ + DISCONNECT frame shapes
+  const auto sub = signal::mqtt_subscribe("t", 1);
+  CHECK(signal::mqtt_parse_one(sub.data(), sub.size(), p) == sub.size());
+  CHECK((p.type_flags >> 4) == 8);
+  const auto ping = signal::mqtt_pingreq();
+  CHECK(ping.size() == 2 && ping[0] == 0xC0);
+  const auto bye = signal::mqtt_disconnect();
+  CHECK(bye.size() == 2 && bye[0] == 0xE0);
+
+  // truncation: parser waits for more bytes instead of overrunning
+  CHECK(signal::mqtt_parse_one(pub.data(), pub.size() - 1, p) == 0);
+}
+
+// live round-trip against a real public broker; network-gated so CI stays hermetic
+static void test_live_mqtt() {
+  if (!std::getenv("SHOPOT_LIVE_MQTT")) {
+    std::cout << "(skipped: set SHOPOT_LIVE_MQTT=1)\n";
+    return;
+  }
+#ifdef SHOPOT_WITH_RTC
+  const char* url_env = std::getenv("SHOPOT_LIVE_MQTT_URL");
+  const std::string url = url_env ? url_env : "wss://broker.emqx.io:8084/mqtt";
+  signal::MqttClient cl(url);
+  if (!cl.connect_wait(15000)) {
+    std::cout << "live mqtt: CONNECT FAILED (" << url << ")\n";
+    ++g_failures;
+    return;
+  }
+  std::cout << "live mqtt: connected\n";
+  const std::string topic = "shopot-selftest-" + crypto::new_id().substr(0, 8);
+  cl.subscribe(topic);
+  cl.publish(topic, "ping", true);
+  bool got = false;
+  for (int i = 0; i < 75 && !got; ++i) {
+    cl.pump(200);
+    for (auto& p : cl.drain())
+      if (p.topic == topic && p.payload == "ping") got = true;
+  }
+  CHECK(got);
+  std::cout << (got ? "live mqtt: subscribe+publish+echo ok\n" : "live mqtt: NO ECHO\n");
+#else
+  std::cout << "(skipped: no RTC)\n";
+#endif
 }
 
 static void test_ratchet() {
@@ -574,6 +701,9 @@ int main() {
   std::cout << "db: ok\n";
   test_ratchet();
   std::cout << "ratchet: ok\n";
+  test_signal();
+  std::cout << "signal: ok\n";
+  test_live_mqtt();
   test_protocol_loopback();
   std::cout << "protocol(loopback): ok\n";
   if (g_failures) {

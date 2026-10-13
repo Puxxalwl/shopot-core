@@ -38,16 +38,16 @@ target_compile_options(shopot-core PRIVATE -Wall -Wextra -Wno-unused-parameter)
 if(SHOPOT_WITH_RTC)
   set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
   set(NO_TESTS ON CACHE BOOL "" FORCE)
-  set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+  set(NO_WEBSOCKET OFF CACHE BOOL "" FORCE)  # WebSocket: the rendezvous relay client
   set(NO_MEDIA ON CACHE BOOL "" FORCE)
   FetchContent_Declare(libdatachannel
     GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
     GIT_TAG v0.23.2
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(libdatachannel)
-  target_sources(shopot-core PRIVATE src/transport/rtc.cpp)
+  target_sources(shopot-core PRIVATE src/transport/rtc.cpp src/transport/mqtt.cpp)
   target_link_libraries(shopot-core PRIVATE datachannel)
-  target_compile_definitions(shopot-core PRIVATE SHOPOT_WITH_RTC=1)
+  target_compile_definitions(shopot-core PRIVATE SHOPOT_WITH_RTC=1 RTC_ENABLE_WEBSOCKET=1)
 endif()
 
 if(SHOPOT_BUILD_CLI AND SHOPOT_WITH_RTC)
@@ -60,5 +60,9 @@ if(SHOPOT_BUILD_TESTS)
   add_executable(shopot-tests tests/test_main.cpp)
   target_include_directories(shopot-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(shopot-tests PRIVATE shopot-core nlohmann_json::nlohmann_json)
+  if(SHOPOT_WITH_RTC)  # live-mqtt test includes rtc headers via mqtt.hpp
+    target_compile_definitions(shopot-tests PRIVATE SHOPOT_WITH_RTC=1 RTC_ENABLE_WEBSOCKET=1)
+    target_include_directories(shopot-tests PRIVATE ${CMAKE_BINARY_DIR}/_deps/libdatachannel-src/include)
+  endif()
   add_test(NAME shopot-tests COMMAND shopot-tests)
 endif()

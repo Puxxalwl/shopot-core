@@ -61,6 +61,7 @@ void print_help() {
   fp                          show your safety number
   contacts                    list contacts (* = online)
   add <name> <bundle>         add a contact
+  auto <id>                   automatic connect via public relay (both sides)
   offer <id>                  create a connection code for contact
   answer <id> <code>          accept their code, prints yours to send back
   accept <id> <code>          complete the connection with their answer
@@ -177,6 +178,11 @@ int main(int argc, char** argv) {
         ss >> id >> code;
         engine.handle_answer(id, code);
         say("answer applied, connecting...");
+      } else if (cmd == "auto") {
+        std::int64_t id;
+        ss >> id;
+        engine.connect_auto(id);
+        say("searching the peer via relay... (run 'auto' on both sides)");
       } else if (cmd == "msg") {
         std::int64_t id;
         ss >> id;

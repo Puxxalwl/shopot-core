@@ -101,8 +101,11 @@ ev.on_file_ready= [](int64_t cid, const shopot::Message& m, const std::string& p
 shopot::Engine engine(cfg, mnemonic, ev);
 
 auto cid   = engine.add_contact(peer_bundle, "Alice");
-auto code  = engine.make_offer(cid);            // show as QR / text
-engine.handle_answer(cid, answer_code);         // when peer replies
+
+// connect — automatic: both peers call connect_auto, they find each other
+// through public relays (topics/keys derive from the room hash; relays see
+// nothing readable). Manual codes still work: make_offer / handle_answer.
+engine.connect_auto(cid);
 
 auto msgId = engine.send_text(cid, "hi");       // safe while offline: queues
 auto file  = engine.send_file(cid, "/tmp/voice.opus", "audio/ogg",
@@ -153,15 +156,21 @@ mid-session leak of ratchet state heals at the next DH rotation
 **Does not defeat:** a compromised endpoint (nothing can), physical access to
 an unlocked device, a global passive adversary correlating *timing* of the two
 peers' traffic (use the Tor-pluggable transport — Roadmap), MITM during code
-exchange (defeated by comparing fingerprints out-of-band).
+exchange (defeated by comparing fingerprints out-of-band). The optional
+automatic rendezvous adds one more observer: the public relay, which learns
+"two anonymous IPs searched for the same opaque topic around the same time"
+— nothing readable, nothing attributable, but it is a metadata witness.
 
 ## Roadmap
 
 - [x] **Double Ratchet** — fresh message key per frame, alternating DH
       rotation (post-compromise healing), race-free by construction
 - [x] **64 KiB chunks + O(1) live sends** — 32 MiB/s engine path on loopback
-- [ ] Pluggable rendezvous (`ISignaling`): Nostr relays / BitTorrent trackers
-      for automatic reconnects without code exchange
+- [x] **Automatic rendezvous** — both peers press "connect" and find each
+      other via public MQTT-over-TLS relays; topic and keys derive from the
+      pairwise room hash, so relays see only an opaque hash and a sealed blob
+- [ ] Alternative rendezvous backends: Nostr relays / BitTorrent trackers
+      (pluggable `ISignaling` interface is in place)
 - [ ] File transfer resume across sessions (chunk bitmaps already stored)
 - [ ] Tor onion-service transport (no STUN, no IP leakage at all)
 - [ ] Voice messages: engine-level opus framing helpers
