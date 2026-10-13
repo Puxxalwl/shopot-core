@@ -217,7 +217,7 @@ messages. This is a mathematical property of serverless design, not a bug.
 ## 9. Storage encryption
 
 SQLite (WAL). Sealed at rest with the identity storage key: message bodies,
-outbox payloads, file chunks, meta values. Sealed value layout:
+outbox payloads, file chunks, contact labels (local nicknames), meta values. Sealed value layout:
 `nonce(24) ‖ ciphertext ‖ Poly1305 tag(16)`. Schema/column names and record
 counts are not hidden; all content is. In-memory secrets (ratchet state,
 handshake keys, storage key) are wiped when their owning objects die.

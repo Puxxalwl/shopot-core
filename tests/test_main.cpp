@@ -257,6 +257,7 @@ static void test_db() {
     std::ifstream in(path, std::ios::binary);
     const std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     CHECK(raw.find("top secret body") == std::string::npos);
+    CHECK(raw.find("alice") == std::string::npos);  // contact labels are sealed too
   }
 
   // wrong key cannot read

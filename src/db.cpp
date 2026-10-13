@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS contacts(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   enc_pub BLOB NOT NULL UNIQUE,
   sign_pub BLOB NOT NULL,
-  name TEXT NOT NULL,
+  name TEXT NOT NULL,  -- local label, stored SEALED (blob: nonce||ct||tag);
+                       -- legacy plaintext rows are resealed on rename
   created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY,
@@ -132,13 +133,16 @@ std::int64_t Db::add_contact(const crypto::Arr<32>& enc_pk, const crypto::Arr<32
     bind_blob(st.p, 1, enc_pk.data(), enc_pk.size());
     if (sqlite3_step(st.p) == SQLITE_ROW) return sqlite3_column_int64(st.p, 0);
   }
+  // the label is user-assigned metadata (who you talk to) — seal it like bodies
+  const crypto::Bytes sealed_name = seal_col(reinterpret_cast<const std::uint8_t*>(name.data()),
+                                             name.size());
   Stmt st;
   sqlite3_prepare_v2(db_,
                      "INSERT INTO contacts(enc_pub,sign_pub,name,created_at) VALUES(?,?,?,?)",
                      -1, &st.p, nullptr);
   bind_blob(st.p, 1, enc_pk.data(), enc_pk.size());
   bind_blob(st.p, 2, sign_pk.data(), sign_pk.size());
-  bind_text(st.p, 3, name);
+  bind_blob(st.p, 3, sealed_name.data(), sealed_name.size());
   sqlite3_bind_int64(st.p, 4, now_ms());
   if (sqlite3_step(st.p) != SQLITE_DONE) throw std::runtime_error("add_contact failed");
   return sqlite3_last_insert_rowid(db_);
@@ -154,7 +158,19 @@ std::vector<ContactRow> Db::contacts() {
     c.id = sqlite3_column_int64(st.p, 0);
     std::memcpy(c.enc_pk.data(), sqlite3_column_blob(st.p, 1), 32);
     std::memcpy(c.sign_pk.data(), sqlite3_column_blob(st.p, 2), 32);
-    c.name = reinterpret_cast<const char*>(sqlite3_column_text(st.p, 3));
+    {
+      // sealed label; DBs from before name-sealing stored plaintext — keep it
+      // and let the next rename reseal it
+      const auto* nb = static_cast<const std::uint8_t*>(sqlite3_column_blob(st.p, 3));
+      const int nbytes = sqlite3_column_bytes(st.p, 3);
+      try {
+        const crypto::Bytes plain = open_col(crypto::Bytes(nb, nb + (nbytes > 0 ? nbytes : 0)));
+        c.name.assign(reinterpret_cast<const char*>(plain.data()), plain.size());
+      } catch (...) {
+        c.name.assign(reinterpret_cast<const char*>(sqlite3_column_text(st.p, 3)),
+                      static_cast<std::size_t>(nbytes > 0 ? nbytes : 0));
+      }
+    }
     c.created_at = sqlite3_column_int64(st.p, 4);
     out.push_back(std::move(c));
   }
@@ -171,15 +187,27 @@ std::optional<ContactRow> Db::contact(std::int64_t id) {
   c.id = sqlite3_column_int64(st.p, 0);
   std::memcpy(c.enc_pk.data(), sqlite3_column_blob(st.p, 1), 32);
   std::memcpy(c.sign_pk.data(), sqlite3_column_blob(st.p, 2), 32);
-  c.name = reinterpret_cast<const char*>(sqlite3_column_text(st.p, 3));
+  {
+    const auto* nb = static_cast<const std::uint8_t*>(sqlite3_column_blob(st.p, 3));
+    const int nbytes = sqlite3_column_bytes(st.p, 3);
+    try {
+      const crypto::Bytes plain = open_col(crypto::Bytes(nb, nb + (nbytes > 0 ? nbytes : 0)));
+      c.name.assign(reinterpret_cast<const char*>(plain.data()), plain.size());
+    } catch (...) {
+      c.name.assign(reinterpret_cast<const char*>(sqlite3_column_text(st.p, 3)),
+                    static_cast<std::size_t>(nbytes > 0 ? nbytes : 0));
+    }
+  }
   c.created_at = sqlite3_column_int64(st.p, 4);
   return c;
 }
 
 void Db::rename_contact(std::int64_t id, const std::string& name) {
+  const crypto::Bytes sealed = seal_col(reinterpret_cast<const std::uint8_t*>(name.data()),
+                                        name.size());
   Stmt st;
   sqlite3_prepare_v2(db_, "UPDATE contacts SET name=? WHERE id=?", -1, &st.p, nullptr);
-  bind_text(st.p, 1, name);
+  bind_blob(st.p, 1, sealed.data(), sealed.size());
   sqlite3_bind_int64(st.p, 2, id);
   sqlite3_step(st.p);
 }
