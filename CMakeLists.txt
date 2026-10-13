@@ -55,6 +55,10 @@ if(SHOPOT_BUILD_CLI AND SHOPOT_WITH_RTC)
     GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
     GIT_TAG v5.0.0
     GIT_SHALLOW TRUE)
+  # FTXUI defaults to shared libraries; a released binary must not depend on
+  # libftxui-*.so (nobody has it installed). Everything before this point is
+  # already resolved, so the switch only affects FTXUI.
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(ftxui)
   add_executable(shopot-cli cli/main.cpp cli/plain.cpp cli/tui.cpp)
   target_link_libraries(shopot-cli PRIVATE shopot-core
