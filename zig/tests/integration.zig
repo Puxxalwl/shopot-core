@@ -471,7 +471,8 @@ test "outbox: очередь офлайн, доставка при сессии,
     var ctx_b = EngineCtx{ .engine = &eng_b, .contact_id = 1, .harness = &hb };
 
     // 1) офлайн: TEXT уходит в очередь, не в ошибку
-    try std.testing.expectEqual(shopot.core.engine.Engine.SendResult.queued, try eng_b.sendText(1, "offline-digest"));
+    const ocq = try eng_b.sendText(1, "offline-digest");
+    try std.testing.expectEqual(shopot.core.engine.Engine.SendResult.queued, ocq.result);
     try std.testing.expectEqual(@as(usize, 1), eng_b.outbox.items.len);
 
     // 2) поднимаем сессии

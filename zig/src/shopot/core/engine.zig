@@ -54,7 +54,8 @@ pub const Contact = struct {
 pub const Reaction = struct {
     msg_id: [16]u8,
     from: [64]u8, // peer bundle
-    code: u8,
+    /// Unicode code point реакции (u32; U+0000..U+10FFFF).
+    code: u32,
 };
 
 pub const Events = struct {
@@ -149,12 +150,16 @@ pub const Engine = struct {
         return idx;
     }
 
-    /// Куда попал TEXT после sendText.
+    /// Куда попал TEXT после sendText + идентификатор (для истории/статусов).
+    pub const SendOutcome = struct {
+        result: SendResult,
+        msg_id: [16]u8,
+    };
     pub const SendResult = enum { sent, queued };
 
     /// Send text to a contact. Blocked peers are rejected locally.
     /// Нет сессии — сообщение уходит в outbox (доставим при появлении).
-    pub fn sendText(self: *Engine, contact_id: i64, body: []const u8) EngineError!SendResult {
+    pub fn sendText(self: *Engine, contact_id: i64, body: []const u8) EngineError!SendOutcome {
         const idx = self.findIndex(contact_id) orelse return EngineError.NoSession;
         if (self.contacts.items[idx].blocked) return EngineError.Blocked;
         var msg_id: [16]u8 = undefined;
@@ -171,12 +176,12 @@ pub const Engine = struct {
             s.sendEnvelope(env) catch {
                 // сессия умерла между проверкой и записью — в очередь
                 self.outboxAppend(contact_id, msg_id, ts_ms, body) catch {};
-                return .queued;
+                return .{ .result = .queued, .msg_id = msg_id };
             };
-            return .sent;
+            return .{ .result = .sent, .msg_id = msg_id };
         }
         self.outboxAppend(contact_id, msg_id, ts_ms, body) catch return EngineError.OutOfMemory;
-        return .queued;
+        return .{ .result = .queued, .msg_id = msg_id };
     }
 
     /// Положить TEXT в outbox (капа outbox_cap: старое вытесняется).
@@ -252,7 +257,7 @@ pub const Engine = struct {
         if (list.items.len > seen_window) _ = list.orderedRemove(0);
     }
 
-    pub fn react(self: *Engine, contact_id: i64, msg_id: [16]u8, op: u8, code: u8) EngineError!void {
+    pub fn react(self: *Engine, contact_id: i64, msg_id: [16]u8, op: u8, code: u32) EngineError!void {
         const idx = self.findIndex(contact_id) orelse return EngineError.NoSession;
         if (self.contacts.items[idx].blocked) return EngineError.Blocked;
         const s = self.sessions.get(contact_id) orelse return EngineError.NoSession;
@@ -370,7 +375,8 @@ test "engine block and react flow" {
     defer eng.deinit();
     const idx = try eng.addContact("peer", peer.bundle());
     const cid: i64 = @intCast(idx + 1);
-    try std.testing.expectEqual(Engine.SendResult.queued, try eng.sendText(cid, "hi"));
+    const oc = try eng.sendText(cid, "hi");
+    try std.testing.expectEqual(Engine.SendResult.queued, oc.result);
     try eng.block(cid);
     try std.testing.expect(eng.contacts.items[idx].blocked);
     try eng.unblock(cid);

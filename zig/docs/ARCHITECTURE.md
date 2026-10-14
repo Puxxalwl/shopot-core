@@ -9,7 +9,7 @@
 4. Один смысл — один файл. Модуль импортирует только core/interfaces.zig, не соседей.
 
 ## Слои (сверху вниз)
-- app/    REPL/TUI/CLI-сервер (listen/connect/msg/react/block/call)
+- app/    приложение-демон: UDS-апи, инвайты, LAN-поиск, автодозвон, outbox
 - core/   engine (контакты, блокировки, dispatch), session
 - proto/  бинарные конверты, кодек без аллокаций
 - crypto/ identity, handshake, ratchet, call_keys, aead, pad

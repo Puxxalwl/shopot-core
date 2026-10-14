@@ -1,5 +1,6 @@
-//! shopot-zig CLI: тонкий REPL над ядром. Только std, никаких JSON.
-//! Контакты и блокировки живут в шифрованном логе (~/.shopot/zig-log).
+//! shopot-zig: ядро шифрованного мессенджера. Только std, никаких JSON.
+//! Интерфейс для клиентов — UDS-апи (cli_server.zig, см. docs/CORE-API.md).
+//! Контакты, история и блокировки — в шифрованном логе (~/.shopot/zig-log).
 const std = @import("std");
 const shopot = @import("shopot");
 
@@ -20,24 +21,14 @@ const cli_srv = @import("cli_server.zig");
 const cli_mod = cli_srv;
 
 const usage =
-    \\shopot-zig — шифрованный мессенджер (std-only Zig)
+    \\shopot-zig — ядро шифрованного мессенджера (std-only Zig).
+    \\Клиенты подключаются через UDS-апи ($HOME/.shopot/api.sock),
+    \\интерактивного CLI нет. Справка по API — docs/CORE-API.md.
     \\
-    \\  init                        создать личность (~/.shopot/zig-seed, 0600)
-    \\  id                          показать bundle и отпечаток
-    \\  invite [имя] [addr]         односторонний код: держатель делает add
-    \\  add <код|bundle-hex> [имя]  добавить контакт (код — одной командой)
-    \\  chat                        интерактивный мессенджер (TUI) + CLI-апи
-    \\  serve                       демон без локального ввода (только CLI-апи:
-    \\                              UDS ~/.shopot/api.sock)
-    \\  contacts                    список контактов
-    \\  listen <addr:port> <id>     ждать этого контакта (сессия responder)
-    \\  connect <addr:port> <id>    подключиться к контакту
-    \\  msg <id> <текст>            отправить сообщение
-    \\  react <id> <hex32> <код>    реакция на msg_id (hex 32)
-    \\  block <id> / unblock <id>   блокировка
-    \\  quit                        выход
+    \\  init    создать личность (~/.shopot/zig-seed, 0600)
+    \\  id      показать bundle и отпечаток
+    \\  serve   демон: ядро + UDS-апи (см. docs/CORE-API.md)
 ;
-
 fn shopotDir(io: std.Io, home: []const u8) ![512]u8 {
     if (home.len == 0) return error.NoHome;
     var buf: [512]u8 = undefined;
@@ -125,7 +116,7 @@ pub const App = struct {
     sel: usize = 0, // выбранный чат (индекс контакта)
     tz: i32 = 0, // смещение локальной TZ, сек
     tui: bool = false,
-    // ---- CLI-сервер (UDS-апи) ----
+    // ---- UDS-апи (единственный интерфейс для клиентов) ----
     cli: ?*cli_srv.Server = null, // сервер (включён, когда != null)
     cli_out: ?*cli_srv.Conn = null, // кому fb отдаёт ответы команд (под cli_mu)
     cli_mu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // приёмник fb-ответов
@@ -353,6 +344,7 @@ fn onTextEv(ctx: *anyopaque, from: *const engine_mod.Contact, msg_id: [16]u8, _:
     hx = hex_buf[0..];
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
+    persistMsg(app, @intCast(idx + 1), false, msg_id, true, body);
     if (app.tui) {
         app.msgLineLocked(idx, .theirs, from.getName(), body);
     } else {
@@ -383,14 +375,19 @@ fn onReactionEv(ctx: *anyopaque, from: *const engine_mod.Contact, r: engine_mod.
     var hex_buf: [32]u8 = undefined;
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
-    var line: [128]u8 = undefined;
-    const t = std.fmt.bufPrint(&line, "реакция {d} на {s}", .{ r.code, toHex(&hex_buf, &r.msg_id) catch "?" }) catch return;
+    var glyph: [4]u8 = undefined;
+    const glyph_len = std.unicode.utf8Encode(@intCast(r.code), &glyph) catch 0;
+    var line: [160]u8 = undefined;
+    const t = std.fmt.bufPrint(&line, "реакция {s} (U+{X:0>4}) на {s}", .{ glyph[0..glyph_len], r.code, toHex(&hex_buf, &r.msg_id) catch "?" }) catch return;
     if (app.tui) {
         app.sysLineLocked(idx, t);
     } else {
         std.debug.print("\n<< [{s}] {s}\n> ", .{ from.getName(), t });
     }
-    cli_srv.fanoutSysLocked(app, @intCast(idx + 1), from.getName(), t);
+    // машиночитаемое событие для UDS-клиентов: react <msg_id_hex> <codepoint>
+    var ml: [64]u8 = undefined;
+    const mt = std.fmt.bufPrint(&ml, "react {s} {d}", .{ toHex(&hex_buf, &r.msg_id) catch "?", r.code }) catch return;
+    cli_srv.fanoutSysLocked(app, @intCast(idx + 1), from.getName(), mt);
 }
 
 fn onPresenceEv(ctx: *anyopaque, from: *const engine_mod.Contact, online: bool, _: i64) void {
@@ -1151,13 +1148,19 @@ fn cmdMsg(app: *App, args: []const u8) !void {
     const cid = try std.fmt.parseInt(i64, id_str, 10);
     app.lock();
     defer app.unlock();
-    const r = try app.eng.sendText(cid, body);
-    if (r == .queued) {
+    const oc = try app.eng.sendText(cid, body);
+    persistMsg(app, cid, true, oc.msg_id, oc.result == .sent, body);
+    if (oc.result == .queued) {
         persistOutboxAdd(app);
         var qb: [80]u8 = undefined;
         const t = std.fmt.bufPrint(&qb, "в очереди: доставлю, когда {s} появится", .{app.eng.contacts.items[@intCast(cid - 1)].getName()}) catch "в очереди";
         fb(app, @intCast(cid - 1), t);
     }
+    var hxb: [32]u8 = undefined;
+    const hx = toHex(&hxb, &oc.msg_id) catch return;
+    var lb: [64]u8 = undefined;
+    const mt = std.fmt.bufPrint(&lb, "msg_id {s}", .{hx}) catch return;
+    fb(app, @intCast(cid - 1), mt);
 }
 
 fn cmdReact(app: *App, args: []const u8) !void {
@@ -1167,10 +1170,26 @@ fn cmdReact(app: *App, args: []const u8) !void {
     const code_str = it.next() orelse return error.BadArgs;
     const cid = try std.fmt.parseInt(i64, id_str, 10);
     const mid = try parseHex16(mid_hex);
-    const code = try std.fmt.parseInt(u8, code_str, 10);
+    const code = try parseCodepoint(code_str);
+    if (code > 0x10FFFF) return error.BadArgs;
     app.lock();
     defer app.unlock();
     try app.eng.react(cid, mid, envelope.react_add, code);
+}
+
+/// Unicode code point из аргумента: 100, 0x2764, U+2764, ❤ (сам глиф).
+fn parseCodepoint(arg: []const u8) !u32 {
+    if (arg.len == 0) return error.BadArgs;
+    if (arg.len >= 2 and (std.mem.startsWith(u8, arg, "0x") or std.mem.startsWith(u8, arg, "0X")))
+        return std.fmt.parseInt(u32, arg[2..], 16);
+    if (arg.len >= 2 and (std.mem.startsWith(u8, arg, "U+") or std.mem.startsWith(u8, arg, "u+")))
+        return std.fmt.parseInt(u32, arg[2..], 16);
+    // односимвольная UTF-8 последовательность — её кодпоинт
+    const len = std.unicode.utf8ByteSequenceLength(arg[0]) catch return std.fmt.parseInt(u32, arg, 10);
+    if (len == arg.len) {
+        return std.unicode.utf8Decode(arg) catch return error.BadArgs;
+    }
+    return std.fmt.parseInt(u32, arg, 10);
 }
 
 fn cmdBlock(app: *App, args: []const u8, flag: bool) !void {
@@ -1275,6 +1294,123 @@ fn persistOutboxAck(app: *App, cid: i64, msg_id: [16]u8) void {
     _ = log.append(.outbox, &buf) catch {};
 }
 
+/// Записать сообщение в историю (kind msg, шифрованный лог).
+/// ts — реальное локальное время (мс), метка в конверте остаётся приватной.
+fn persistMsg(app: *App, cid: i64, mine: bool, msg_id: [16]u8, delivered: bool, body: []const u8) void {
+    const log = app.log orelse return;
+    if (body.len == 0 or body.len > 4096) return;
+    var buf: [3 + 16 + 8 + 2 + 4096]u8 = undefined;
+    std.mem.writeInt(u16, buf[0..2], @intCast(cid), .little);
+    // бит0 = mine, бит1 = delivered
+    buf[2] = @as(u8, @intFromBool(mine)) | (@as(u8, @intFromBool(delivered)) << 1);
+    @memcpy(buf[3 .. 3 + 16], &msg_id);
+    std.mem.writeInt(u64, buf[19..27], @intCast(app.nowMs()), .little);
+    std.mem.writeInt(u16, buf[27..29], @intCast(body.len), .little);
+    @memcpy(buf[29 .. 29 + body.len], body);
+    _ = log.append(.msg, buf[0 .. 29 + body.len]) catch {};
+}
+
+/// history <cid> [limit]: последние N сообщений контакта (по логу).
+fn cmdGetHistory(app: *App, args: []const u8) !void {
+    var it = std.mem.tokenizeAny(u8, args, " ");
+    const cid = try std.fmt.parseInt(i64, it.next() orelse return error.BadArgs, 10);
+    const limit = it.next() orelse "50";
+    const n = try std.fmt.parseInt(u32, limit, 10);
+    {
+        app.lock();
+        defer app.unlock();
+        if (cid < 1 or cid > app.eng.contacts.items.len) return error.NoContact;
+    }
+    const log = app.log orelse return;
+    // записи: [cid u16][flags u8][msg_id 16][ts u64][len u16][body]
+    const recs = log.readAll(.msg, app.alloc) catch return;
+    defer {
+        for (recs) |r| app.alloc.free(r);
+        app.alloc.free(recs);
+    }
+    var total: usize = 0;
+    var start: usize = recs.len; // индекс первой записи окна
+    {
+        var count: usize = 0;
+        var i: usize = recs.len;
+        while (i > 0) {
+            i -= 1;
+            const rec = recs[i];
+            if (rec.len < 29) continue;
+            if (std.mem.readInt(u16, rec[0..2], .little) != cid) continue;
+            total += 1;
+            count += 1;
+            if (count == n) {
+                start = i;
+                break;
+            }
+        }
+        if (i == 0 and start == recs.len) start = 0;
+    }
+    var idx2 = start;
+    while (idx2 < recs.len) : (idx2 += 1) {
+        const rec = recs[idx2];
+        if (rec.len < 29) continue;
+        if (std.mem.readInt(u16, rec[0..2], .little) != cid) continue;
+        const flags = rec[2];
+        const msg_id: [16]u8 = rec[3 .. 3 + 16].*;
+        const ts_ms = std.mem.readInt(u64, rec[19..27], .little);
+        const blen = std.mem.readInt(u16, rec[27..29], .little);
+        if (rec.len < 29 + blen) continue;
+        var hxb: [32]u8 = undefined;
+        const hx = toHex(&hxb, &msg_id) catch continue;
+        var line: [256]u8 = undefined;
+        const t = std.fmt.bufPrint(&line, "msg {s} {s} {d} {s}", .{
+            if (flags & 1 != 0) "mine" else "theirs",
+            hx,
+            ts_ms,
+            rec[29 .. 29 + blen],
+        }) catch continue;
+        fb(app, @intCast(cid - 1), t);
+    }
+    var fin: [48]u8 = undefined;
+    const f = std.fmt.bufPrint(&fin, "hist_end {d} {d}", .{ cid, total }) catch return;
+    fb(app, null, f);
+}
+
+/// getmessage <msg_id_hex>: одно сообщение по идентификатору.
+fn cmdGetMessage(app: *App, args: []const u8) !void {
+    const trimmed = std.mem.trim(u8, args, " ");
+    if (trimmed.len == 0) return error.BadArgs;
+    const want = try parseHex16(trimmed);
+    const log = app.log orelse return;
+    const recs = log.readAll(.msg, app.alloc) catch return;
+    defer {
+        for (recs) |r| app.alloc.free(r);
+        app.alloc.free(recs);
+    }
+    var last: ?[]u8 = null;
+    for (recs) |rec| {
+        if (rec.len < 29) continue;
+        if (!std.mem.eql(u8, rec[3 .. 3 + 16], &want)) continue;
+        last = rec;
+    }
+    const rec = last orelse {
+        fb(app, null, "не найдено");
+        return;
+    };
+    const flags = rec[2];
+    const cid = std.mem.readInt(u16, rec[0..2], .little);
+    const ts_ms = std.mem.readInt(u64, rec[19..27], .little);
+    const blen = std.mem.readInt(u16, rec[27..29], .little);
+    var hxb: [32]u8 = undefined;
+    const hx = toHex(&hxb, &want) catch return;
+    var line: [256]u8 = undefined;
+    const t = std.fmt.bufPrint(&line, "msg {s} {d} {s} {d} {s}", .{
+        if (flags & 1 != 0) "mine" else "theirs",
+        cid,
+        hx,
+        ts_ms,
+        rec[29..@min(29 + blen, rec.len)],
+    }) catch return;
+    fb(app, null, t);
+}
+
 fn loadContacts(app: *App) void {
     const log = app.log orelse return;
     const recs = log.readAll(.contact, app.alloc) catch return;
@@ -1349,249 +1485,9 @@ fn loadContacts(app: *App) void {
     }
 }
 
-/// Построчное чтение stdin: readStreaming может вернуть 0 без данных —
-/// тогда короткий сон и повтор. EndOfStream только на настоящем закрытии.
-fn readLine(buf: []u8) ![]u8 {
-    var n: usize = 0;
-    while (true) {
-        if (n == buf.len) return error.StreamTooLong;
-        const got = std.posix.read(0, buf[n..]) catch |e| switch (e) {
-            error.WouldBlock => {
-                std.Thread.yield() catch {};
-                continue;
-            },
-            else => return e,
-        };
-        if (got == 0) return error.EndOfStream;
-        if (std.mem.indexOfScalar(u8, buf[n .. n + got], '\n')) |ix| {
-            return buf[0 .. n + ix];
-        }
-        n += got;
-    }
-}
-
-var stdin_file: std.Io.File = undefined;
-
-// ------------------------------------------------------------------ TUI
-/// Мини-билдер строк кадра: копирует байты и считает ЗАНЯТЫЕ КОЛОНКИ
-/// (ANSI-эскейпы не считаются) — для выравнивания рамок.
-const StrBuf = struct {
-    buf: []u8,
-    n: usize = 0,
-    cols: usize = 0,
-    in_esc: bool = false,
-
-    fn init(buf: []u8) StrBuf {
-        return .{ .buf = buf };
-    }
-
-    fn add(self: *StrBuf, bytes: []const u8) void {
-        if (self.n + bytes.len > self.buf.len) return;
-        @memcpy(self.buf[self.n .. self.n + bytes.len], bytes);
-        self.n += bytes.len;
-        var i: usize = 0;
-        while (i < bytes.len) {
-            const b = bytes[i];
-            if (b == 0x1B) {
-                self.in_esc = true;
-                i += 1;
-                continue;
-            }
-            if (self.in_esc) {
-                if (b == 'm') self.in_esc = false;
-                i += 1;
-                continue;
-            }
-            const l = std.unicode.utf8ByteSequenceLength(b) catch 1;
-            self.cols += 1;
-            i += l;
-        }
-    }
-};
-
-/// Помощник записи в буфер кадра.
-const W = struct {
-    fn put(buf: []u8, n: *usize, bytes: []const u8) void {
-        if (n.* + bytes.len > buf.len) return;
-        @memcpy(buf[n.* .. n.* + bytes.len], bytes);
-        n.* += bytes.len;
-    }
-
-    /// Строка панели: │ mid дополненный пробелами до cols │ (+перевод строки).
-    /// used — колонки, занятые mid (по счётчику StrBuf).
-    fn row(buf: []u8, n: *usize, mid: []const u8, used: usize, cols: usize) void {
-        put(buf, n, tui_mod.c.dim);
-        put(buf, n, "│");
-        put(buf, n, tui_mod.c.reset);
-        put(buf, n, mid);
-        if (used < cols) {
-            var pad: [256]u8 = @splat(' ');
-            var left = cols - used;
-            while (left > 0) {
-                const chunk = @min(left, pad.len);
-                put(buf, n, pad[0..chunk]);
-                left -= chunk;
-            }
-        }
-        put(buf, n, tui_mod.c.dim);
-        put(buf, n, "│");
-        put(buf, n, tui_mod.c.reset);
-        put(buf, n, "\r\n");
-    }
-
-    /// Строка из простого текста (без цветов).
-    fn rowPlain(buf: []u8, n: *usize, mid: []const u8, cols: usize) void {
-        row(buf, n, mid, plainCols(mid), cols);
-    }
-
-    fn plainCols(s_: []const u8) usize {
-        var cols: usize = 0;
-        var i: usize = 0;
-        while (i < s_.len) {
-            const l = std.unicode.utf8ByteSequenceLength(s_[i]) catch 1;
-            if (i + l > s_.len) break;
-            cols += 1;
-            i += l;
-        }
-        return cols;
-    }
-};
-
-/// Двухпанельный мессенджер (голый ANSI):
-/// слева список чатов (выбор, онлайн, возраст последнего пакета,
-/// непрочитанные), справа лента с временем, шапка контакта и поле
-/// ввода в рамке; внизу — строка клавиш. Полный кадр каждые 150 мс.
-fn tuiLoop(app: *App) !void {
-    app.tui = true;
-    var kb = try tui_mod.Keyboard.init();
-    defer kb.deinit();
-    tui_mod.enterScreen();
-    defer tui_mod.leaveScreen();
-
-    var input: [512]u8 = undefined;
-    var input_len: usize = 0;
-    var scroll: u32 = 0; // строк от низа ленты
-    var frame: [49152]u8 = undefined;
-
-    while (app.running) {
-        const n = renderTui(app, input[0..input_len], &scroll, &frame);
-        tui_mod.writeAllRaw(frame[0..n]);
-
-        const key = kb.poll(150);
-        switch (key) {
-            .none => {},
-            .ctrl_c => app.running = false,
-            .esc => input_len = 0,
-            .enter => {
-                if (input_len == 0) continue;
-                scroll = 0;
-                if (input[0] == '/') {
-                    if (!execCmd(app, input[1..input_len])) app.running = false;
-                } else {
-                    app.lock();
-                    const nc = app.eng.contacts.items.len;
-                    if (nc == 0) {
-                        app.sysLineLocked(null, "нет чатов: /add shopot1.код");
-                    } else {
-                        const cid: i64 = @intCast(app.sel + 1);
-                        const name = app.eng.contacts.items[app.sel].getName();
-                        const r = app.eng.sendText(cid, input[0..input_len]) catch |e| {
-                            var eb: [64]u8 = undefined;
-                            const t = std.fmt.bufPrint(&eb, "! ошибка: {s}", .{@errorName(e)}) catch "!";
-                            app.sysLineLocked(app.sel, t);
-                            return;
-                        };
-                        if (r == .queued) {
-                            persistOutboxAdd(app);
-                            app.sysLineLocked(app.sel, "в очереди: доставлю, когда контакт появится");
-                        }
-                        app.msgLineLocked(app.sel, .mine, name, input[0..input_len]);
-                    }
-                    app.unlock();
-                }
-                input_len = 0;
-            },
-            .tab => {
-                app.lock();
-                const nc = app.eng.contacts.items.len;
-                if (nc > 0) {
-                    app.sel = (app.sel + 1) % nc;
-                    app.threads[app.sel].unread = 0;
-                }
-                app.unlock();
-                scroll = 0;
-            },
-            .up => scroll +%= 1,
-            .down => {
-                if (scroll > 0) scroll -= 1;
-            },
-            .backspace => {
-                if (input_len > 0) {
-                    input_len -= 1;
-                    while (input_len > 0 and (input[input_len] & 0xC0) == 0x80) input_len -= 1;
-                }
-            },
-            .alt => |code| switch (code) {
-                // Alt+q/Ctrl+C — выход; буквы всегда идут в текст ввода
-                'q' => {
-                    app.running = false;
-                    return;
-                },
-                'c' => {
-                    app.lock();
-                    const nc = app.eng.contacts.items.len;
-                    app.unlock();
-                    if (nc > 0) {
-                        var cb: [16]u8 = undefined;
-                        const cid_str = std.fmt.bufPrint(&cb, "{d}", .{app.sel + 1}) catch continue;
-                        cmdCall(app, cid_str) catch |e| {
-                            fb(app, app.sel, fmtErr(&cb, "звонок", e));
-                        };
-                    } else fb(app, null, "нет чатов");
-                    continue;
-                },
-                'a' => {
-                    cmdAnswer(app) catch |e| {
-                        var eb: [64]u8 = undefined;
-                        const t2 = std.fmt.bufPrint(&eb, "! звонок: {s}", .{@errorName(e)}) catch "!";
-                        fb(app, null, t2);
-                    };
-                    continue;
-                },
-                'h' => {
-                    cmdHangup(app) catch {};
-                    continue;
-                },
-                'b' => {
-                    app.lock();
-                    const nc = app.eng.contacts.items.len;
-                    const blocked = if (nc > 0) app.eng.contacts.items[app.sel].blocked else false;
-                    app.unlock();
-                    if (nc > 0) {
-                        var cb: [16]u8 = undefined;
-                        const cid_str = std.fmt.bufPrint(&cb, "{d}", .{app.sel + 1}) catch continue;
-                        cmdBlock(app, cid_str, !blocked) catch {};
-                        fb(app, app.sel, if (!blocked) "контакт заблокирован" else "контакт разблокирован");
-                    }
-                    continue;
-                },
-                else => {},
-            },
-            .char => |ch| {
-                if (input_len + ch.len <= input.len) {
-                    @memcpy(input[input_len .. input_len + ch.len], ch);
-                    input_len += ch.len;
-                    scroll = 0;
-                }
-            },
-            .unknown => {},
-        }
-    }
-}
-
-/// Сообщение для пользователя: в TUI — строка ленты, в REPL — печать.
+/// Ответ на команду: уходит подключённому UDS-клиенту (cli_out), иначе — в лог демона.
 fn fb(app: *App, idx: ?usize, txt: []const u8) void {
-    // CLI-клиент ждёт ответа команды — отдаём ему, а не в терминал
+    // UDS-клиент ждёт ответа команды — отдаём ему, а не в лог демона
     {
         app.cliLock();
         defer app.cliUnlock();
@@ -1613,412 +1509,7 @@ fn fmtErr(buf: []u8, what: []const u8, e: anyerror) []const u8 {
     return std.fmt.bufPrint(buf, "! {s}: {s}", .{ what, @errorName(e) }) catch "!";
 }
 
-/// Полный кадр TUI. Возвращает длину записанного.
-fn renderTui(app: *App, input: []const u8, scroll: *u32, frame: []u8) usize {
-    const T = tui_mod;
-    const sz = T.termSize();
-    const w: usize = sz.w;
-    const h: usize = sz.h;
-    var n: usize = 0;
-    // курсор в дом: каждый кадр перезаписывает экран поверх предыдущего
-    W.put(frame, &n, "\x1b[H");
-
-    if (w < 60 or h < 12) {
-        W.put(frame, &n, T.c.dim);
-        var msg: [64]u8 = undefined;
-        const t = std.fmt.bufPrint(&msg, " терминал мал: нужно 60x12, сейчас {d}x{d} ", .{ w, h }) catch " мал ";
-        W.put(frame, &n, t);
-        W.put(frame, &n, T.c.reset);
-        return n;
-    }
-
-    // сетка: │ сайдбар │ чат │
-    const sw: usize = if (w >= 100) 28 else 24; // контент сайдбара
-    const cw: usize = w - sw - 3; // контент чата
-    const rows_msg: usize = h - 7; // строки ленты
-    const name_w: usize = sw - 12; // имя в сайдбаре
-
-    // ---------------- строка 0: ┌─ shopot · :7777 ──┬────┐
-    W.put(frame, &n, T.c.dim);
-    W.put(frame, &n, "┌");
-    {
-        var tb: [40]u8 = undefined;
-        const title = std.fmt.bufPrint(&tb, " shopot · :{d} · LAN ", .{app.listen_port}) catch " shopot ";
-        const tl = @min(title.len, sw);
-        W.put(frame, &n, T.c.cyan);
-        W.put(frame, &n, T.c.bold);
-        W.put(frame, &n, title[0..tl]);
-        W.put(frame, &n, T.c.reset);
-        W.put(frame, &n, T.c.dim);
-        var k: usize = 0;
-        while (k < sw - tl) : (k += 1) W.put(frame, &n, "─");
-    }
-    W.put(frame, &n, "┬");
-    var k2: usize = 0;
-    while (k2 < cw) : (k2 += 1) W.put(frame, &n, "─");
-    W.put(frame, &n, "┐");
-    W.put(frame, &n, T.c.reset);
-    W.put(frame, &n, "\r\n");
-
-    // ---------------- строка 1: шапки панелей
-    {
-        var mid_s: [64]u8 = undefined;
-        var sb = StrBuf.init(&mid_s);
-        app.lock();
-        const nc = app.eng.contacts.items.len;
-        var online_cnt: usize = 0;
-        for (app.eng.contacts.items) |ct| {
-            if (ct.online and !ct.blocked) online_cnt += 1;
-        }
-        sb.add(T.c.bold);
-        sb.add(" ЧАТЫ");
-        sb.add(T.c.reset);
-        sb.add(T.c.dim);
-        var cnt: [24]u8 = undefined;
-        const cts = std.fmt.bufPrint(&cnt, "  {d}/{d} online", .{ online_cnt, nc }) catch "";
-        sb.add(cts);
-        sb.add(T.c.reset);
-
-        var mid_c: [160]u8 = undefined;
-        var cb = StrBuf.init(&mid_c);
-        if (nc > 0) {
-            const ct = app.eng.contacts.items[app.sel];
-            var nb: [24]u8 = undefined;
-            const name = T.trunc(&nb, ct.getName(), 16);
-            cb.add(" ");
-            cb.add(T.c.bold);
-            cb.add(name);
-            cb.add(T.c.reset);
-            if (ct.blocked) {
-                cb.add("  ");
-                cb.add(T.c.red);
-                cb.add("✕ заблокирован");
-                cb.add(T.c.reset);
-            } else if (app.call) |cc| {
-                if (cc.cid == @as(i64, @intCast(app.sel + 1))) {
-                    var db: [12]u8 = undefined;
-                    const dur = T.fmtDur(&db, app.nowMs() - cc.start_ms);
-                    cb.add("  ");
-                    cb.add(T.c.yellow);
-                    cb.add(T.c.bold);
-                    cb.add("ЗВОНОК ");
-                    cb.add(dur);
-                    cb.add(T.c.reset);
-                }
-            }
-            if (!ct.blocked and (app.call == null or app.call.?.cid != @as(i64, @intCast(app.sel + 1)))) {
-                if (ct.online) {
-                    const seen = app.eng.lastSeen(@intCast(app.sel + 1)) orelse 0;
-                    var ab: [12]u8 = undefined;
-                    const age = T.fmtAge(&ab, app.nowMs() - seen);
-                    cb.add("  ");
-                    cb.add(T.c.green);
-                    cb.add("● ");
-                    cb.add(age);
-                    cb.add(T.c.reset);
-                } else {
-                    cb.add("  ");
-                    cb.add(T.c.dim);
-                    cb.add("○ офлайн");
-                    cb.add(T.c.reset);
-                }
-            }
-        } else {
-            cb.add(T.c.dim);
-            cb.add(" нет чата — /add shopot1.код");
-            cb.add(T.c.reset);
-        }
-        app.unlock();
-        W.row(frame, &n, mid_s[0..sb.n], sb.cols, sw);
-        W.row(frame, &n, mid_c[0..cb.n], cb.cols, cw);
-    }
-
-    // ---------------- строка 2: пересечения ├──┼──┤
-    W.put(frame, &n, T.c.dim);
-    W.put(frame, &n, "├");
-    var k3: usize = 0;
-    while (k3 < sw) : (k3 += 1) W.put(frame, &n, "─");
-    W.put(frame, &n, "┼");
-    var k4: usize = 0;
-    while (k4 < cw) : (k4 += 1) W.put(frame, &n, "─");
-    W.put(frame, &n, "┤");
-    W.put(frame, &n, T.c.reset);
-    W.put(frame, &n, "\r\n");
-
-    // ---------------- данные под лок (снапшот в стек)
-    app.lock();
-    const nc = app.eng.contacts.items.len;
-    const sel: ?usize = if (app.sel < nc) app.sel else null;
-    const now = app.nowMs();
-
-    var entry_buf: [18][96]u8 = undefined;
-    var entry_cols: [18]usize = @splat(0);
-    var entry_len: [18]usize = @splat(0);
-    const max_entries: usize = @min(rows_msg + 2, entry_buf.len);
-    var shown_entries: usize = 0;
-    {
-        var i: usize = 0;
-        while (i < nc and shown_entries < max_entries) : (i += 1) {
-            const ct = app.eng.contacts.items[i];
-            var sb = StrBuf.init(&entry_buf[shown_entries]);
-            if (i == app.sel) {
-                sb.add(T.c.cyan);
-                sb.add(T.c.bold);
-                sb.add("› ");
-            } else sb.add("  ");
-            sb.add(T.c.reset);
-            var nb: [28]u8 = undefined;
-            const name = T.trunc(&nb, ct.getName(), name_w);
-            var padname: [30]u8 = @splat(' ');
-            @memcpy(padname[0..name.len], name);
-            sb.add(padname[0..name_w]);
-            if (ct.blocked) {
-                sb.add(T.c.red);
-                sb.add("✕");
-                sb.add(T.c.reset);
-            } else if (ct.online) {
-                sb.add(T.c.green);
-                sb.add("●");
-                sb.add(T.c.reset);
-                const seen = app.eng.lastSeen(@intCast(i + 1)) orelse 0;
-                var ab: [10]u8 = undefined;
-                const age = T.fmtAge(&ab, now - seen);
-                var agepad: [8]u8 = @splat(' ');
-                var al: usize = 0;
-                while (al + age.len < 5) : (al += 1) {}
-                sb.add(T.c.dim);
-                sb.add(agepad[0..al]);
-                sb.add(age);
-                sb.add(T.c.reset);
-            } else {
-                sb.add(T.c.dim);
-                sb.add("○");
-                sb.add(T.c.reset);
-            }
-            if (i != app.sel and app.threads[i].unread > 0) {
-                var ub: [12]u8 = undefined;
-                const us = std.fmt.bufPrint(&ub, " {d}", .{app.threads[i].unread}) catch "";
-                sb.add(T.c.cyan);
-                sb.add(T.c.bold);
-                sb.add(us);
-                sb.add(T.c.reset);
-            }
-            entry_cols[shown_entries] = sb.cols;
-            entry_len[shown_entries] = sb.n;
-            shown_entries += 1;
-        }
-    }
-
-    var msg_buf: [48][300]u8 = undefined;
-    var msg_cols: [48]usize = @splat(0);
-    var msg_len: [48]usize = @splat(0);
-    var shown_msgs: usize = 0;
-    if (sel) |si| {
-        const th = &app.threads[si];
-        if (th.count == 0) {
-            var sb = StrBuf.init(&msg_buf[0]);
-            sb.add(T.c.dim);
-            sb.add(" нет сообщений — напишите первое");
-            sb.add(T.c.reset);
-            msg_cols[0] = sb.cols;
-            msg_len[0] = sb.n;
-            shown_msgs = 1;
-        } else {
-            var sp = scroll.*;
-            if (sp >= th.count) sp = @intCast(th.count - 1);
-            scroll.* = sp;
-            var show: usize = @min(th.count, rows_msg);
-            if (sp > 0 and show > 1) show -= 1;
-            var base: usize = th.count - show;
-            if (base >= sp) base -= sp else base = 0;
-            var r: usize = 0;
-            while (r < show and r < msg_buf.len) : (r += 1) {
-                const line = th.at(@intCast(base + r));
-                var sb = StrBuf.init(&msg_buf[r]);
-                var tsb: [8]u8 = undefined;
-                const clock = T.fmtClock(&tsb, line.ts, app.tz);
-                sb.add(T.c.dim);
-                sb.add(" ");
-                sb.add(clock);
-                sb.add("  ");
-                switch (line.kind) {
-                    .mine => {
-                        sb.add(T.c.reset);
-                        sb.add(T.c.green);
-                        sb.add(T.c.bold);
-                        sb.add("я");
-                        sb.add(T.c.reset);
-                        // колонка автора — фикс. 12, как у theirs: текст ровно
-                        var padme: [14]u8 = @splat(' ');
-                        sb.add(padme[0..11]);
-                        sb.add("  ");
-                    },
-                    .theirs => {
-                        sb.add(T.c.reset);
-                        sb.add(T.c.cyan);
-                        sb.add(T.c.bold);
-                        var nb: [26]u8 = undefined;
-                        const name = T.trunc(&nb, line.name(), 12);
-                        var padn: [14]u8 = @splat(' ');
-                        @memcpy(padn[0..name.len], name);
-                        sb.add(padn[0..12]);
-                        sb.add(T.c.reset);
-                        sb.add("  ");
-                    },
-                    .sys => {
-                        sb.add(T.c.dim);
-                    },
-                }
-                const budget = if (sb.cols < cw) cw - sb.cols else 0;
-                var tb: [208]u8 = undefined;
-                const txt = T.trunc(&tb, line.text(), budget);
-                sb.add(txt);
-                sb.add(T.c.reset);
-                msg_cols[r] = sb.cols;
-                msg_len[r] = sb.n;
-                shown_msgs += 1;
-            }
-        }
-    }
-    app.unlock();
-
-    // ---------------- строки контента
-    var row_i: usize = 0;
-    while (row_i < rows_msg) : (row_i += 1) {
-        if (row_i < shown_entries) {
-            W.row(frame, &n, entry_buf[row_i][0..entry_len[row_i]], entry_cols[row_i], sw);
-        } else if (nc == 0 and row_i == shown_entries) {
-            W.rowPlain(frame, &n, " нет чатов", sw);
-        } else {
-            W.rowPlain(frame, &n, " ", sw);
-        }
-        if (row_i < shown_msgs) {
-            W.row(frame, &n, msg_buf[row_i][0..msg_len[row_i]], msg_cols[row_i], cw);
-        } else if (sel == null and row_i == 0) {
-            W.rowPlain(frame, &n, " добавьте контакт: /add shopot1.код", cw);
-        } else {
-            W.rowPlain(frame, &n, " ", cw);
-        }
-    }
-
-    // ---------------- ряды h-4 (сепаратор ввода) и h-3 (ввод)
-    {
-        var s1: [96]u8 = undefined;
-        var s1c: usize = 0;
-        var s1l: usize = 0;
-        var s2: [96]u8 = undefined;
-        var s2c: usize = 0;
-        var s2l: usize = 0;
-        if (rows_msg < shown_entries) {
-            s1c = entry_cols[rows_msg];
-            s1l = entry_len[rows_msg];
-            @memcpy(s1[0..s1l], entry_buf[rows_msg][0..s1l]);
-        }
-        if (rows_msg + 1 < shown_entries) {
-            s2c = entry_cols[rows_msg + 1];
-            s2l = entry_len[rows_msg + 1];
-            @memcpy(s2[0..s2l], entry_buf[rows_msg + 1][0..s2l]);
-        }
-
-        // ряд h-4: │ сайдбар │ ───────── │
-        W.put(frame, &n, T.c.dim);
-        W.put(frame, &n, "│");
-        W.put(frame, &n, T.c.reset);
-        W.put(frame, &n, s1[0..s1l]);
-        if (s1c < sw) {
-            var pad: [96]u8 = @splat(' ');
-            W.put(frame, &n, pad[0 .. sw - s1c]);
-        }
-        W.put(frame, &n, T.c.dim);
-        W.put(frame, &n, "│");
-        W.put(frame, &n, T.c.reset);
-        W.put(frame, &n, T.c.dim);
-        var kk: usize = 0;
-        while (kk < cw) : (kk += 1) W.put(frame, &n, "─");
-        W.put(frame, &n, "│");
-        W.put(frame, &n, T.c.reset);
-        W.put(frame, &n, "\r\n");
-
-        // ряд h-3: │ сайдбар │ ввод │
-        var ib: [600]u8 = undefined;
-        var sb = StrBuf.init(&ib);
-        sb.add(" ");
-        sb.add(T.c.green);
-        sb.add(T.c.bold);
-        sb.add("›");
-        sb.add(T.c.reset);
-        sb.add(" ");
-        var txt: [520]u8 = undefined;
-        const ti = T.trunc(&txt, input, cw - 4);
-        sb.add(ti);
-        if (sb.cols + 1 < cw) sb.add("▌");
-        W.put(frame, &n, T.c.dim);
-        W.put(frame, &n, "│");
-        W.put(frame, &n, T.c.reset);
-        W.put(frame, &n, s2[0..s2l]);
-        if (s2c < sw) {
-            var pad2: [96]u8 = @splat(' ');
-            W.put(frame, &n, pad2[0 .. sw - s2c]);
-        }
-        W.put(frame, &n, T.c.dim);
-        W.put(frame, &n, "│");
-        W.put(frame, &n, T.c.reset);
-        W.put(frame, &n, ib[0..sb.n]);
-        if (sb.cols < cw) {
-            var pad3: [600]u8 = @splat(' ');
-            W.put(frame, &n, pad3[0 .. cw - sb.cols]);
-        }
-        W.put(frame, &n, T.c.dim);
-        W.put(frame, &n, "│");
-        W.put(frame, &n, T.c.reset);
-        W.put(frame, &n, "\r\n");
-    }
-
-    // ---------------- низ: └────┴────┘
-    W.put(frame, &n, T.c.dim);
-    W.put(frame, &n, "└");
-    var k5: usize = 0;
-    while (k5 < sw) : (k5 += 1) W.put(frame, &n, "─");
-    W.put(frame, &n, "┴");
-    var k6: usize = 0;
-    while (k6 < cw) : (k6 += 1) W.put(frame, &n, "─");
-    W.put(frame, &n, "┘");
-    W.put(frame, &n, T.c.reset);
-    W.put(frame, &n, "\r\n");
-
-    // ---------------- подсказки (вне рамки)
-    W.put(frame, &n, T.c.dim);
-    var hints: [256]u8 = undefined;
-    const hl = T.trunc(&hints, " enter отправить · tab чат · ↑↓ лента · /cmd · Alt+c звонок · Alt+a принять · Alt+h сброс · Alt+b блок", w - 1);
-    W.put(frame, &n, hl);
-    W.put(frame, &n, T.c.reset);
-
-    return n;
-}
-
-fn repl(app: *App) !void {
-    stdin_file = std.Io.File.stdin();
-    var line_buf: [2048]u8 = undefined;
-
-    std.debug.print("готов. помощь:\n{s}\n", .{usage});
-    var prompt_visible = true;
-    while (app.running) {
-        if (prompt_visible) std.debug.print("> ", .{});
-        const line = readLine(&line_buf) catch |e| switch (e) {
-            error.EndOfStream => break,
-            else => return e,
-        };
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0) {
-            prompt_visible = false;
-            continue;
-        }
-        prompt_visible = true;
-        if (!execCmd(app, trimmed)) break;
-    }
-}
-
-/// Исполнение команды REPL/TUI (возвращает false для выхода).
+/// Исполнение команды UDS-апи (возвращает false для выхода).
 pub fn execCmd(app: *App, trimmed: []const u8) bool {
     var errbuf: [96]u8 = undefined;
     var it = std.mem.tokenizeAny(u8, trimmed, " ");
@@ -2026,8 +1517,8 @@ pub fn execCmd(app: *App, trimmed: []const u8) bool {
     const rest = std.mem.trim(u8, trimmed[cmd.len..], " ");
 
     if (std.mem.eql(u8, cmd, "help")) {
-        fb(app, null, "invite <имя> · add <код|hex> · msg <id> <текст> · react · block/unblock <id>");
-        fb(app, null, "call <id> · answer · hangup · contacts · connect <addr:port> <id> · listen · quit");
+        fb(app, null, "invite <имя> · add <код|hex> · msg <id> <текст> · react <id> <msg_id> <U+код> · block/unblock <id>");
+        fb(app, null, "gethistory <id> [n] · getmessage <msg_id> · call <id> · answer · hangup · contacts · connect · listen · quit");
     } else if (std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "q")) {
         app.running = false;
     } else if (std.mem.eql(u8, cmd, "contacts")) {
@@ -2040,6 +1531,10 @@ pub fn execCmd(app: *App, trimmed: []const u8) bool {
         cmdMsg(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "msg", e));
     } else if (std.mem.eql(u8, cmd, "react")) {
         cmdReact(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "react", e));
+    } else if (std.mem.eql(u8, cmd, "gethistory") or std.mem.eql(u8, cmd, "history")) {
+        cmdGetHistory(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "gethistory", e));
+    } else if (std.mem.eql(u8, cmd, "getmessage")) {
+        cmdGetMessage(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "getmessage", e));
     } else if (std.mem.eql(u8, cmd, "block")) {
         cmdBlock(app, rest, true) catch |e| fb(app, null, fmtErr(&errbuf, "block", e));
     } else if (std.mem.eql(u8, cmd, "unblock")) {
@@ -2114,7 +1609,7 @@ pub fn main(start: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "serve")) {
+    if (std.mem.eql(u8, cmd, "serve")) {
         // потоки: rx-сессий, тикер presence, accept-loop — аллокатор общий
         var dbg_state = std.heap.DebugAllocator(.{ .thread_safe = true }){};
         const alloc = dbg_state.allocator();
@@ -2139,7 +1634,7 @@ pub fn main(start: std.process.Init) !void {
             pcm_heap = std.fmt.allocPrint(alloc, "{s}/.shopot/pcm", .{home}) catch "";
         }
 
-        // переписки для TUI: heap-массив (стеку 12+ МБ не отдавать)
+        // буфер переписки по контактам: heap-массив (стеку 12+ МБ не отдавать)
         const threads = alloc.alloc(tui_mod.Thread, 256) catch
             return error.OutOfMemory;
         // alloc возвращает сырую память (DebugAllocator заполняет 0xAA):
@@ -2192,25 +1687,12 @@ pub fn main(start: std.process.Init) !void {
             }
         }
 
-        // CLI-фронт-енд: UDS-апи
+        // Единственный интерфейс: UDS-апи для клиентов
         cli_srv.start(&app, home);
-
-        // интерактивный терминал — полноэкранный TUI; иначе — построчный REPL;
-        // serve — безлокальный демон для CLI-клиентов (UDS)
-        const is_tty = blk: {
-            _ = std.posix.tcgetattr(0) catch break :blk false;
-            break :blk true;
-        };
-        if (std.mem.eql(u8, cmd, "serve")) {
-            std.debug.print("serve: работаю без локального ввода, жду CLI-клиентов\n", .{});
-            while (app.running) {
-                const req: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
-                _ = std.os.linux.nanosleep(&req, null);
-            }
-        } else if (is_tty) {
-            try tuiLoop(&app);
-        } else {
-            try repl(&app);
+        std.debug.print("serve: демон работает, UDS-апи готово\n", .{});
+        while (app.running) {
+            const req: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
+            _ = std.os.linux.nanosleep(&req, null);
         }
 
         eng.deinit();

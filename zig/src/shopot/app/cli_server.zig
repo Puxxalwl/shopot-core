@@ -1,13 +1,12 @@
-//! CLI-сервер: UDS-апи поверх одного ядра shopot.
+//! UDS-апи — единственный интерфейс ядра shopot для клиентов.
 //!
 //! Сокет $HOME/.shopot/api.sock, построчный протокол (без JSON, как весь
-//! проект): команды те же, что в REPL/TUI — msg/call/answer/hangup/block/
-//! unblock/contacts/help... Голый текст = сообщение в выбранный чат.
-//! Ответы на команды — произвольные строки (те же тексты, что видит TUI).
+//! проект). Полная спецификация команд/событий — docs/CORE-API.md.
 //! События ядра приходят строками с префиксами:
-//!   msg <cid> <имя> <текст>   — входящее сообщение
-//!   sys <cid> <текст>         — служебная строка (звонки, presence)
-//!   presence <cid> on|off     — контакт на связи / пропал
+//!   msg <cid> <имя> <текст>        — входящее сообщение
+//!   sys <cid> <текст>              — служебная строка (звонки, presence,
+//!                                     delivered/react, подключения)
+//!   presence <cid> on|off          — контакт на связи / пропал
 //! quit — закрыть соединение (не демон).
 const std = @import("std");
 const posix = std.posix;
@@ -164,8 +163,8 @@ fn selectedCid(app: *main.App) ?i64 {
 }
 
 const known_cmds = [_][]const u8{
-    "help", "contacts", "invite", "add",     "msg",    "react", "block", "unblock",
-    "call", "answer",   "hangup", "connect", "listen",
+    "help", "contacts", "invite", "add",     "msg",    "react",      "block",      "unblock",
+    "call", "answer",   "hangup", "connect", "listen", "gethistory", "getmessage",
 };
 
 fn isKnownCmd(word: []const u8) bool {

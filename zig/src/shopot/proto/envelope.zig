@@ -8,7 +8,7 @@
 //! Раскладка кадров:
 //!   TEXT          0x10: msg_id: [16]u8, ts_ms: u64, body: u16 + байты (≤ 4096)
 //!   ACK           0x15: msg_id: [16]u8
-//!   REACT         0x13: msg_id: [16]u8, op: u8, code: u8
+//!   REACT         0x13: msg_id: [16]u8, op: u8, code: u32 (unicode code point)
 //!   BLOCK_NOTICE  0x14: reason: u8
 //!   PRESENCE_PING 0x20: seq: u32, ts_ms: u64
 //!   PRESENCE_PONG 0x21: seq: u32, ts_peer_ms: u64
@@ -89,8 +89,9 @@ pub const React = struct {
     msg_id: [id_len]u8,
     /// 1 = добавить, 2 = снять (см. react_add/react_remove).
     op: u8,
-    /// Код реакции.
-    code: u8,
+    /// Реакция — unicode code point (U+0000..U+10FFFF), например 0x2764 = ❤.
+    /// u32 LE в проводе; рендер (глиф/эмодзи) — задача клиента.
+    code: u32,
 };
 
 /// ACK (0x15): подтверждение доставки TEXT с этим msg_id.
@@ -207,7 +208,7 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
             try w.put(@backingInt(Tag.react));
             try w.putFixed(&m.msg_id);
             try w.put(m.op);
-            try w.put(m.code);
+            try w.putInt(u32, m.code);
         },
         .block_notice => |m| {
             try w.put(@backingInt(Tag.block_notice));
@@ -275,7 +276,7 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
         @backingInt(Tag.react) => .{ .react = .{
             .msg_id = try readId(&r),
             .op = try r.getU8(),
-            .code = try r.getU8(),
+            .code = try r.getInt(u32),
         } },
         @backingInt(Tag.block_notice) => .{ .block_notice = .{
             .reason = try r.getU8(),
@@ -394,18 +395,20 @@ test "TEXT: пустое тело и максимум 4096" {
 
 test "REACT: roundtrip" {
     var buf: [32]u8 = undefined;
-    const src: Envelope = .{ .react = .{
-        .msg_id = filled(id_len, 7),
-        .op = react_add,
-        .code = 42,
-    } };
+    const src: Envelope = .{
+        .react = .{
+            .msg_id = filled(id_len, 7),
+            .op = react_add,
+            .code = 0x2764, // U+2764 = ❤
+        },
+    };
     const wire = try encode(&buf, src);
-    try testing.expectEqual(@as(usize, 1 + id_len + 1 + 1), wire.len);
+    try testing.expectEqual(@as(usize, 1 + id_len + 1 + 4), wire.len);
 
     const back = try decode(wire);
     try testing.expectEqualSlices(u8, &src.react.msg_id, &back.react.msg_id);
     try testing.expectEqual(react_add, back.react.op);
-    try testing.expectEqual(@as(u8, 42), back.react.code);
+    try testing.expectEqual(@as(u32, 0x2764), back.react.code);
 
     const rm: Envelope = .{ .react = .{ .msg_id = filled(id_len, 8), .op = react_remove, .code = 3 } };
     const back_rm = try decode(try encode(&buf, rm));
