@@ -1,5 +1,21 @@
 # Changelog — shopot-zig
 
+## [неизданное] — интерактивный чат и TCP-транспорт
+
+### Added
+- **net/tcp.zig**: блокирующий TCP-транспорт на сырых POSIX-сокетах
+  (socket/connect/bind/listen/accept4/read/write через std.os.linux),
+  адаптер к core-интерфейсу Conn. Намеренно без std.Io: один вызов —
+  один syscall, предсказуемое поведение при потоках CLI. IPv4-литералы
+  адресов, SO_REUSEADDR для быстрых перезапусков. Файл из скоупа net,
+  написан лидом (net-агент неактивен).
+- **app/main.zig**: интерактивный REPL `chat` — add/contacts/listen/
+  connect/msg/react/block/unblock/quit; поток accept-лупа и поток
+  presence-тикера (250 мс, heartbeat-пинги); спин-блокировки на
+  атомарном флаге вместо std.Io.Mutex (дедлок кросс-поточного Io).
+  Контакты и блокировки сохраняются в AEAD-лог при каждом изменении.
+
+
 ## [zig-core 0.1.0] — 2025-10-14
 
 Первый релиз полностью переписанного ядра на Zig 0.17.0. Только std,

@@ -20,6 +20,7 @@ pub const net = struct {
     pub const framing = @import("shopot/net/framing.zig");
     pub const obfuscate = @import("shopot/net/obfuscate.zig");
     pub const heartbeat = @import("shopot/net/heartbeat.zig");
+    pub const tcp = @import("shopot/net/tcp.zig");
 };
 
 pub const store = struct {
@@ -32,6 +33,7 @@ test {
 const std = @import("std");
 
 pub const core = struct {
+    pub const interfaces = @import("shopot/core/interfaces.zig");
     pub const session = @import("shopot/core/session.zig");
     pub const engine = @import("shopot/core/engine.zig");
 };
