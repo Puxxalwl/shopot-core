@@ -28,7 +28,7 @@ std::string status_name(shopot::MsgStatus s) {
 
 void print_help() {
   say(R"(commands:
-  bundle                      show your contact code (share it)
+  id | bundle                 show your contact code (share it)
   fp                          show your safety number
   contacts                    list contacts (* = online)
   add <name> <bundle>         add a contact
@@ -39,6 +39,9 @@ void print_help() {
   offer <id>                  create a connection code for contact
   answer <id> <code>          accept their code, prints yours to send back
   accept <id> <code>          complete the connection with their answer
+  call <id>                   start a call (audio: arecord/aplay, s16le 16k mono)
+  accept | decline            answer the incoming call
+  hangup                      end the current call
   msg <id> <text...>          send a text message (queues if offline)
   send <id> <path> [voice]    send a file / voice note
   hist <id> [n]               show last n messages
@@ -75,6 +78,17 @@ int run_plain(shopot::Config cfg, const std::string& mnemonic) {
     say("new contact from invite: id=" + std::to_string(cid) + " (" + name + ")" +
         "  - connect with: auto " + std::to_string(cid));
   };
+  ev.on_call_event = [](const shopot::CallEvent& ce) {
+    std::string st;
+    switch (ce.state) {
+      case shopot::CallState::OutgoingRing: st = "calling... (hangup to cancel)"; break;
+      case shopot::CallState::IncomingRing: st = "INCOMING CALL - type: accept | decline"; break;
+      case shopot::CallState::Active:       st = "call active (hangup to end)"; break;
+      case shopot::CallState::Ended:        st = "call ended (" + ce.reason + ")"; break;
+      case shopot::CallState::Idle:         break;
+    }
+    if (!st.empty()) say("[" + std::to_string(ce.contact_id) + "] " + st);
+  };
 
   shopot::Engine engine(cfg, mnemonic, ev);
   say("shopot-cli ready. your bundle: " + engine.my_bundle());
@@ -93,8 +107,29 @@ int run_plain(shopot::Config cfg, const std::string& mnemonic) {
       if (cmd == "quit" || cmd == "exit") break;
       if (cmd == "help" || cmd.empty()) {
         print_help();
-      } else if (cmd == "bundle") {
+      } else if (cmd == "bundle" || cmd == "id") {
         say(engine.my_bundle());
+      } else if (cmd == "call") {
+        std::int64_t cid;
+        ss >> cid;
+        engine.start_call(cid);
+      } else if (cmd == "accept" || cmd == "decline") {
+        // incoming call goes to the open contact: plain mode has no "open",
+        // so pick the single ringing one via call_state scan
+        for (const auto& c : engine.contacts()) {
+          if (engine.call_state(c.id) == shopot::CallState::IncomingRing) {
+            engine.answer_call(c.id, cmd == "accept");
+            break;
+          }
+        }
+      } else if (cmd == "hangup") {
+        for (const auto& c : engine.contacts()) {
+          const auto st = engine.call_state(c.id);
+          if (st == shopot::CallState::Active || st == shopot::CallState::OutgoingRing) {
+            engine.end_call(c.id);
+            break;
+          }
+        }
       } else if (cmd == "fp") {
         say(engine.my_fingerprint());
       } else if (cmd == "contacts") {

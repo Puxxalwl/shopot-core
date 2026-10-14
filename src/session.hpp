@@ -34,6 +34,10 @@ struct SessionEvents {
   std::function<void(const FileRow&)> file_progress;
   std::function<void(const FileRow&)> file_ready;  // incoming file assembled & verified
   std::function<void(std::int64_t contact, std::string what)> error;
+  // calls: act is "offer" | "accept" | "reject" | "end", call_id is the tie-breaker
+  std::function<void(const std::string& act, const std::string& call_id)> call_signal;
+  // decrypted audio arriving on the lossy lane (only while a call is up)
+  std::function<void(const std::uint8_t*, std::size_t)> call_audio;
 };
 
 class Session : public std::enable_shared_from_this<Session> {
@@ -54,6 +58,15 @@ public:
   /// Ask the tx thread to re-scan the outbox and pending files.
   void kick();
 
+  /// Call signaling over the reliable lane (ratchet-sealed, ack-free).
+  void send_call_signal(const std::string& act, const std::string& call_id);
+  /// Declare this side's call role so audio keys derive correctly.
+  /// role: "i" = caller, "r" = callee; call ends reset it.
+  void set_call(const std::string& call_id, const char* role);
+  void clear_call();
+  /// Encrypt (per-call key + fresh nonce) and hand to the lossy lane.
+  void send_audio_packet(const std::uint8_t* data, std::size_t len);
+
   // v2 frame helpers (ratchet-sealed): [dh(32)][pn(4)][n(4)][nonce(24)][ct]
   crypto::Bytes ratchet_seal(const std::uint8_t* data, std::size_t len);
   crypto::Bytes ratchet_open(const std::uint8_t* data, std::size_t len);
@@ -69,6 +82,7 @@ private:
   void on_channel_message(const std::uint8_t* data, std::size_t len);
   void handle_control(const std::uint8_t* data, std::size_t len);
   void handle_envelope(const std::uint8_t* data, std::size_t len);
+  void on_audio_packet(const std::uint8_t* data, std::size_t len);
   void handle_chunk(const std::uint8_t* data, std::size_t len);
 
   void maybe_establish();
@@ -108,6 +122,10 @@ private:
 
   std::mutex wr_mu_;
   std::condition_variable wr_cv_;
+
+  std::mutex call_mu_;
+  std::string call_id_;
+  char call_role_ = 0;  // 0 none, 'i' caller, 'r' callee
 };
 
 } // namespace shopot

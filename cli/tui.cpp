@@ -1,7 +1,7 @@
-// shopot-cli — full-screen chat interface (light-blue theme).
+// shopot-cli — full-screen chat interface (quiet dark terminal theme).
 //
-// Keys: Tab/Shift+Tab — switch chat · arrows/PgUp/PgDn/wheel — scroll history ·
-//       Ctrl+O — attach a file or photo · Esc — cancel · /quit or Ctrl+C — exit.
+// Selection/copy: the terminal's own text selection works — mouse reporting
+// is switched off on purpose, so bundle/invite codes can be copied directly.
 #include "tui.hpp"
 #include "support.hpp"
 
@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -20,6 +22,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace ftxui;
 
@@ -29,10 +34,11 @@ struct Entry {
   enum Kind { Text, FileCard, Sys } kind = Text;
   bool outgoing = false;
   bool err = false;
+  bool loud = false;
   std::string time;
   std::string text;
   std::string name;
-  std::string status;  // outgoing: "", "queued", "sent", "delivered"
+  std::string status;
   std::string msg_id;
   std::string file_id;
   std::string file_name;
@@ -48,9 +54,52 @@ struct FileState {
   std::string saved_path;
 };
 
+struct CallUi {
+  int state = 0;  // 0 idle · 1 out ring · 2 in ring · 3 active
+  std::int64_t started_ms = 0;
+  std::int64_t peer = 0;
+  std::string peer_name;
+};
+// arecord/aplay child with an explicit pid (pclose would wait forever for
+// arecord, which exits only on a signal).
+struct Proc {
+  FILE* f = nullptr;
+  pid_t pid = -1;
+  bool live() const { return f != nullptr; }
+  static Proc open(const std::string& cmd, const char* mode) {
+    Proc p;
+    int fds[2];
+    if (pipe(fds) != 0) return p;
+    const pid_t pid = fork();
+    if (pid < 0) { ::close(fds[0]); ::close(fds[1]); return p; }
+    if (pid == 0) {
+      if (std::strcmp(mode, "r") == 0) ::dup2(fds[1], 1);
+      else                            ::dup2(fds[0], 0);
+      ::close(fds[0]); ::close(fds[1]);
+      execlp("/bin/sh", "sh", "-c", cmd.c_str(), (char*)nullptr);
+      _exit(127);
+    }
+    if (std::strcmp(mode, "r") == 0) { ::close(fds[0]); p.f = fdopen(fds[1], "r"); }
+    else                             { ::close(fds[1]); p.f = fdopen(fds[0], "w"); }
+    p.pid = pid;
+    if (!p.f) { ::kill(pid, SIGKILL); int st; waitpid(pid, &st, 0); p.pid = -1; }
+    return p;
+  }
+  void stop() {
+    if (!f) return;
+    ::kill(pid, SIGTERM);
+    fclose(f);
+    f = nullptr;
+    int st;
+    waitpid(pid, &st, 0);
+    pid = -1;
+  }
+};
+
 struct Model {
   std::mutex mu;
   std::vector<shopot::Contact> contacts;
+  CallUi call;
   int selected = 0;
   std::int64_t open = 0;
   std::vector<Entry> hist;
@@ -75,29 +124,44 @@ std::string trunc_name(const std::string& s, std::size_t max) {
   return s.substr(0, max - 3) + "...";
 }
 
+std::string mmss(std::int64_t ms) {
+  const int total = int(ms / 1000);
+  char buf[16];
+  std::snprintf(buf, sizeof buf, "%02d:%02d", total / 60, total % 60);
+  return buf;
+}
+
 Element tick_element(const Entry& e) {
   if (!e.outgoing || e.status.empty()) return text("");
-  if (e.status == "delivered") return text("  ✓✓") | color(Color::SkyBlue1) | bold;
-  if (e.status == "sent") return text("  ✓") | color(Color::SkyBlue1);
+  if (e.status == "delivered") return text("  ✓✓") | color(Color::GreenLight);
+  if (e.status == "sent") return text("  ✓") | color(Color::GrayLight);
   return text("  …") | dim;
 }
 
+Element who_element(const Entry& e) {
+  return e.outgoing ? Element(text("вы") | bold | color(Color::White))
+                    : Element(text(e.name) | bold | color(Color::White));
+}
+
 Element text_entry_element(const Entry& e) {
-  Element who = e.outgoing ? Element(text("вы") | color(Color::SkyBlue1) | bold)
-                           : Element(text(e.name) | color(Color::Cyan1));
   return hbox({
       text(" " + e.time + "  ") | dim,
-      who,
+      who_element(e),
       text("  "),
-      paragraph(e.text) | (e.outgoing ? color(Color::White) : color(Color::GrayLight)),
+      paragraph(e.text) | color(Color::GrayLight),
       tick_element(e),
   });
 }
 
 Element sys_element(const Entry& e) {
+  if (e.loud)
+    return hbox({
+        text("    "),
+        paragraph(e.text) | bold | color(Color::White),
+    });
   return hbox({
       text("    · ") | dim,
-      paragraph(e.text) | (e.err ? color(Color::RedLight) : color(Color::GrayDark)),
+      paragraph(e.text) | (e.err ? color(Color::RedLight) : dim),
   });
 }
 
@@ -108,11 +172,10 @@ Element file_entry_element(const Entry& e, const std::map<std::string, FileState
   Elements rows;
   rows.push_back(hbox({
       text(" " + e.time + "  ") | dim,
-      e.outgoing ? Element(text("вы") | color(Color::SkyBlue1) | bold)
-                 : Element(text(e.name) | color(Color::Cyan1)),
+      who_element(e),
       text("  "),
-      text(icon + " "),
-      text(e.file_name) | color(Color::SkyBlue1) | bold,
+      text(icon + " ") | dim,
+      text(e.file_name) | bold | color(Color::White),
       text("  ·  " + cli_support::human_size(e.file_size)) | dim,
       tick_element(e),
   }));
@@ -122,8 +185,8 @@ Element file_entry_element(const Entry& e, const std::map<std::string, FileState
     pct << int(ratio * 100.0) << "%";
     rows.push_back(hbox({
         text("         "),
-        gauge(ratio) | color(Color::SkyBlue1) | size(WIDTH, EQUAL, 28),
-        text("  " + pct.str()) | color(Color::SkyBlue1),
+        gauge(ratio) | color(Color::GrayLight) | size(WIDTH, EQUAL, 28),
+        text("  " + pct.str()) | dim,
     }));
   } else if (fs && fs->finished && !e.outgoing && !fs->saved_path.empty()) {
     rows.push_back(hbox({
@@ -136,13 +199,43 @@ Element file_entry_element(const Entry& e, const std::map<std::string, FileState
 
 } // namespace
 
+// run_tui itself follows in part 2
 int run_tui(shopot::Config cfg, const std::string& mnemonic) {
   auto screen = ScreenInteractive::Fullscreen();
+  screen.TrackMouse(false);  // keep the terminal's own selection/copy working
   Model M;
   int editor_tab = 0;
 
   shopot::Events ev;
   const auto post = [&] { screen.PostEvent(Event::Custom); };
+  shopot::Engine* engine_ptr = nullptr;  // set after engine construction below
+
+  // ------------------------------------------------- audio (arecord/aplay)
+  Proc rec;
+  Proc play;
+  std::thread rec_thread;
+  const auto audio_stop = [&] {
+    if (rec.live()) rec.stop();
+    if (rec_thread.joinable()) rec_thread.join();
+    if (play.live()) play.stop();
+  };
+  const auto audio_start = [&](std::int64_t cid) {
+    audio_stop();
+    rec = Proc::open("arecord -q -f S16_LE -r 16000 -c 1 -t raw 2>/dev/null", "r");
+    if (!rec.live()) return false;
+    static std::uint8_t buf[640];  // 20 ms of s16le mono 16 kHz
+    rec_thread = std::thread([cid, &engine_ref = *engine_ptr, &rec] {
+      while (rec.f) {
+        const size_t n = fread(buf, 1, sizeof buf, rec.f);
+        if (n == 0) break;
+        try {
+          engine_ref.push_call_audio(cid, buf, n);
+        } catch (...) { break; }
+      }
+    });
+    play = Proc::open("aplay -q -f S16_LE -r 16000 -c 1 -t raw 2>/dev/null", "w");
+    return true;
+  };
 
   // ------------------------------------------------------------- events
   ev.on_message = [&](const shopot::Message& m) {
@@ -241,7 +334,96 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
     post();
   };
 
+  // call events: UI state + arecord/aplay lifecycle
+  ev.on_call_event = [&](const shopot::CallEvent& ce) {
+    bool want_audio = false, stop_audio = false;
+    std::string loud_err;
+    {
+      std::lock_guard lk(M.mu);
+      switch (ce.state) {
+        case shopot::CallState::OutgoingRing: {
+          M.call = {};
+          M.call.state = 1;
+          M.call.started_ms = now_ms();
+          M.call.peer = ce.contact_id;
+          for (const auto& c : M.contacts)
+            if (c.id == ce.contact_id) M.call.peer_name = c.name;
+          Entry e;
+          e.kind = Entry::Sys;
+          e.text = "вызов " + M.call.peer_name + "…  (/hangup — отменить)";
+          M.hist.push_back(e);
+          break;
+        }
+        case shopot::CallState::IncomingRing: {
+          M.call = {};
+          M.call.state = 2;
+          M.call.started_ms = now_ms();
+          M.call.peer = ce.contact_id;
+          for (const auto& c : M.contacts)
+            if (c.id == ce.contact_id) M.call.peer_name = c.name;
+          Entry e;
+          e.kind = Entry::Sys;
+          e.loud = true;
+          e.text = "ВХОДЯЩИЙ ЗВОНОК: " + M.call.peer_name +
+                   "  —  /accept принять · /decline отклонить";
+          M.hist.push_back(e);
+          break;
+        }
+        case shopot::CallState::Active:
+          if (M.call.state != 3) {
+            M.call.state = 3;
+            M.call.started_ms = now_ms();
+            want_audio = true;
+            Entry e;
+            e.kind = Entry::Sys;
+            e.text = "разговор начат: " + M.call.peer_name + "  (/hangup завершить)";
+            M.hist.push_back(e);
+          }
+          break;
+        case shopot::CallState::Ended: {
+          if (M.call.state == 0) break;
+          const std::string why = ce.reason == "declined" ? "отклонён"
+                                  : ce.reason == "timeout" ? "без ответа"
+                                  : ce.reason == "local"   ? "завершён"
+                                                           : "завершён собеседником";
+          M.call.state = 0;
+          stop_audio = true;
+          Entry e;
+          e.kind = Entry::Sys;
+          e.text = "звонок " + why;
+          M.hist.push_back(e);
+          break;
+        }
+        case shopot::CallState::Idle:
+          break;
+      }
+      if (M.scroll != 0) ++M.scroll;
+    }
+    if (want_audio && engine_ptr) {
+      std::int64_t cid;
+      {
+        std::lock_guard lk(M.mu);
+        cid = M.call.peer;
+      }
+      if (!audio_start(cid)) loud_err = "нет arecord/aplay (alsa-utils) — звука нет, разговор идёт";
+    }
+    if (stop_audio) audio_stop();
+    if (!loud_err.empty()) {
+      std::lock_guard lk(M.mu);
+      Entry e;
+      e.kind = Entry::Sys;
+      e.err = true;
+      e.text = loud_err;
+      M.hist.push_back(e);
+    }
+    post();
+  };
+  ev.on_call_audio = [&](std::int64_t, const std::uint8_t* d, std::size_t n) {
+    if (play.f) std::fwrite(d, 1, n, play.f);
+  };
+
   shopot::Engine engine(cfg, mnemonic, ev);
+  engine_ptr = &engine;
 
   // --------------------------------------------------------- model loading
   const auto reload_contacts = [&] {
@@ -333,7 +515,7 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
     post();
   };
 
-  const auto do_send_file = [&](const std::string& path, shopot::MsgKind kind) {
+  const auto do_send_file = [&](const std::string& raw_path, shopot::MsgKind kind) {
     std::int64_t cid;
     {
       std::lock_guard lk(M.mu);
@@ -341,6 +523,11 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
     }
     if (cid == 0) {
       sys_line("нет открытого чата", true);
+      return;
+    }
+    const std::string path = cli_support::expand_path(raw_path);
+    if (path.empty() || path[0] != '/') {
+      sys_line("укажите полный путь (от /) или начните с ~/ — иначе файл не найти", true);
       return;
     }
     try {
@@ -359,7 +546,7 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
       M.scroll = 0;
       post();
     } catch (const std::exception& ex) {
-      sys_line(std::string("файл не отправлен: ") + ex.what(), true);
+      sys_line("файл не отправлен (" + path + "): " + ex.what(), true);
     }
   };
 
@@ -370,13 +557,54 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
     try {
       if (cmd == "/help" || cmd == "/?") {
         sys_line(
-            "Tab — переключить чат · Ctrl+O — файл/фото · /voice <путь> — голосовое\n"
-            "/invite — одноразовый код приглашения · /addi <код> [имя] — принять\n"
-            "/add <имя> <бандл> · /fp — сверить ключи · /auto — искать всех\n"
+            "Tab — чат · ↑↓ PgUp/PgDn — история · Ctrl+O — файл/фото · выделение мышью работает\n"
+            "/id — ваш код · /invite — код приглашения · /addi <код> [имя] — принять инвайт\n"
+            "/add <имя> <код> · /fp — сверить ключи · /auto — искать всех\n"
+            "/call — позвонить · /accept /decline — ответить · /hangup — завершить\n"
             "/rename <имя> · /wipe — стереть всё · /quit — выход");
+      } else if (cmd == "/id" || cmd == "/bundle") {
+        sys_line("ваш код (передайте тем, кто добавляет вас через /add):\n" +
+                 engine.my_bundle());
       } else if (cmd == "/invite") {
         sys_line("код приглашения (одноразовый, передай одному человеку):\n" +
                  engine.make_invite());
+      } else if (cmd == "/call") {
+        std::int64_t cid;
+        {
+          std::lock_guard lk(M.mu);
+          cid = M.open;
+        }
+        if (cid == 0) {
+          sys_line("нет открытого чата", true);
+        } else {
+          engine.start_call(cid);
+        }
+      } else if (cmd == "/accept" || cmd == "/decline") {
+        std::int64_t cid;
+        bool ringing;
+        {
+          std::lock_guard lk(M.mu);
+          cid = M.call.peer;
+          ringing = M.call.state == 2;
+        }
+        if (!ringing) {
+          sys_line("нет входящего звонка", true);
+        } else {
+          engine.answer_call(cid, cmd == "/accept");
+        }
+      } else if (cmd == "/hangup") {
+        std::int64_t cid;
+        bool in_call;
+        {
+          std::lock_guard lk(M.mu);
+          cid = M.call.peer;
+          in_call = M.call.state != 0;
+        }
+        if (!in_call) {
+          sys_line("звонка нет", true);
+        } else {
+          engine.end_call(cid);
+        }
       } else if (cmd == "/add") {
         std::string name, bundle;
         ss >> name >> bundle;
@@ -505,7 +733,7 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
   // ---------------------------------------------------------- components
   InputOption in_opt;
   in_opt.content = &M.input;
-  in_opt.placeholder = "  написать сообщение…  (Enter — отправить, /help — команды)";
+  in_opt.placeholder = "  сообщение…  (Enter — отправить, /help — команды)";
   in_opt.on_enter = [&] { submit_fn(); };
   auto input = Input(in_opt);
 
@@ -536,24 +764,23 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
       rows.push_back(text("   нет контактов") | dim);
       rows.push_back(text("   /invite — код") | dim);
       rows.push_back(text("   приглашения") | dim);
-      rows.push_back(text("   /add <имя> <бандл>") | dim);
+      rows.push_back(text("   /add <имя> <код>") | dim);
     }
     for (std::size_t i = 0; i < M.contacts.size(); ++i) {
       const auto& c = M.contacts[i];
       const bool sel = int(i) == M.selected;
       const auto un = M.unread.find(c.id);
       Element row = hbox({
-          text(c.online ? " ● " : " ○ ") |
+          text(sel ? " › " : "   ") | (sel ? bold : dim),
+          text(c.online ? "● " : "○ ") |
               color(c.online ? Color::GreenLight : Color::GrayDark),
-          text(trunc_name(c.name, 17)) |
-              (sel ? color(Color::SkyBlue1) | bold : color(Color::GrayLight)),
+          text(trunc_name(c.name, 16)) |
+              (sel ? bold | color(Color::White) : color(Color::GrayLight)),
           filler(),
           (un != M.unread.end() && un->second > 0)
-              ? Element(text(" " + std::to_string(un->second) + " ") |
-                        (bgcolor(Color::SkyBlue1) | color(Color::Black) | bold))
-              : Element(text("   ") | dim),
+              ? Element(text(std::to_string(un->second) + " ") | bold | color(Color::White))
+              : Element(text("  ") | dim),
       });
-      if (sel) row |= bgcolor(Color::RGB(16, 42, 72));
       rows.push_back(sel ? row | focus : row);
     }
     return vbox(rows) | yframe;
@@ -561,12 +788,23 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
 
   auto chat_header = Renderer([&] {
     std::lock_guard lk(M.mu);
+    if (M.call.state != 0) {
+      std::string label = M.call.state == 3 ? " разговор " + mmss(now_ms() - M.call.started_ms)
+                          : M.call.state == 1 ? " вызов…"
+                                              : " входящий звонок";
+      return hbox({
+          text("  " + M.call.peer_name) | bold | color(Color::White),
+          text(label) | bold | color(Color::GreenLight),
+          filler(),
+          text("fp " + M.call.peer_name.empty() ? "" : "") | dim,
+      });
+    }
     if (M.open == 0) return hbox({text("  чат не выбран") | dim});
     for (const auto& c : M.contacts)
       if (c.id == M.open)
         return hbox({
-            text("  " + c.name) | bold | color(Color::SkyBlue1),
-            text(c.online ? "   ● в сети" : "   ○ не в сети") |
+            text("  " + c.name) | bold | color(Color::White),
+            text(c.online ? "  ● в сети" : "  ○ не в сети") |
                 color(c.online ? Color::GreenLight : Color::GrayDark),
             filler(),
             text("fp " + c.fingerprint.substr(0, 7) + " ") | dim,
@@ -600,20 +838,20 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
     std::lock_guard lk(M.mu);
     if (M.attach) {
       return hbox({
-          text(" файл ") | bgcolor(Color::SkyBlue1) | color(Color::Black) | bold,
+          text(" файл › ") | bold | color(Color::White),
           attach_input->Render() | flex,
           text("  Enter — отправить · Esc — отмена ") | dim,
       });
     }
     if (M.confirm_wipe) {
       return hbox({
-          text(" ⚠ введите ДА ") | bgcolor(Color::RedLight) | color(Color::Black) | bold,
+          text(" ⚠ введите ДА › ") | bold | color(Color::RedLight),
           input->Render() | flex,
           text("  сотрёт ВСЮ историю · Esc — отмена ") | dim,
       });
     }
     return hbox({
-        text(" ❯ ") | color(Color::SkyBlue1) | bold,
+        text(" › ") | dim,
         input->Render() | flex,
     });
   });
@@ -621,8 +859,7 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
   auto header = Renderer([&] {
     std::lock_guard lk(M.mu);
     return hbox({
-        text(" shopot ") | bgcolor(Color::SkyBlue1) | color(Color::Black) | bold,
-        text("  p2p · e2e · без серверов") | dim,
+        text(" shopot ") | bold | color(Color::White),
         filler(),
         text("fp " + M.fp_line + " ") | dim,
     });
@@ -633,32 +870,33 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
     int online = 0;
     for (const auto& c : M.contacts)
       if (c.online) ++online;
+    std::string right = std::to_string(online) + "/" +
+                        std::to_string(M.contacts.size()) + " онлайн · ";
+    if (M.call.state == 3)
+      right += " разговор " + mmss(now_ms() - M.call.started_ms) + " · ";
     return hbox({
-        text(" Tab чат ") | bgcolor(Color::SkyBlue1) | color(Color::Black),
-        text(" ↑↓ история ") | bgcolor(Color::RGB(28, 66, 108)) | color(Color::White),
-        text(" Ctrl+O файл ") | bgcolor(Color::RGB(28, 66, 108)) | color(Color::White),
-        text(" /help ") | bgcolor(Color::RGB(28, 66, 108)) | color(Color::White),
-        filler() | bgcolor(Color::SkyBlue1),
-        text(" " + std::to_string(online) + "/" + std::to_string(M.contacts.size()) +
-             " онлайн · p2p ")
-            | bgcolor(Color::SkyBlue1) | color(Color::Black),
+        text(" Tab чат · ↑↓/PgUp история · Ctrl+O файл · /help ") | dim,
+        filler(),
+        text(right) | dim,
     });
   });
 
   auto root_renderer = Renderer(editors, [&] {
     return vbox({
         header->Render(),
+        separator() | dim,
         hbox({
             contacts_pane->Render() | size(WIDTH, EQUAL, 26),
-            separator() | color(Color::RGB(38, 76, 118)),
+            separator() | dim,
             vbox({
                 chat_header->Render(),
-                separator() | color(Color::RGB(38, 76, 118)),
+                separator() | dim,
                 hist_view->Render() | flex_grow,
-                separator() | color(Color::RGB(38, 76, 118)),
+                separator() | dim,
                 input_area->Render(),
             }) | flex_grow,
         }) | flex_grow,
+        separator() | dim,
         status_bar->Render(),
     });
   });
@@ -666,27 +904,12 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
   // ------------------------------------------------------------- keys
   const std::string kCtrlC(1, char(3));
   const std::string kCtrlO(1, char(15));
+  // note: no mouse handling at all — text selection stays native
   auto ui = CatchEvent(root_renderer, [&](const Event& e) {
     if (e.input() == kCtrlC) {
+      audio_stop();
       screen.Exit();
       return true;
-    }
-    if (e.is_mouse()) {
-      Event ev = e;  // mouse() is non-const; work on our copy
-      auto m = ev.mouse();
-      if (m.button == Mouse::WheelUp) {
-        std::lock_guard lk(M.mu);
-        if (M.scroll < int(M.hist.size()) - 1) M.scroll += 3;
-        post();
-        return true;
-      }
-      if (m.button == Mouse::WheelDown) {
-        std::lock_guard lk(M.mu);
-        M.scroll = std::max(0, M.scroll - 3);
-        post();
-        return true;
-      }
-      return false;
     }
     if (e == Event::Tab || e == Event::TabReverse) {
       {
@@ -734,11 +957,27 @@ int run_tui(shopot::Config cfg, const std::string& mnemonic) {
     return false;
   });
 
+  // 1 s redraw while a call is up (timer in the header)
+  std::atomic<bool> tick_run{true};
+  std::thread ticker([&] {
+    while (tick_run.load()) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      {
+        std::lock_guard lk(M.mu);
+        if (M.call.state != 3) continue;
+      }
+      screen.PostEvent(Event::Custom);
+    }
+  });
+
   std::atomic<bool> keeper_run{true};
   std::thread keeper = cli_support::run_keeper(engine, keeper_run);
 
   screen.Loop(ui);
+  tick_run.store(false);
+  ticker.join();
   keeper_run.store(false);
   keeper.join();
+  audio_stop();
   return 0;
 }

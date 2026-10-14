@@ -37,6 +37,15 @@ struct Engine::Impl {
   std::atomic<bool> invites_inflight_{false};       // one invite listener at a time
   std::atomic<bool> stopping_{false};
 
+  // calls: one per contact; guarded by mu_ (never held across user callbacks)
+  struct Call {
+    std::string id;
+    CallState state = CallState::Idle;
+    std::string reason;
+  };
+  std::unordered_map<std::int64_t, Call> calls_;
+  std::vector<std::thread> call_timers_;  // ring timeout watchers
+
   Impl(Config c, const std::string& mnemonic, Events events)
       : cfg(std::move(c)),
         ev(std::move(events)),
@@ -46,7 +55,9 @@ struct Engine::Impl {
   }
 
   ~Impl() {
-    stopping_.store(true);  // tell auto-connect workers to bail before teardown
+    stopping_.store(true);  // tell auto-connect workers and call timers to bail
+    for (auto& t : call_timers_)
+      if (t.joinable()) t.join();
     for (auto& w : auto_workers_)
       if (w.joinable()) w.join();
     {
@@ -116,8 +127,36 @@ struct Engine::Impl {
     sev.error = [this](std::int64_t cid, std::string what) {
       if (ev.on_error) dispatch([this, cid, what = std::move(what)] { ev.on_error(cid, what); });
     };
+    // attach_channel sets this while the events for one contact are built
+    const std::int64_t self_contact = wiring_contact_;
+    sev.call_signal = [this, self_contact](const std::string& act, const std::string& call_id) {
+      dispatch([this, self_contact, act, call_id] {
+        handle_call_signal(self_contact, act, call_id);
+      });
+    };
+    sev.call_audio = [this, self_contact](const std::uint8_t* d, std::size_t n) {
+      if (!ev.on_call_audio || self_contact < 0) return;
+      // copy the bytes; the lane frees them as soon as we return
+      std::vector<std::uint8_t> buf(d, d + n);
+      dispatch([this, self_contact, buf] {
+        bool active = false;
+        {
+          std::lock_guard lk(mu_);
+          const auto it = calls_.find(self_contact);
+          active = it != calls_.end() && it->second.state == CallState::Active;
+        }
+        if (active) ev.on_call_audio(self_contact, buf.data(), buf.size());
+      });
+    };
     return sev;
   }
+
+  std::atomic<std::int64_t> wiring_contact_{-1};  // set while attach_channel builds a session
+
+  void set_call_state(std::int64_t cid, CallState st, const std::string& reason,
+                      const std::string& call_id);
+  void handle_call_signal(std::int64_t contact_id, const std::string& act,
+                          const std::string& call_id);
 
 #ifdef SHOPOT_WITH_RTC
   // programmatic variants of the manual signaling dance (used by connect_auto)
@@ -129,11 +168,14 @@ struct Engine::Impl {
   void listen_invites(std::int64_t timeout_ms);
 
   void attach_channel(std::int64_t contact_id, std::unique_ptr<IChannel> ch) {
+    wiring_contact_ = contact_id;  // read by session_events() only here
+    SessionEvents sev = session_events();
+    wiring_contact_ = -1;
     std::lock_guard lk(mu_);
     auto crow = db.contact(contact_id);
     if (!crow) return;
     if (auto it = sessions_.find(contact_id); it != sessions_.end()) it->second->stop();
-    auto s = std::make_shared<Session>(id, *crow, db, std::move(ch), session_events(),
+    auto s = std::make_shared<Session>(id, *crow, db, std::move(ch), std::move(sev),
                                        cfg.download_dir);
     sessions_[contact_id] = s;
     s->start();

@@ -92,6 +92,41 @@ void RtcChannel::wire_dc() {
   });
 }
 
+void RtcChannel::send_audio(const std::uint8_t* data, std::size_t len) {
+  if (!adc_ || !adc_->isOpen()) return;  // no call lane / call not up: drop
+  try {
+    adc_->send(reinterpret_cast<const std::byte*>(data), len);
+  } catch (...) {
+  }
+}
+
+void RtcChannel::wire_adc(const std::shared_ptr<rtc::DataChannel>& dc) {
+  dc->onMessage([this](rtc::message_variant msg) {
+    if (!cbs_.on_audio) return;
+    if (std::holds_alternative<rtc::binary>(msg)) {
+      const rtc::binary& b = std::get<rtc::binary>(msg);
+      if (!b.empty())
+        cbs_.on_audio(reinterpret_cast<const std::uint8_t*>(b.data()), b.size());
+    }
+  });
+}
+
+// labels both lanes; called for channels arriving from the remote side
+bool RtcChannel::accept_remote_dc(const std::shared_ptr<rtc::DataChannel>& dc) {
+  const std::string label = dc->label();
+  if (label == "shopot") {
+    dc_ = dc;
+    wire_dc();
+    return true;
+  }
+  if (label == "shopot-call") {
+    adc_ = dc;
+    wire_adc(dc);
+    return true;
+  }
+  return false;
+}
+
 std::string RtcChannel::collect_code() {
   std::mutex mu;
   std::condition_variable cv;
@@ -177,6 +212,12 @@ std::unique_ptr<RtcChannel> rtc_make_offer(const std::string& stun_server) {
   ch->init(stun_server);
   ch->dc_ = ch->pc_->createDataChannel("shopot");
   ch->wire_dc();
+  // call lane: unordered, zero retransmits — stale audio is worse than lost
+  rtc::DataChannelInit init;
+  init.reliability.unordered = true;
+  init.reliability.maxRetransmits = 0;
+  ch->adc_ = ch->pc_->createDataChannel("shopot-call", init);
+  ch->wire_adc(ch->adc_);
   ch->collect_code();
   return ch;
 }
@@ -187,8 +228,7 @@ std::unique_ptr<RtcChannel> rtc_make_answer(const std::string& offer_code,
   auto ch = std::make_unique<RtcChannel>();
   ch->init(stun_server);
   ch->pc_->onDataChannel([ch = ch.get()](std::shared_ptr<rtc::DataChannel> dc) {
-    ch->dc_ = std::move(dc);
-    ch->wire_dc();
+    ch->accept_remote_dc(dc);
   });
   ch->pc_->setRemoteDescription(rtc::Description(offer.sdp, offer.type));
   for (const auto& [c, m] : offer.candidates) ch->pc_->addRemoteCandidate(rtc::Candidate(c, m));

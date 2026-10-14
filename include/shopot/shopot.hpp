@@ -48,6 +48,17 @@ struct Message {
   std::uint64_t file_size = 0;
 };
 
+/// Real-time call state (one active call per contact pair).
+enum class CallState { Idle, OutgoingRing, IncomingRing, Active, Ended };
+
+struct CallEvent {
+  std::int64_t contact_id = 0;
+  std::string call_id;
+  CallState state = CallState::Idle;
+  /// why it ended: "declined", "remote", "local", "timeout", "error" (Idle -> "" )
+  std::string reason;
+};
+
 struct FileProgress {
   std::string file_id;
   std::int64_t contact_id = 0;
@@ -88,6 +99,12 @@ struct Events {
   /// A pending invite was redeemed: a new contact appeared (name is
   /// provisional, rename at will). Fired on the inviter's side.
   std::function<void(std::int64_t contact_id, const std::string& name)> on_contact_added;
+  /// Call state transitions.
+  std::function<void(const CallEvent&)> on_call_event;
+  /// Decrypted audio from the peer, s16le mono 16 kHz raw PCM. The app feeds
+  /// it to the speaker; capture goes back through push_call_audio().
+  std::function<void(std::int64_t contact_id, const std::uint8_t* data, std::size_t len)>
+      on_call_audio;
 };
 
 // ------------------------------------------------------------------ engine
@@ -158,6 +175,23 @@ public:
   /// arrives (adding the contact), then connect to it. Non-blocking worker,
   /// outcomes via on_contact_added / on_presence / on_error.
   void listen_invites(std::int64_t timeout_ms = 120000);
+
+  // --- calls ---------------------------------------------------------------
+  // One active call per contact. Signaling rides the regular encrypted lane;
+  // audio rides a lossy second lane, encrypted under a key derived from the
+  // room hash and the call id (fresh nonce per packet). Raw s16le mono 16 kHz
+  // PCM in both directions; capture/playback devices are the app's business.
+  /// Ring the peer. Throws when there is no established session.
+  /// Returns the call id. Outcome arrives via on_call_event.
+  std::string start_call(std::int64_t contact_id);
+  /// Accept or decline an incoming call (IncomingRing).
+  void answer_call(std::int64_t contact_id, bool accept);
+  /// Hang up any current call with the contact.
+  void end_call(std::int64_t contact_id);
+  /// Feed captured audio (s16le mono 16 kHz) to the peer. ~20 ms chunks.
+  void push_call_audio(std::int64_t contact_id, const std::uint8_t* data, std::size_t len);
+  /// Current call state for a contact.
+  CallState call_state(std::int64_t contact_id) const;
 
   // messaging — safe to call while the peer is offline; payloads wait in the
   // encrypted outbox and are flushed automatically when a session establishes.

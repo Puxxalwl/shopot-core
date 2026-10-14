@@ -13,6 +13,8 @@
 //   the device is compromised.
 #pragma once
 
+#include <sodium.h>
+
 #include <array>
 #include <cstdint>
 #include <map>
@@ -168,5 +170,34 @@ std::string hex_lower(const std::uint8_t* data, std::size_t len);
 Arr<32> sha256(const std::uint8_t* data, std::size_t len);
 Arr<32> random32();
 std::string new_id();  // 16 random bytes as 32 lowercase hex chars
+
+
+// per-call audio keys: HKDF-SHA256(ikm = room_hash || call_id || role)
+inline crypto::Arr<32> call_key_for(const crypto::Arr<32>& room, const std::string& call_id,
+                                    char role) {
+  const std::string salt = "shopot-call-v1";
+  crypto::Bytes ikm;
+  ikm.reserve(room.size() + call_id.size() + 1);
+  ikm.insert(ikm.end(), room.begin(), room.end());
+  ikm.insert(ikm.end(), call_id.begin(), call_id.end());
+  ikm.push_back(static_cast<std::uint8_t>(role));
+
+  crypto_auth_hmacsha256_state st;
+  crypto_auth_hmacsha256_init(&st, reinterpret_cast<const unsigned char*>(salt.data()),
+                              static_cast<unsigned long long>(salt.size()));
+  crypto_auth_hmacsha256_update(&st, ikm.data(), ikm.size());
+  crypto::Arr<32> prk;
+  crypto_auth_hmacsha256_final(&st, prk.data());
+
+  const std::string info = "shopot-call-audio-v1";
+  crypto_auth_hmacsha256_init(&st, prk.data(), prk.size());
+  crypto_auth_hmacsha256_update(&st, reinterpret_cast<const unsigned char*>(info.data()),
+                                static_cast<unsigned long long>(info.size()));
+  const std::uint8_t one = 1;
+  crypto_auth_hmacsha256_update(&st, &one, 1);
+  crypto::Arr<32> okm;
+  crypto_auth_hmacsha256_final(&st, okm.data());
+  return okm;
+}
 
 } // namespace shopot::crypto

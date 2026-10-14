@@ -16,6 +16,19 @@
 
 namespace cli_support {
 
+// "~/..." -> $HOME; strips surrounding quotes; resolves to nothing if empty
+inline std::string expand_path(const std::string& raw) {
+  std::string p = raw;
+  while (!p.empty() && (p.front() == '"' || p.front() == '\'')) p.erase(0, 1);
+  while (!p.empty() && (p.back() == '"' || p.back() == '\'')) p.pop_back();
+  if (p.rfind("~/", 0) == 0 || p == "~") {
+    const char* home = std::getenv("HOME");
+    if (home) p = std::string(home) + p.substr(1);
+  }
+  return p;
+}
+
+
 inline std::string read_keyfile(const std::string& path) {
   std::ifstream in(path);
   std::string words;

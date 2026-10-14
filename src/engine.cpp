@@ -615,6 +615,233 @@ std::vector<Message> Engine::history(std::int64_t contact_id, std::size_t limit,
   return out;
 }
 
+
+// ------------------------------------------------------------------ calls
+
+// state transition + user event; never called with mu_ held
+void Engine::Impl::set_call_state(std::int64_t cid, CallState st, const std::string& reason,
+                                  const std::string& call_id) {
+  CallEvent ce;
+  ce.contact_id = cid;
+  ce.call_id = call_id;
+  ce.state = st;
+  ce.reason = reason;
+  {
+    std::lock_guard lk(mu_);
+    if (st == CallState::Idle)
+      calls_.erase(cid);
+    else {
+      Call& c = calls_[cid];
+      c.state = st;
+      c.id = call_id.empty() ? c.id : call_id;
+    }
+  }
+  if (ev.on_call_event) {
+    dispatch([this, ce] { ev.on_call_event(ce); });
+  }
+}
+
+void Engine::Impl::handle_call_signal(std::int64_t contact_id, const std::string& act,
+                                      const std::string& call_id) {
+  std::shared_ptr<Session> session;
+  {
+    std::lock_guard lk(mu_);
+    const auto it = sessions_.find(contact_id);
+    session = it == sessions_.end() ? nullptr : it->second;
+  }
+
+  if (act == "offer") {
+    bool busy;
+    {
+      std::lock_guard lk(mu_);
+      const auto it = calls_.find(contact_id);
+      busy = it != calls_.end() && it->second.state != CallState::Idle &&
+             it->second.state != CallState::Ended;
+    }
+    if (busy) {
+      if (session) session->send_call_signal("reject", call_id);  // polite busy
+      return;
+    }
+    {
+      std::lock_guard lk(mu_);
+      Call c;
+      c.id = call_id;
+      c.state = CallState::IncomingRing;
+      calls_[contact_id] = c;
+    }
+    if (session) session->set_call(call_id, "r");
+    set_call_state(contact_id, CallState::IncomingRing, "", call_id);
+    return;
+  }
+
+  if (act == "accept") {
+    {
+      std::lock_guard lk(mu_);
+      const auto it = calls_.find(contact_id);
+      if (it == calls_.end() || it->second.state != CallState::OutgoingRing ||
+          it->second.id != call_id)
+        return;  // stale or foreign accept
+      it->second.state = CallState::Active;
+    }
+    set_call_state(contact_id, CallState::Active, "", call_id);
+    return;
+  }
+
+  if (act == "reject" || act == "end") {
+    std::string id;
+    bool had = false, was_active = false;
+    {
+      std::lock_guard lk(mu_);
+      const auto it = calls_.find(contact_id);
+      if (it != calls_.end() && it->second.id == call_id) {
+        id = it->second.id;
+        was_active = it->second.state == CallState::Active;
+        had = true;
+        calls_.erase(it);
+      }
+    }
+    if (!had) return;
+    if (session) session->clear_call();
+    set_call_state(contact_id, CallState::Ended,
+                   act == "reject" ? "declined" : (was_active ? "remote" : "declined"), id);
+    {
+      std::lock_guard lk(mu_);
+      calls_.erase(contact_id);  // Ended is one-shot
+    }
+    return;
+  }
+}
+
+std::string Engine::start_call(std::int64_t contact_id) {
+  auto& impl = *impl_;
+  auto session = impl.established_session(contact_id);
+  if (!session) throw std::runtime_error("нет соединения — сначала /auto");
+  const std::string call_id = crypto::new_id();
+  {
+    std::lock_guard lk(impl.mu_);
+    auto& c = impl.calls_[contact_id];
+    c.id = call_id;
+    c.state = CallState::OutgoingRing;
+    c.reason.clear();
+  }
+  session->set_call(call_id, "i");
+  session->send_call_signal("offer", call_id);
+  impl.set_call_state(contact_id, CallState::OutgoingRing, "", call_id);
+  // ring timeout: nobody picked up in 45 s
+  impl.call_timers_.push_back(std::thread([&impl, contact_id, call_id] {
+    for (int i = 0; i < 45; ++i) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (impl.stopping_.load()) return;
+      bool fire = false;
+      {
+        std::lock_guard lk(impl.mu_);
+        const auto it = impl.calls_.find(contact_id);
+        fire = it != impl.calls_.end() && it->second.id == call_id &&
+               it->second.state == CallState::OutgoingRing && i == 44;
+      }
+      if (!fire) {
+        // answered or cancelled: stop watching
+        std::lock_guard lk(impl.mu_);
+        const auto it = impl.calls_.find(contact_id);
+        if (it == impl.calls_.end() || it->second.id != call_id ||
+            it->second.state != CallState::OutgoingRing)
+          return;
+        continue;
+      }
+      // fire: end locally, tell the peer, surface the event
+      auto session2 = impl.established_session(contact_id);
+      {
+        std::lock_guard lk(impl.mu_);
+        impl.calls_.erase(contact_id);
+      }
+      if (session2) {
+        session2->send_call_signal("end", call_id);
+        session2->clear_call();
+      }
+      impl.set_call_state(contact_id, CallState::Ended, "timeout", call_id);
+      {
+        std::lock_guard lk(impl.mu_);
+        impl.calls_.erase(contact_id);
+      }
+      return;
+    }
+  }));
+  return call_id;
+}
+
+void Engine::answer_call(std::int64_t contact_id, bool accept) {
+  auto& impl = *impl_;
+  std::string call_id;
+  {
+    std::lock_guard lk(impl.mu_);
+    const auto it = impl.calls_.find(contact_id);
+    if (it == impl.calls_.end() || it->second.state != CallState::IncomingRing)
+      throw std::runtime_error("нет входящего звонка");
+    call_id = it->second.id;
+  }
+  auto session = impl.established_session(contact_id);
+  if (!session) throw std::runtime_error("соединение потеряно");
+  session->send_call_signal(accept ? "accept" : "reject", call_id);
+  if (accept) {
+    {
+      std::lock_guard lk(impl.mu_);
+      const auto it = impl.calls_.find(contact_id);
+      if (it != impl.calls_.end()) it->second.state = CallState::Active;
+    }
+    impl.set_call_state(contact_id, CallState::Active, "", call_id);
+  } else {
+    {
+      std::lock_guard lk(impl.mu_);
+      impl.calls_.erase(contact_id);
+    }
+    session->clear_call();
+    impl.set_call_state(contact_id, CallState::Ended, "declined", call_id);
+    {
+      std::lock_guard lk(impl.mu_);
+      impl.calls_.erase(contact_id);
+    }
+  }
+}
+
+void Engine::end_call(std::int64_t contact_id) {
+  auto& impl = *impl_;
+  std::string call_id;
+  {
+    std::lock_guard lk(impl.mu_);
+    const auto it = impl.calls_.find(contact_id);
+    if (it == impl.calls_.end()) return;
+    call_id = it->second.id;
+    impl.calls_.erase(it);
+  }
+  if (auto session = impl.established_session(contact_id)) {
+    session->send_call_signal("end", call_id);
+    session->clear_call();
+  }
+  impl.set_call_state(contact_id, CallState::Ended, "local", call_id);
+  {
+    std::lock_guard lk(impl.mu_);
+    impl.calls_.erase(contact_id);
+  }
+}
+
+void Engine::push_call_audio(std::int64_t contact_id, const std::uint8_t* data,
+                             std::size_t len) {
+  auto& impl = *impl_;
+  {
+    std::lock_guard lk(impl.mu_);
+    const auto it = impl.calls_.find(contact_id);
+    if (it == impl.calls_.end() || it->second.state != CallState::Active) return;
+  }
+  if (auto session = impl.established_session(contact_id)) session->send_audio_packet(data, len);
+}
+
+CallState Engine::call_state(std::int64_t contact_id) const {
+  auto& impl = *impl_;
+  std::lock_guard lk(impl.mu_);
+  const auto it = impl.calls_.find(contact_id);
+  return it == impl.calls_.end() ? CallState::Idle : it->second.state;
+}
+
 void Engine::wipe() {
   {
     std::lock_guard lk(impl_->mu_);

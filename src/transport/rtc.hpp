@@ -25,6 +25,7 @@ public:
 
   void set_callbacks(Cbs cbs) override;
   void send(const std::uint8_t* data, std::size_t len) override;
+  void send_audio(const std::uint8_t* data, std::size_t len) override;
   std::size_t buffered_amount() const override;
   void close() override;
 
@@ -39,10 +40,13 @@ private:
 
   void init(const std::string& stun_server);
   void wire_dc();
+  void wire_adc(const std::shared_ptr<rtc::DataChannel>& dc);
+  bool accept_remote_dc(const std::shared_ptr<rtc::DataChannel>& dc);
   std::string collect_code();  // blocks until ICE gathering completes (bounded)
 
   std::shared_ptr<rtc::PeerConnection> pc_;
   std::shared_ptr<rtc::DataChannel> dc_;
+  std::shared_ptr<rtc::DataChannel> adc_;  // lossy call-audio lane
   Cbs cbs_;
   std::string code_;
   bool open_notified_ = false;

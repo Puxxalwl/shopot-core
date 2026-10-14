@@ -4,6 +4,7 @@
 #include <sodium.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -86,6 +87,9 @@ void Session::wire_callbacks() {
       s->wr_cv_.notify_all();
     }
   };
+  cbs.on_audio = [self](const std::uint8_t* d, std::size_t n) {
+    if (auto s = self.lock()) s->on_audio_packet(d, n);
+  };
   ch_->set_callbacks(std::move(cbs));
 }
 
@@ -137,6 +141,8 @@ void Session::send_hello() {
 }
 
 void Session::handle_control(const std::uint8_t* data, std::size_t len) {
+  if (std::getenv("SHOPOT_SESSION_DEBUG"))
+    std::fprintf(stderr, "[sess] control %zu bytes\n", len);
   try {
     const crypto::Hello h =
         crypto::hello_parse(crypto::Bytes(data, data + len), room_, contact_.sign_pk);
@@ -172,6 +178,7 @@ void Session::maybe_establish() {
     have_eph_ = false;
   }
   established_.store(true);
+  if (std::getenv("SHOPOT_SESSION_DEBUG")) std::fprintf(stderr, "[sess] established\n");
   if (ev_.presence) ev_.presence(contact_.id, true);
   kick();  // flush outbox + pending files (establishment is the only full flush)
 }
@@ -301,6 +308,80 @@ void Session::handle_envelope(const std::uint8_t* data, std::size_t len) {
     if (ev_.message) ev_.message(m);
     return;
   }
+
+  if (t == "call") {
+    const std::string act = j.value("act", "");
+    const std::string cid = j.value("id", "");
+    if (act.empty() || cid.empty()) return;
+    if (ev_.call_signal) ev_.call_signal(act, cid);
+    return;
+  }
+}
+
+// ------------------------------------------------------------------ calls
+
+void Session::set_call(const std::string& call_id, const char* role) {
+  std::lock_guard lk(call_mu_);
+  call_id_ = call_id;
+  call_role_ = role && *role ? role[0] : 0;
+}
+
+void Session::clear_call() {
+  std::lock_guard lk(call_mu_);
+  call_id_.clear();
+  call_role_ = 0;
+}
+
+void Session::send_call_signal(const std::string& act, const std::string& call_id) {
+  nlohmann::json j;
+  j["t"] = "call";
+  j["act"] = act;
+  j["id"] = call_id;
+  const std::string s = j.dump();
+  const crypto::Bytes plain(s.begin(), s.end());
+  tx_push(TxItem{.kind = TxItem::Frame, .frame = frame_bytes(kFrameEnvelope, ratchet_seal(
+      plain.data(), plain.size()))});
+}
+
+void Session::send_audio_packet(const std::uint8_t* data, std::size_t len) {
+  std::string call_id;
+  char role = 0;
+  {
+    std::lock_guard lk(call_mu_);
+    call_id = call_id_;
+    role = call_role_;
+  }
+  if (call_id.empty() || role == 0 || len == 0) return;
+  const crypto::Arr<32> key = crypto::call_key_for(room_, call_id, role);
+  crypto::Bytes out;
+  out.reserve(crypto_secretbox_NONCEBYTES + len + crypto_secretbox_MACBYTES);
+  crypto::Arr<24> nonce{};
+  randombytes_buf(nonce.data(), nonce.size());
+  out.insert(out.end(), nonce.begin(), nonce.end());
+  crypto::Bytes box(len + crypto_secretbox_MACBYTES);
+  crypto_secretbox_easy(box.data(), data, len, nonce.data(), key.data());
+  out.insert(out.end(), box.begin(), box.end());
+  ch_->send_audio(out.data(), out.size());
+}
+
+void Session::on_audio_packet(const std::uint8_t* data, std::size_t len) {
+  std::string call_id;
+  char role = 0;
+  {
+    std::lock_guard lk(call_mu_);
+    call_id = call_id_;
+    role = call_role_;
+  }
+  if (call_id.empty() || role == 0) return;  // no active call: drop late frames
+  constexpr std::size_t kHdr = crypto_secretbox_NONCEBYTES + crypto_secretbox_MACBYTES;
+  if (len < kHdr + 8) return;  // less than half a 20ms frame: junk
+  const char peer_role = role == 'i' ? 'r' : 'i';
+  const crypto::Arr<32> key = crypto::call_key_for(room_, call_id, peer_role);
+  crypto::Bytes plain(len - crypto_secretbox_NONCEBYTES - crypto_secretbox_MACBYTES);
+  if (crypto_secretbox_open_easy(plain.data(), data + crypto_secretbox_NONCEBYTES,
+                                 len - crypto_secretbox_NONCEBYTES, data, key.data()) != 0)
+    return;  // forged/dropped-key frame: drop silently
+  if (ev_.call_audio) ev_.call_audio(plain.data(), plain.size());
 }
 
 void Session::handle_chunk(const std::uint8_t* data, std::size_t len) {

@@ -76,6 +76,17 @@ public:
     peer_->cv.notify_one();
   }
 
+  // lossy lane: same delivery, no framing beyond a distinct callback
+  void send_audio(const std::uint8_t* data, std::size_t len) override {
+    Cbs cbs;
+    {
+      std::lock_guard lk(peer_->mu);
+      if (peer_->closed) return;
+      cbs = peer_->cbs;
+    }
+    if (cbs.on_audio) cbs.on_audio(data, len);
+  }
+
   std::size_t buffered_amount() const override { return 0; }
 
   void close() override {
@@ -516,6 +527,88 @@ static void test_ratchet() {
   CHECK(threw);
 }
 
+static void test_calls_loopback() {
+  const std::string db_a = "/tmp/shopot-call-a.sqlite", db_b = "/tmp/shopot-call-b.sqlite";
+  std::filesystem::remove(db_a);
+  std::filesystem::remove(db_b);
+
+  const crypto::Identity id_a =
+      crypto::Identity::from_entropy(crypto::mnemonic_to_entropy(crypto::mnemonic_generate()));
+  const crypto::Identity id_b =
+      crypto::Identity::from_entropy(crypto::mnemonic_to_entropy(crypto::mnemonic_generate()));
+  Db dba(db_a, id_a.storage), dbb(db_b, id_b.storage);
+  const std::int64_t cid_b_in_a = dba.add_contact(id_b.enc_pk, id_b.sign_pk, "b");
+  const std::int64_t cid_a_in_b = dbb.add_contact(id_a.enc_pk, id_a.sign_pk, "a");
+
+  std::mutex mu;
+  std::vector<std::pair<std::string, std::string>> sig_a, sig_b;  // (act, call_id)
+  std::vector<std::string> audio_b;                                // decrypted payload
+  SessionEvents ev_a, ev_b;
+  ev_a.error = [](std::int64_t, std::string e) { std::cerr << "[A err] " << e << "\n"; };
+  ev_b.error = [](std::int64_t, std::string e) { std::cerr << "[B err] " << e << "\n"; };
+  ev_a.call_signal = [&](const std::string& act, const std::string& cid) {
+    std::lock_guard lk(mu);
+    sig_a.emplace_back(act, cid);
+  };
+  ev_b.call_signal = [&](const std::string& act, const std::string& cid) {
+    std::lock_guard lk(mu);
+    sig_b.emplace_back(act, cid);
+  };
+  ev_b.call_audio = [&](const std::uint8_t* d, std::size_t n) {
+    std::lock_guard lk(mu);
+    audio_b.emplace_back(reinterpret_cast<const char*>(d), n);
+  };
+
+  auto [ch_a, ch_b] = LoopbackChannel::pair();
+  auto sa = std::make_shared<Session>(id_a, *dba.contact(cid_b_in_a), dba, std::move(ch_a),
+                                      ev_a, "/tmp/shopot-dl-a");
+  auto sb = std::make_shared<Session>(id_b, *dbb.contact(cid_a_in_b), dbb, std::move(ch_b),
+                                      ev_b, "/tmp/shopot-dl-b");
+  sa->start();
+  sb->start();
+  if (!wait_for([&] { return sa->established() && sb->established(); }, 8000))
+    std::cerr << "[call-test debug] established a=" << sa->established()
+              << " b=" << sb->established() << "\n";
+  CHECK(wait_for([&] { return sa->established() && sb->established(); }));
+
+  // ring: A -> B
+  const std::string call_id = "calltest0001";
+  sa->set_call(call_id, "i");
+  sa->send_call_signal("offer", call_id);
+  CHECK(wait_for([&] {
+    std::lock_guard lk(mu);
+    return !sig_b.empty() && sig_b.back().first == "offer" && sig_b.back().second == call_id;
+  }));
+  sb->set_call(call_id, "r");
+  sb->send_call_signal("accept", call_id);
+  CHECK(wait_for([&] {
+    std::lock_guard lk(mu);
+    return !sig_a.empty() && sig_a.back().first == "accept";
+  }));
+
+  // audio A -> B decrypts to the same bytes
+  const std::string pcm(640, '\x42');
+  sa->send_audio_packet(reinterpret_cast<const std::uint8_t*>(pcm.data()), pcm.size());
+  CHECK(wait_for([&] {
+    std::lock_guard lk(mu);
+    return !audio_b.empty() && audio_b.back() == pcm;
+  }));
+
+  // wrong-key frame is dropped: B sets no call? try peer-role mismatch
+  sb->send_audio_packet(reinterpret_cast<const std::uint8_t*>(pcm.data()), pcm.size());
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));  // A has no audio cb: no crash
+
+  // hangup B -> A
+  sb->send_call_signal("end", call_id);
+  CHECK(wait_for([&] {
+    std::lock_guard lk(mu);
+    return !sig_a.empty() && sig_a.back().first == "end";
+  }));
+
+  sa->stop();
+  sb->stop();
+}
+
 static void test_protocol_loopback() {
   const std::string db_a = "/tmp/shopot-test-a.sqlite", db_b = "/tmp/shopot-test-b.sqlite";
   std::filesystem::remove(db_a);
@@ -748,6 +841,8 @@ int main() {
   test_signal();
   std::cout << "signal: ok\n";
   test_live_mqtt();
+  test_calls_loopback();
+  std::cout << "calls(loopback): ok\n";
   test_protocol_loopback();
   std::cout << "protocol(loopback): ok\n";
   if (g_failures) {
