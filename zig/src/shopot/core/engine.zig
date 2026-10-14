@@ -53,8 +53,8 @@ pub const Engine = struct {
     id: identity_mod.Identity,
     ev: Events,
 
-    contacts: std.ArrayList(Contact),
-    contact_ids: std.ArrayList(i64), // stable small ids
+    contacts: std.ArrayListUnmanaged(Contact) = .empty,
+    contact_ids: std.ArrayListUnmanaged(i64) = .empty, // stable small ids
 
     sessions: std.AutoHashMap(i64, *session_mod.Session),
 
@@ -67,8 +67,6 @@ pub const Engine = struct {
             .io = io,
             .id = id,
             .ev = ev,
-            .contacts = std.ArrayList(Contact).init(alloc),
-            .contact_ids = std.ArrayList(i64).init(alloc),
             .sessions = std.AutoHashMap(i64, *session_mod.Session).init(alloc),
             .last_seen_ms = std.AutoHashMap(i64, i64).init(alloc),
         };
@@ -80,8 +78,8 @@ pub const Engine = struct {
             s.*.close();
         }
         self.sessions.deinit();
-        self.contacts.deinit();
-        self.contact_ids.deinit();
+        self.contacts.deinit(self.alloc);
+        self.contact_ids.deinit(self.alloc);
         self.last_seen_ms.deinit();
     }
 
@@ -89,9 +87,9 @@ pub const Engine = struct {
         var c = Contact{};
         c.setName(name);
         c.bundle = bundle;
-        try self.contacts.append(c);
+        try self.contacts.append(self.alloc, c);
         const idx = self.contacts.items.len - 1;
-        try self.contact_ids.append(@intCast(idx + 1));
+        try self.contact_ids.append(self.alloc, @intCast(idx + 1));
         return idx;
     }
 
@@ -108,7 +106,7 @@ pub const Engine = struct {
         if (self.contacts.items[idx].blocked) return EngineError.Blocked;
         const s = self.sessions.get(contact_id) orelse return EngineError.NoSession;
         var msg_id: [16]u8 = undefined;
-        std.crypto.random.bytes(&msg_id);
+        self.io.random(&msg_id);
         var ts_buf: [8]u8 = undefined;
         self.io.random(&ts_buf);
         const ts_ms: u64 = std.mem.readInt(u64, &ts_buf, .little) % 100_000_000_000_000;
@@ -196,7 +194,7 @@ pub const Engine = struct {
                 }
             },
             .presence_pong => {
-                self.markSeen(contact_id, std.time.milliTimestamp());
+                self.markSeen(contact_id, self.nowMs());
             },
             .call_signal => |cs| {
                 if (self.ev.onCallSignal) |cb| cb(self.ev.ctx, c, cs.op, cs.call_id);
