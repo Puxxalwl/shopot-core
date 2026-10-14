@@ -775,7 +775,7 @@ fn loadContacts(app: *App) void {
         if (rec.len < 1 + nlen + 64) continue;
         const name = rec[1 .. 1 + nlen];
         const bundle: [64]u8 = rec[1 + nlen ..][0..64].*;
-        const idx = app.eng.addContact(name, bundle) catch continue;
+        const idx = app.eng.addContact(name, bundle) catch return;
         app.hb.put(@intCast(idx + 1), .{}) catch {};
     }
     // блокировки поверх загруженных контактов
@@ -972,6 +972,55 @@ fn tuiLoop(app: *App) !void {
                 }
             },
             .char => |ch| {
+                // при пустом вводе латинские буквы — горячие клавиши
+                if (input_len == 0 and ch.len == 1) {
+                    switch (ch[0]) {
+                        'q' => {
+                            app.running = false;
+                            return;
+                        },
+                        'c' => {
+                            app.lock();
+                            const nc = app.eng.contacts.items.len;
+                            app.unlock();
+                            if (nc > 0) {
+                                var cb: [16]u8 = undefined;
+                                const cid_str = std.fmt.bufPrint(&cb, "{d}", .{selected + 1}) catch continue;
+                                cmdCall(app, cid_str) catch |e| {
+                                    var eb: [96]u8 = undefined;
+                                    const t = std.fmt.bufPrint(&eb, "! звонок: {s}", .{@errorName(e)}) catch "";
+                                    app.pushChat(t);
+                                };
+                            }
+                            continue;
+                        },
+                        'a' => {
+                            cmdAnswer(app) catch |e| {
+                                var eb: [96]u8 = undefined;
+                                const t = std.fmt.bufPrint(&eb, "! звонок: {s}", .{@errorName(e)}) catch "";
+                                app.pushChat(t);
+                            };
+                            continue;
+                        },
+                        'h' => {
+                            cmdHangup(app) catch {};
+                            continue;
+                        },
+                        'b' => {
+                            app.lock();
+                            const nc = app.eng.contacts.items.len;
+                            const blocked = if (nc > 0) app.eng.contacts.items[selected].blocked else false;
+                            app.unlock();
+                            if (nc > 0) {
+                                var cb: [16]u8 = undefined;
+                                const cid_str = std.fmt.bufPrint(&cb, "{d}", .{selected + 1}) catch continue;
+                                cmdBlock(app, cid_str, !blocked) catch {};
+                            }
+                            continue;
+                        },
+                        else => {},
+                    }
+                }
                 if (input_len + ch.len <= input.len) {
                     @memcpy(input[input_len .. input_len + ch.len], ch);
                     input_len += ch.len;
@@ -979,45 +1028,6 @@ fn tuiLoop(app: *App) !void {
                 }
             },
             .unknown => {},
-        }
-        // одиночные клавиши-команды только при пустом вводе
-        if (input_len == 0) blk: {
-            app.lock();
-            const nc = app.eng.contacts.items.len;
-            app.unlock();
-            const key2 = key;
-            switch (key2) {
-                .char => |ch| {
-                    if (std.mem.eql(u8, ch, "q")) {
-                        app.running = false;
-                    } else if (std.mem.eql(u8, ch, "c") and nc > 0) {
-                        var cb: [64]u8 = undefined;
-                        const cid_str = std.fmt.bufPrint(&cb, "{d}", .{selected + 1}) catch break :blk;
-                        cmdCall(app, cid_str) catch |e| {
-                            var eb: [96]u8 = undefined;
-                            const t = std.fmt.bufPrint(&eb, "! звонок: {s}", .{@errorName(e)}) catch "";
-                            app.pushChat(t);
-                        };
-                    } else if (std.mem.eql(u8, ch, "a")) {
-                        cmdAnswer(app) catch |e| {
-                            var eb: [96]u8 = undefined;
-                            const t = std.fmt.bufPrint(&eb, "! звонок: {s}", .{@errorName(e)}) catch "";
-                            app.pushChat(t);
-                        };
-                    } else if (std.mem.eql(u8, ch, "h")) {
-                        cmdHangup(app) catch {};
-                    } else if (std.mem.eql(u8, ch, "b") and nc > 0) {
-                        var cb: [64]u8 = undefined;
-                        const cid_str = std.fmt.bufPrint(&cb, "{d}", .{selected + 1}) catch break :blk;
-                        app.lock();
-                        const blocked = app.eng.contacts.items[selected].blocked;
-                        app.unlock();
-                        const args = std.fmt.bufPrint(&cb, "{s}", .{cid_str}) catch break :blk;
-                        cmdBlock(app, args, !blocked) catch {};
-                    }
-                },
-                else => {},
-            }
         }
     }
 }
