@@ -16,8 +16,10 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-linux
+            zig_target: x86_64-linux-musl
           - os: macos-14
             target: aarch64-macos
+            zig_target: native
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +33,7 @@ jobs:
         run: zig build test
       - name: Build
         working-directory: zig
-        run: zig build -Doptimize=ReleaseFast -Dcpu=baseline
+        run: zig build -Doptimize=ReleaseFast -Dcpu=baseline -Dtarget=${{ matrix.zig_target }}
       - name: Package
         working-directory: zig
         shell: bash
