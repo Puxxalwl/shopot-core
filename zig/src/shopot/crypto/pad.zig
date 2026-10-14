@@ -8,8 +8,9 @@ const std = @import("std");
 /// BadLen — заголовок длины не согласован с данными.
 pub const Error = error{ TooShort, BadLen };
 
-/// Классы размеров кадра.
-pub const buckets = [_]usize{ 128, 256, 512, 1024, 4096, 16384, 65536 };
+/// Классы размеров кадра. Таблица общая с net/obfuscate.zig (синхронно менять).
+/// Класса 65536 нет: длина кадра на проводе — u16, запас обязан быть явным.
+pub const buckets = [_]usize{ 128, 256, 512, 1024, 4096, 16384 };
 
 /// Максимальный размер payload: кадр с заголовком u16 обязан влезть в класс.
 pub const max_payload = buckets[buckets.len - 1] - 2;
@@ -73,7 +74,7 @@ test "pad: случайные размеры и довесок" {
     const io = std.testing.io;
     var buf: [buckets[buckets.len - 1]]u8 = undefined;
 
-    const sizes = [_]usize{ 0, 1, 2, 100, 126, 127, 200, 400, 900, 4000, 16000, 65000, max_payload };
+    const sizes = [_]usize{ 0, 1, 2, 100, 126, 127, 200, 400, 900, 4000, 16000, max_payload };
     for (sizes) |n| {
         var payload: [max_payload]u8 = undefined;
         @memset(payload[0..n], 0x5A);

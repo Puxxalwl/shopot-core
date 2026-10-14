@@ -26,7 +26,12 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the CLI");
     run_step.dependOn(&run_cmd.step);
 
-    const unit = b.addTest(.{ .root_module = mod });
+    const unit_mod = b.createModule(.{
+        .root_source_file = b.path("src/shopot_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const unit = b.addTest(.{ .root_module = unit_mod });
     const run_unit = b.addRunArtifact(unit);
     const test_step = b.step("test", "Run module tests");
     test_step.dependOn(&run_unit.step);

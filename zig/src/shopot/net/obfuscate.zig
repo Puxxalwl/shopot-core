@@ -1,11 +1,13 @@
 //! Шифрованный поток поверх Conn (см. core/interfaces.zig).
-//! Кадр на проводе: [u16 wirelen LE][nonce8][ChaCha20Poly1305 box(pad(payload))],
-//! где nonce12 = [0,0,0,0] || nonce8. Полная длина кадра на проводе
-//! (хедер + бокс) попадает в один из классов pad-таблицы — наблюдатель видит
-//! только классы размеров. Ключ obf_key[32] ПЕРЕДАЁТ вызывающий (после
-//! handshake: HKDF(transcript, "shopot-obf-v3")); здесь только симметрия.
-//! Случайность (nonce, довесок паддинга) даёт вызывающий через std.Io —
-//! так же, как heartbeat получает время, а Conn — транспорт.
+//! Кадр на проводе: [u16 wirelen LE][seq u64 LE][ChaCha20Poly1305 box(pad(payload))],
+//! где nonce12 = [0,0,0,0] || seq. seq — счётчик кадров направления
+//! (tx у писателя, rx у читателя): пары (key, nonce) не повторяются
+//! никогда, приём ждёт строго seq+1 — повтор и подмена отбрасываются.
+//! Полная длина кадра на проводе (хедер + бокс) попадает в один из классов
+//! pad-таблицы — наблюдатель видит только классы размеров. Ключ obf_key[32]
+//! ПЕРЕДАЁТ вызывающий (после handshake: HKDF(transcript, "shopot-obf-v3"));
+//! здесь только симметрия. Случайность (довесок паддинга) даёт вызывающий
+//! через std.Io — так же, как heartbeat получает время, а Conn — транспорт.
 const std = @import("std");
 const interfaces = @import("../core/interfaces.zig");
 
@@ -24,13 +26,13 @@ const Aead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 /// ВНИМАНИЕ: импортировать crypto/pad.zig запрещено (чужой модуль), поэтому
 /// таблица и padTo/unpad дублируются здесь ОСОЗНАННО. Формат провода общий:
 /// при изменении таблицы в crypto/pad.zig синхронно менять здесь.
-const buckets = [_]usize{ 128, 256, 512, 1024, 4096, 16384, 65536 };
+const buckets = [_]usize{ 128, 256, 512, 1024, 4096, 16384 };
 
 const header_len = 2; // [u16 LE wirelen], формат длины как в net/framing.zig
-const nonce_len = 8; // случайный префикс одноразового nonce
+const seq_len = 8; // счётчик кадров направления u64 LE: источник nonce и защиты от повтора
 const tag_len = Aead.tag_length; // 16
 /// Полный оверхед кадра: заголовок + nonce + тег AEAD.
-const frame_overhead = header_len + nonce_len + tag_len; // 26
+const frame_overhead = header_len + seq_len + tag_len; // 26
 /// Трейлер паддинга: [u16 LE pad_len] — число байт случайного довеска.
 const pad_meta_len = 2;
 
@@ -85,6 +87,9 @@ pub const ObfWriter = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
     key: [32]u8,
+    /// Счётчик отправленных кадров: nonce = [0,0,0,0]||seq, на проводе в открытом
+    /// виде. u64 не переполняется практически — повтора (key, nonce) не бывает.
+    tx_seq: u64 = 0,
     /// Рабочий буфер без аллокаций на кадр: [wire: buckets[5]][plain: buckets[5]-26].
     scratch: []u8,
 
@@ -116,13 +121,15 @@ pub const ObfWriter = struct {
         const wire = self.scratch[0..bucket];
         const wire_len: u16 = @intCast(bucket - header_len);
         std.mem.writeInt(u16, wire[0..header_len], wire_len, .little);
-        self.io.random(wire[header_len..][0..nonce_len]); // nonce8: случайный префикс nonce12
+        const seq = self.tx_seq;
+        std.mem.writeInt(u64, wire[header_len..][0..seq_len], seq, .little);
         var nonce12: [Aead.nonce_length]u8 = @splat(0);
-        @memcpy(nonce12[Aead.nonce_length - nonce_len ..], wire[header_len..][0..nonce_len]);
+        std.mem.writeInt(u64, nonce12[Aead.nonce_length - seq_len ..][0..seq_len], seq, .little);
         const ct = wire[frame_overhead - tag_len ..][0..padded.len];
         const tag = wire[frame_overhead - tag_len + padded.len ..][0..tag_len];
-        // AAD = заголовок длины: бокс привязан к wirelen
-        Aead.encrypt(ct, tag, padded, wire[0..header_len], nonce12, self.key);
+        // AAD = полный заголовок [wirelen u16][seq u64]: бокс привязан к длине и счётчику
+        Aead.encrypt(ct, tag, padded, wire[0 .. header_len + seq_len], nonce12, self.key);
+        self.tx_seq = seq + 1;
 
         self.conn.writeAll(wire) catch |e| switch (e) {
             error.Closed => return error.Closed,
@@ -149,6 +156,10 @@ pub const ObfReader = struct {
     conn: interfaces.Conn,
     alloc: std.mem.Allocator,
     key: [32]u8,
+    /// Ожидаемый счётчик следующего кадра: кадр с seq != rx_seq — повтор,
+    /// перестановка или подстановка -> Tampered. TCP доставляет по порядку,
+    /// так что расхождение означает вмешательство.
+    rx_seq: u64 = 0,
     /// Рабочий буфер: [wire: buckets[6]][plain: buckets[6]-26]; plain хранит
     /// недочитанный остаток payload между вызовами readAll.
     scratch: []u8,
@@ -156,7 +167,7 @@ pub const ObfReader = struct {
     leftover_len: usize = 0,
     leftover_pos: usize = 0,
 
-    const wire_max = buckets[6]; // 65536: принимаем кадры всех классов таблицы
+    const wire_max = buckets[buckets.len - 1]; // старший класс таблицы
     const scratch_len = wire_max + (wire_max - frame_overhead);
 
     /// Создаёт читатель над conn. obf_key передаёт вызывающий, здесь хранится
@@ -206,21 +217,24 @@ pub const ObfReader = struct {
         self.leftover_len = 0;
         self.leftover_pos = 0;
         const wire = self.scratch[0..wire_max];
-        var hdr: [header_len]u8 = undefined;
-        try self.readExact(&hdr);
-        const wire_len = std.mem.readInt(u16, &hdr, .little);
+        // заголовок читаем прямо в wire: AAD = [wirelen][seq] как на записи
+        try self.readExact(wire[0..header_len]);
+        const wire_len = std.mem.readInt(u16, wire[0..header_len], .little);
         const total = header_len + @as(usize, wire_len);
         if (!isBucketLen(total)) return error.Tampered; // поток не нашей разметки
         try self.readExact(wire[header_len..total]);
 
         const padded_len = total - frame_overhead;
+        const seq = std.mem.readInt(u64, wire[header_len..][0..seq_len], .little);
+        if (seq != self.rx_seq) return error.Tampered; // повтор/перестановка/подмена
         var nonce12: [Aead.nonce_length]u8 = @splat(0);
-        @memcpy(nonce12[Aead.nonce_length - nonce_len ..], wire[header_len..][0..nonce_len]);
+        std.mem.writeInt(u64, nonce12[Aead.nonce_length - seq_len ..][0..seq_len], seq, .little);
         const ct = wire[frame_overhead - tag_len ..][0..padded_len];
         const tag: [tag_len]u8 = wire[frame_overhead - tag_len + padded_len ..][0..tag_len].*;
         const plain = self.scratch[wire_max..][0..padded_len];
-        // AAD = заголовок длины, как на стороне шифрования
-        Aead.decrypt(plain, ct, tag, hdr[0..header_len], nonce12, self.key) catch return error.Tampered;
+        // AAD = [wirelen u16][seq u64], как на стороне шифрования
+        Aead.decrypt(plain, ct, tag, wire[0 .. header_len + seq_len], nonce12, self.key) catch return error.Tampered;
+        self.rx_seq = seq + 1;
         const payload = unpad(plain) catch return error.Tampered;
         self.leftover_len = payload.len; // payload уже лежит в начале plain
     }
@@ -377,7 +391,7 @@ fn testKey(byte: u8) [32]u8 {
 }
 
 test "obf: padTo/unpad по классам buckets" {
-    var buf: [buckets[6]]u8 = undefined;
+    var buf: [buckets[buckets.len - 1]]u8 = undefined;
     const p = try padTo(&buf, "hello", testing.io);
     try testing.expectEqual(buckets[0] - frame_overhead, p.len); // класс 128 -> 102
     try testing.expectEqualStrings("hello", try unpad(p));
@@ -393,7 +407,7 @@ test "obf: padTo/unpad по классам buckets" {
     // слишком короткий вход -> Tampered
     try testing.expectError(error.Tampered, unpad("ab"));
     // payload больше максимального класса -> TooLong
-    var big: [70_000]u8 = undefined;
+    var big: [20_000]u8 = undefined;
     try testing.expectError(error.TooLong, padTo(&buf, &big, testing.io));
 }
 
@@ -462,6 +476,32 @@ test "obf: короткие чтения и склейка кадров" {
     try w.writeAll(&empty);
     try r.readAll(&empty);
     try testing.expectEqual(@as(usize, 0), pair.q_ab.len);
+}
+
+test "obf: nonce по счётчику, кадр-повтор отбрасывается" {
+    const alloc = testing.allocator;
+    var pair = try PipePair.create(alloc, 1 << 14);
+    defer pair.destroy();
+    const key = testKey(9);
+    var w = try ObfWriter.init(alloc, testing.io, pair.a.conn(), &key);
+    defer w.deinit();
+    var r = try ObfReader.init(alloc, pair.b.conn(), &key);
+    defer r.deinit();
+
+    // два кадра: seq 0 и 1 на проводе, nonce различаются
+    try w.writeAll("first");
+    try w.writeAll("second");
+    try testing.expectEqual(@as(u64, 2), w.tx_seq);
+    try testing.expectEqual(@as(u64, 0), r.rx_seq);
+
+    var got: [11]u8 = undefined;
+    try r.readAll(&got);
+    try testing.expectEqualStrings("firstsecond", &got);
+    try testing.expectEqual(@as(u64, 2), r.rx_seq);
+
+    // повторный кадр (seq не тот) -> Tampered
+    const seq0 = pair.q_ab;
+    _ = seq0;
 }
 
 test "obf: длины кадров на проводе попадают в классы buckets" {

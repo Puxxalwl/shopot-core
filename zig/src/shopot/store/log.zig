@@ -3,7 +3,7 @@
 //! Формат файла (все целые — little-endian, никаких varint):
 //!
 //!     header (12B): [version u8 = 3][reserved u8 x3][epoch u32][base_seq u32]
-//!     record:       [len u16][nonce 12B][box]
+//!     record:       [len u16][nonce 12B][box] (nonce = [0 x4][epoch][seq], детерминированный)
 //!
 //! `len` — длина данных после поля len (nonce + box), максимум 65535.
 //! `box` — ChaCha20-Poly1305: ciphertext||tag(16B). AAD бокса — epoch u32 LE
@@ -502,18 +502,6 @@ fn writeHeader(buf: *[header_size]u8, epoch: u32, base_seq: u32) void {
 }
 
 /// Заполняет buf криптостойкой энтропией ОС (getrandom).
-fn fillRandom(buf: []u8) Error!void {
-    var i: usize = 0;
-    while (i < buf.len) {
-        const rc = posix.system.getrandom(buf.ptr + i, buf.len - i, 0);
-        switch (posix.errno(rc)) {
-            .SUCCESS => i += @intCast(rc),
-            .INTR => continue,
-            else => return error.EntropyUnavailable,
-        }
-    }
-}
-
 /// Собирает зашифрованную запись в buf (buf.len >= max_record_disk).
 fn assembleRecord(buf: []u8, kind: Kind, seq: u32, payload: []const u8, epoch: u32, key: *const [32]u8) Error![]u8 {
     if (payload.len > max_payload) return error.RecordTooLarge;
@@ -523,7 +511,13 @@ fn assembleRecord(buf: []u8, kind: Kind, seq: u32, payload: []const u8, epoch: u
     mem.writeInt(u32, &aad, epoch, .little);
 
     mem.writeInt(u16, buf[0..2], len, .little);
-    fillRandom(buf[2..14]) catch return error.EntropyUnavailable;
+    // nonce детерминированный: [0 x4][epoch u32 LE][seq u32 LE]. Уникален в
+    // рамках (storage_key, epoch, seq): seq монотонен внутри эпохи — повтора
+    // пары (key, nonce) не бывает. Поле nonce на диске сохранено: старые записи
+    // со случайным nonce читаются как раньше.
+    @memset(buf[2..6], 0);
+    mem.writeInt(u32, buf[6..10], epoch, .little);
+    mem.writeInt(u32, buf[10..14], seq, .little);
     // Открытый текст: [kind u8][seq u32][payload]; шифруется на месте.
     buf[14] = @backingInt(kind);
     mem.writeInt(u32, buf[15..19], seq, .little);

@@ -115,19 +115,21 @@ test "heartbeat: offline ровно после 3 пропусков, один р
     const testing = std.testing;
     var s = State{};
     s.onInbound(0);
+    // backoff пингов пропавшего: 5с, 10с, 20с
     const a1 = s.tick(5_000);
     const a2 = s.tick(10_000);
-    const a3 = s.tick(15_000);
+    const a3 = s.tick(20_000);
     try testing.expect(a1 == .send_ping and a1.send_ping.seq == 1);
     try testing.expect(a2 == .send_ping and a2.send_ping.seq == 2);
     try testing.expect(a3 == .send_ping and a3.send_ping.seq == 3);
     try testing.expectEqual(@as(u8, 3), s.missed); // три пинга подряд без понга
     try testing.expect(s.online);
-    const off = s.tick(20_000);
+    try testing.expect(s.tick(25_000) == .none); // 5с < эффективных 20с
+    const off = s.tick(40_000); // 20с прошло — третий пропуск
     try testing.expect(off == .mark_offline);
     try testing.expect(!s.online);
-    try testing.expect(s.tick(25_000) == .none);
-    try testing.expect(s.tick(30_000) == .none);
+    try testing.expect(s.tick(45_000) == .none); // после offline тики молчат
+    try testing.expect(s.tick(60_000) == .none);
     try testing.expectEqual(@as(u32, 3), s.seq); // seq больше не растёт
 }
 
@@ -156,11 +158,11 @@ test "heartbeat: pong гасит ожидание, поздний игнорир
     s.onInbound(0);
     _ = s.tick(5_000);
     _ = s.tick(10_000);
-    _ = s.tick(15_000);
-    try testing.expect(s.tick(20_000) == .mark_offline);
-    s.onInbound(20_500);
+    _ = s.tick(20_000);
+    try testing.expect(s.tick(40_000) == .mark_offline);
+    s.onInbound(40_500);
     try testing.expect(s.online and s.missed == 0);
-    try testing.expect(s.tick(20_500) == .none);
+    try testing.expect(s.tick(40_500) == .none);
 }
 
 test "heartbeat: seq детерминирован на одинаковых таймлайнах" {
