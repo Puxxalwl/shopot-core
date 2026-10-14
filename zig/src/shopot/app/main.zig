@@ -17,6 +17,7 @@ const invite_mod = @import("invite.zig");
 const discover_mod = @import("discover.zig");
 const tui_mod = @import("tui.zig");
 const audio_mod = @import("audio.zig");
+const adpcm_mod = @import("adpcm.zig");
 const cli_srv = @import("cli_server.zig");
 const cli_mod = cli_srv;
 
@@ -29,6 +30,13 @@ const usage =
     \\  id      показать bundle и отпечаток
     \\  serve   демон: ядро + UDS-апи (см. docs/CORE-API.md)
 ;
+const app_home_max = 512;
+
+/// $HOME копия App.home_buf.
+fn appHomeDir(app: *const App) []const u8 {
+    return app.home_buf[0..app.home_len];
+}
+
 fn shopotDir(io: std.Io, home: []const u8) ![512]u8 {
     if (home.len == 0) return error.NoHome;
     var buf: [512]u8 = undefined;
@@ -129,6 +137,13 @@ pub const App = struct {
     join_map: std.AutoHashMapUnmanaged(i64, JoinInfo) = .empty,
     /// Кэш аватаров: avatar_id -> байты (из лога kind AVATAR).
     avatars: std.AutoHashMapUnmanaged([16]u8, []u8) = .empty,
+    /// Живые fake-TLS обёртки (для deinit по завершении).
+    ftlss: std.ArrayListUnmanaged(*shopot.net.faketls.FakeTlsConn) = .empty,
+    /// Приём файлов в полёте: file_id -> RxFile.
+    rx_files: std.AutoHashMapUnmanaged([16]u8, *RxFile) = .empty,
+    /// Копия $HOME (для файлов/путей).
+    home_buf: [512]u8 = @splat(0),
+    home_len: usize = 0,
 
     running: bool = true,
 
@@ -200,7 +215,7 @@ pub const App = struct {
     }
 
     fn events(self: *App) engine_mod.Events {
-        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv, .onAvatar = onAvatarEv, .onAvatarReq = onAvatarReqEv };
+        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv, .onAvatar = onAvatarEv, .onAvatarReq = onAvatarReqEv, .onFileMeta = onFileMetaEv, .onFileData = onFileDataEv };
     }
 };
 
@@ -394,6 +409,116 @@ fn onAvatarEv(ctx: *anyopaque, from: *const engine_mod.Contact, avatar_id: [16]u
     cli_srv.fanoutSysLocked(app, @intCast(idx + 1), from.getName(), mt);
 }
 
+/// FILE_META: начать приём файла (состояние под app.mu).
+fn onFileMetaEv(ctx: *anyopaque, from: *const engine_mod.Contact, meta: envelope.FileMeta) void {
+    _ = from;
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (app.rx_files.contains(meta.file_id)) return; // уже в полёте
+    if (fileAlreadyStored(app, meta.file_id)) return; // уже приняли ранее
+    const rx = app.alloc.create(RxFile) catch return;
+    rx.* = .{ .size = meta.size, .sha = meta.sha };
+    const n = @min(meta.name.len, envelope.max_file_name);
+    @memcpy(rx.name_buf[0..n], meta.name[0..n]);
+    rx.name_len = n;
+    app.rx_files.put(app.alloc, meta.file_id, rx) catch {
+        app.alloc.destroy(rx);
+        return;
+    };
+}
+
+/// Чанк FILE_DATA: копим; по последнему чанку — сверка SHA и сохранение.
+/// ВЫЗЫВАЕТСЯ ПОД app.mu (из envIn).
+fn onFileDataEv(ctx: *anyopaque, from: *const engine_mod.Contact, data: envelope.FileData) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const rx = app.rx_files.get(data.file_id) orelse return;
+    if (data.seq != rx.expected_seq) return; // дубликат/дыра: ждём свой
+    rx.expected_seq += 1;
+    rx.buf.appendSlice(app.alloc, data.data) catch return;
+    if (rx.buf.items.len < rx.size) return;
+    if (rx.buf.items.len != rx.size) { // перелив = поломка передачи
+        dropRxFile(app, data.file_id);
+        return;
+    }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(rx.buf.items, &digest, .{});
+    if (!std.mem.eql(u8, &digest, &rx.sha)) { // битые байты
+        dropRxFile(app, data.file_id);
+        return;
+    }
+    const cid = contactIdByBundle(app, from.bundle) orelse {
+        dropRxFile(app, data.file_id);
+        return;
+    };
+    if (!saveRxFile(app, data.file_id, rx.buf.items)) {
+        dropRxFile(app, data.file_id);
+        return;
+    }
+    // лог kind FILE — перезапрос после рестарта не нужен
+    persistFileMeta(app, @intCast(cid), data.file_id, rx.size, rx.name());
+    var hxb: [32]u8 = undefined;
+    const hx = toHex(&hxb, &data.file_id) catch {
+        dropRxFile(app, data.file_id);
+        return;
+    };
+    var line: [192]u8 = undefined;
+    const t = std.fmt.bufPrint(&line, "file {d} {s} {d} {s}", .{ cid, hx, rx.size, rx.name() }) catch {
+        dropRxFile(app, data.file_id);
+        return;
+    };
+    dropRxFile(app, data.file_id);
+    cli_srv.fanoutSysLocked(app, cid, "file", t);
+}
+
+fn dropRxFile(app: *App, file_id: [16]u8) void {
+    const rx = app.rx_files.get(file_id) orelse return;
+    _ = app.rx_files.remove(file_id);
+    rx.buf.deinit(app.alloc);
+    std.crypto.secureZero(u8, &rx.sha);
+    app.alloc.destroy(rx);
+}
+
+/// Файл уже сохранён? (кэш ~/.shopot/files/<id_hex32>)
+fn fileAlreadyStored(app: *App, file_id: [16]u8) bool {
+    var hxb: [32]u8 = undefined;
+    const hx = toHex(&hxb, &file_id) catch return false;
+    var fbuf: [700]u8 = undefined;
+    const path = std.fmt.bufPrint(&fbuf, "{s}/.shopot/files/{s}", .{ appHomeDir(app), hx }) catch return false;
+    var zbuf: [701]u8 = undefined;
+    @memcpy(zbuf[0..path.len], path);
+    zbuf[path.len] = 0;
+    const fd = std.os.linux.openat(@bitCast(@as(i32, -100)), @ptrCast(&zbuf), .{ .ACCMODE = .RDONLY }, 0);
+    if (std.os.linux.errno(fd) != .SUCCESS) return false;
+    _ = std.os.linux.close(@intCast(fd));
+    return true;
+}
+
+/// Сохранить принятый файл (SHA уже сверена). true = записан.
+fn saveRxFile(app: *App, file_id: [16]u8, bytes: []const u8) bool {
+    var hxb: [32]u8 = undefined;
+    const hx = toHex(&hxb, &file_id) catch return false;
+    var pbuf: [600]u8 = undefined;
+    const dir = std.fmt.bufPrint(&pbuf, "{s}/.shopot/files", .{appHomeDir(app)}) catch return false;
+    var zbuf: [601]u8 = undefined;
+    @memcpy(zbuf[0..dir.len], dir);
+    zbuf[dir.len] = 0;
+    _ = std.os.linux.mkdir(@ptrCast(&zbuf), 0o700); // EEXIST — не ошибка
+    var fbuf: [700]u8 = undefined;
+    const path = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ dir, hx }) catch return false;
+    var zbuf2: [701]u8 = undefined;
+    @memcpy(zbuf2[0..path.len], path);
+    zbuf2[path.len] = 0;
+    const fd = std.os.linux.openat(@bitCast(@as(i32, -100)), @ptrCast(&zbuf2), .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
+    if (std.os.linux.errno(fd) != .SUCCESS) return false;
+    defer _ = std.os.linux.close(@intCast(fd));
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = std.os.linux.write(@intCast(fd), bytes[off..].ptr, bytes.len - off);
+        if (std.os.linux.errno(rc) != .SUCCESS) return false;
+        off += @intCast(rc);
+    }
+    return true;
+}
+
 /// Пир просит аватар с id: перекачать, если это наш текущий.
 fn onAvatarReqEv(ctx: *anyopaque, from: *const engine_mod.Contact, avatar_id: [16]u8) void {
     const app: *App = @ptrCast(@alignCast(ctx));
@@ -526,9 +651,26 @@ fn onCallAudioEv(ctx: *anyopaque, from: *const engine_mod.Contact, seq: u32, dat
     const c = app.call orelse return;
     if (!c.up) return;
     if (c.cid != contactIdByBundle(app, from.bundle) orelse return) return;
-    var plain: [audio_mod.frame_bytes]u8 = undefined;
-    audio_mod.openFrame(&plain, c.secret, c.call_id, seq, data) catch return;
-    if (c.pcm) |*pcm| pcm.writeFrame(&plain);
+    // провод: [codec u8][AEAD-блок]; codec 1 = PCM, 2 = ADPCM
+    if (data.len < 1 + aead_min) return;
+    var plain: [audio_mod.frame_bytes]u8 = undefined; // вместимость для PCM
+    const n = audio_mod.openFrame(&plain, c.secret, c.call_id, seq, data[1..]) catch return;
+    var pcm_buf: [audio_mod.frame_bytes]u8 = undefined;
+    var play: []const u8 = undefined;
+    switch (data[0]) {
+        audio_mod.codec_pcm => {
+            if (n != audio_mod.frame_bytes) return;
+            play = plain[0..n];
+        },
+        audio_mod.codec_adpcm => {
+            if (n != audio_mod.adpcm_block) return;
+            const got = adpcm_mod.decodeBlock(&pcm_buf, plain[0..n]);
+            if (got != audio_mod.frame_bytes) return;
+            play = pcm_buf[0..got];
+        },
+        else => return, // неизвестный кодек: кадр отброшен
+    }
+    if (c.pcm) |*pcm| pcm.writeFrame(play);
 }
 
 /// Найти cid по bundle (порядок стабильный: contacts[i] — id i+1).
@@ -561,8 +703,9 @@ fn startCallAudio(app: *App, c: *CallState) void {
 fn micLoop(app: *App) void {
     // Аккумулятор: fifo может отдавать данные малыми кусками, кадр шлём
     // только целиком (320 байт) — иначе разбор на приёме усложняется.
-    var acc: [audio_mod.frame_bytes]u8 = @splat(0);
+    var acc: [audio_mod.frame_bytes]u8 = @splat(0); // 640 байт = 20 мс @ 16 кГц
     var acc_len: usize = 0;
+    var silent_run: u32 = 0;
     const sleep: std.os.linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
     while (true) {
         _ = std.os.linux.nanosleep(&sleep, null);
@@ -575,7 +718,6 @@ fn micLoop(app: *App) void {
         // добираем в аккумулятор сколько есть
         acc_len += c.pcm.?.readPartial(acc[acc_len..]);
         if (acc_len < audio_mod.frame_bytes) continue; // ждём полный кадр
-        var box_: [audio_mod.box_bytes]u8 = undefined;
         const frame_seq = c.seq;
         // seq u32 в кадре CALL_AUDIO: на максимуме ключ/nonce кадра начали бы
         // повторяться — обрываем звонок раньше (практически недостижимо: ~99 суток)
@@ -583,11 +725,36 @@ fn micLoop(app: *App) void {
             endCallLocked(app, "достигнут предел длины звонка", c.call_id);
             continue;
         }
-        audio_mod.sealFrame(&box_, c.secret, c.call_id, frame_seq, acc[0..]);
+        // DTX: тишину не шлём (каждый 25-й кадр — keepalive, чтобы пир знал:
+        // линия жива). Пустое fifo читается как нули.
+        const is_silent = isZero(acc[0..]);
+        if (is_silent and silent_run < 24) {
+            silent_run += 1;
+            acc_len = 0;
+            continue;
+        }
+        silent_run = 0;
+        // кодек: IMA-ADPCM 4:1 -> 181 байт на проводе вместо 657
+        var wbuf: [1 + audio_mod.adpcm_block + aead_min]u8 = undefined;
+        var blk: [audio_mod.adpcm_block]u8 = undefined;
+        if (is_silent) {
+            @memset(&blk, 0);
+        } else {
+            _ = adpcm_mod.encodeBlock(&blk, acc[0..]);
+        }
+        wbuf[0] = audio_mod.codec_adpcm;
+        const sealed = audio_mod.sealFrame(wbuf[1..], c.secret, c.call_id, frame_seq, &blk);
         acc_len = 0;
         c.seq = frame_seq + 1;
-        _ = app.eng.callAudio(c.cid, frame_seq, &box_) catch {};
+        _ = app.eng.callAudio(c.cid, frame_seq, wbuf[0 .. 1 + sealed]) catch {};
     }
+}
+
+const aead_min = 16; // aead.tag_length
+
+fn isZero(b: []const u8) bool {
+    for (b) |x| if (x != 0) return false;
+    return true;
 }
 
 /// Завершить звонок: остановить поток, закрыть аудио, освободить состояние.
@@ -854,9 +1021,14 @@ fn autoAcceptLoop(app: *App, listener: *tcp.Listener) void {
                 continue;
             };
         }
-        // кадр m1: [len u16][m1 64]
+        // весь провод завёрнут в fake-TLS: обёртку ставим ДО чтения m1,
+        // кадр m1 [len u16][64] приходит внутри записей application_data
+        const raw = faketlsServer(app, tc) catch {
+            tc.deinit();
+            continue;
+        };
         var hdr: [2]u8 = undefined;
-        readRawAll(tc, &hdr) catch {
+        raw.readAll(&hdr) catch {
             tc.deinit();
             continue;
         };
@@ -866,7 +1038,7 @@ fn autoAcceptLoop(app: *App, listener: *tcp.Listener) void {
             continue;
         }
         var m1: [64]u8 = undefined;
-        readRawAll(tc, &m1) catch {
+        raw.readAll(&m1) catch {
             tc.deinit();
             continue;
         };
@@ -902,7 +1074,7 @@ fn autoAcceptLoop(app: *App, listener: *tcp.Listener) void {
                 sc.* = .{ .app = app, .cid = -1, .s = null };
                 const sp = session_mod.Session.establishPending(
                     app.alloc,
-                    tc.conn(),
+                    raw,
                     &m1,
                     app.id,
                     eph2,
@@ -938,7 +1110,7 @@ fn autoAcceptLoop(app: *App, listener: *tcp.Listener) void {
         sc.* = .{ .app = app, .cid = found_cid };
         const s = session_mod.Session.establishIdentified(
             app.alloc,
-            tc.conn(),
+            raw,
             &m1,
             app.id,
             eph,
@@ -1139,6 +1311,37 @@ fn cmdContacts(app: *App, rest: []const u8) void {
     }
 }
 
+/// Состояние приёма одного файла (FILE_META + чанки FILE_DATA).
+const RxFile = struct {
+    name_buf: [envelope.max_file_name]u8 = @splat(0),
+    name_len: usize = 0,
+    size: u32 = 0,
+    sha: [32]u8 = @splat(0),
+    expected_seq: u32 = 0,
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn name(self: *const RxFile) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
+/// Обернуть TCP-коннект в fake-TLS (server-роль, accept-сторона).
+fn faketlsServer(app: *App, tc: *tcp.TcpConn) !interfaces.Conn {
+    const ft = shopot.net.faketls.wrap(app.alloc, app.io, tc.conn(), .server) catch |e| {
+        return e;
+    };
+    {
+        app.lock();
+        defer app.unlock();
+        app.ftlss.append(app.alloc, ft.ftls) catch {
+            ft.ftls.deinit();
+            app.alloc.destroy(ft.ftls);
+            return error.OutOfMemory;
+        };
+    }
+    return ft.conn;
+}
+
 fn establishTo(app: *App, addr: []const u8, cid: i64, role: session_mod.HandshakeRole) !void {
     const idx: usize = @intCast(cid - 1);
     if (idx >= app.eng.contacts.items.len) return error.NoContact;
@@ -1153,9 +1356,24 @@ fn establishTo(app: *App, addr: []const u8, cid: i64, role: session_mod.Handshak
     app.io.random(&eph);
     const sc = try app.alloc.create(SessCtx);
     sc.* = .{ .app = app, .cid = cid };
+    // транспортная маскировка под TLS: dialer = client-роль fake-TLS
+    const ft = shopot.net.faketls.wrap(app.alloc, app.io, tc.conn(), .client) catch |e| {
+        app.alloc.destroy(sc);
+        return e;
+    };
+    {
+        app.lock();
+        defer app.unlock();
+        app.ftlss.append(app.alloc, ft.ftls) catch {
+            ft.ftls.deinit();
+            app.alloc.destroy(ft.ftls);
+            app.alloc.destroy(sc);
+            return error.OutOfMemory;
+        };
+    }
     const s = session_mod.Session.establish(
         app.alloc,
-        tc.conn(),
+        ft.conn,
         role,
         app.id,
         bundle[32..64].*,
@@ -1213,9 +1431,14 @@ fn acceptLoop(app: *App, listener: *tcp.Listener, cid: i64) void {
             continue;
         };
         sc.* = .{ .app = app, .cid = cid };
+        const raw = faketlsServer(app, tc) catch {
+            app.alloc.destroy(sc);
+            tc.deinit();
+            continue;
+        };
         const s = session_mod.Session.establish(
             app.alloc,
-            tc.conn(),
+            raw,
             .responder,
             app.id,
             bundle[32..64].*,
@@ -1420,6 +1643,20 @@ fn persistMsg(app: *App, cid: i64, mine: bool, msg_id: [16]u8, delivered: bool, 
     _ = log.append(.msg, buf[0 .. 29 + body.len]) catch {};
 }
 
+/// Записать принятый файл в лог (kind file): переживает рестарты.
+/// Вызывается под app.mu.
+fn persistFileMeta(app: *App, cid: i64, file_id: [16]u8, size: u32, name: []const u8) void {
+    const log = app.log orelse return;
+    var buf: [23 + 64]u8 = undefined;
+    std.mem.writeInt(u16, buf[0..2], @intCast(cid), .little);
+    @memcpy(buf[2..18], &file_id);
+    std.mem.writeInt(u32, buf[18..22], size, .little);
+    const n = @min(name.len, 64);
+    buf[22] = @intCast(n);
+    @memcpy(buf[23 .. 23 + n], name[0..n]);
+    _ = log.append(.file, buf[0 .. 23 + n]) catch {};
+}
+
 /// setname <имя>: моё отображаемое имя (лог set:2 + PROFILE пир-ам онлайн).
 fn cmdSetName(app: *App, args: []const u8) !void {
     const name = std.mem.trim(u8, args, " ");
@@ -1491,6 +1728,50 @@ fn cmdSetAvatar(app: *App, args: []const u8) !void {
     const hx = toHex(&hxb, &id) catch return;
     var line: [96]u8 = undefined;
     const t = std.fmt.bufPrint(&line, "аватар задан: {s} ({d} байт)", .{ hx, bytes.len }) catch return;
+    fb(app, null, t);
+}
+
+/// sendfile <cid> <путь>: передача файла чанками FILE_META + FILE_DATA.
+/// Чанк 16000 байт = один obf-кадр; file_id = SHA-256(файла)[0..16].
+fn cmdSendFile(app: *App, args: []const u8) !void {
+    var it = std.mem.tokenizeAny(u8, args, " ");
+    const id_str = it.next() orelse return error.BadArgs;
+    const path = std.mem.trim(u8, it.rest(), " ");
+    if (path.len == 0) return error.BadArgs;
+    const cid = try std.fmt.parseInt(i64, id_str, 10);
+    // только имя файла, без каталогов
+    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
+    if (base.len == 0 or base.len > envelope.max_file_name) return error.BadArgs;
+    const f = std.Io.Dir.openFileAbsolute(app.io, path, .{ .mode = .read_only }) catch
+        return error.FileNotFound;
+    defer f.close(app.io);
+    // лимит: 64 МБ (u32 размер + разумный таймаут перекачки)
+    const max_file_total = 64 * 1024 * 1024;
+    const data = app.alloc.alloc(u8, max_file_total) catch return error.OutOfMemory;
+    defer app.alloc.free(data);
+    const n = f.readPositionalAll(app.io, data, 0) catch return error.FileNotFound;
+    if (n == 0 or n > std.math.maxInt(u32)) return error.TooBig;
+    const bytes = data[0..n];
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const file_id = digest[0..16].*;
+    {
+        app.lock();
+        defer app.unlock();
+        try app.eng.sendFileMeta(cid, file_id, base, @intCast(n), digest);
+        var seq: u32 = 0;
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const chunk_len = @min(bytes.len - off, envelope.max_file_chunk);
+            try app.eng.sendFileChunk(cid, file_id, seq, bytes[off .. off + chunk_len]);
+            off += chunk_len;
+            seq += 1;
+        }
+    }
+    var hxb: [32]u8 = undefined;
+    const hx = toHex(&hxb, &file_id) catch return;
+    var line: [128]u8 = undefined;
+    const t = std.fmt.bufPrint(&line, "файл отправлен: {s} ({d} байт, {d} чанк.)", .{ hx, n, @divTrunc(n + envelope.max_file_chunk - 1, envelope.max_file_chunk) }) catch return;
     fb(app, null, t);
 }
 
@@ -1767,7 +2048,7 @@ pub fn execCmd(app: *App, trimmed: []const u8) bool {
 
     if (std.mem.eql(u8, cmd, "help")) {
         fb(app, null, "invite <имя> · add <код|hex> · msg <id> <текст> · react <id> <msg_id> <U+код> · block/unblock <id>");
-        fb(app, null, "gethistory <id> [n] · getmessage <msg_id> · call <id> · answer · hangup · contacts · connect · listen · quit");
+        fb(app, null, "sendfile <id> <путь> · gethistory <id> [n] · getmessage <msg_id> · call <id> · answer · hangup · contacts · connect · listen · quit");
     } else if (std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "q")) {
         app.running = false;
     } else if (std.mem.eql(u8, cmd, "contacts")) {
@@ -1786,6 +2067,8 @@ pub fn execCmd(app: *App, trimmed: []const u8) bool {
         cmdSetName(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "setname", e));
     } else if (std.mem.eql(u8, cmd, "setavatar")) {
         cmdSetAvatar(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "setavatar", e));
+    } else if (std.mem.eql(u8, cmd, "sendfile")) {
+        cmdSendFile(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "sendfile", e));
     } else if (std.mem.eql(u8, cmd, "avatar")) {
         cmdAvatar(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "avatar", e));
     } else if (std.mem.eql(u8, cmd, "gethistory") or std.mem.eql(u8, cmd, "history")) {
@@ -1903,12 +2186,14 @@ pub fn main(start: std.process.Init) !void {
             .id = &id,
             .eng = &eng,
             .log = log_ptr,
+            .home_len = @min(home.len, app_home_max),
             .hb = std.AutoHashMap(i64, hb.State).init(alloc),
             .sess_ctx = std.AutoHashMap(i64, *SessCtx).init(alloc),
             .call_pcm_dir = if (pcm_heap.len > 0) pcm_heap else null,
             .threads = threads,
             .tz = tui_mod.tzOffset(),
         };
+        @memcpy(app.home_buf[0..app.home_len], home[0..app.home_len]);
         eng.ev = app.events();
 
         loadContacts(&app);

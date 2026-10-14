@@ -81,6 +81,7 @@ pub fn dial(alloc: std.mem.Allocator, addr: []const u8) DialError!*TcpConn {
         if (linux.errno(rc) != .SUCCESS) return error.Network;
         break :blk @as(posix.socket_t, @intCast(rc));
     };
+    setNoDelay(fd);
     const rc = linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
     if (linux.errno(rc) != .SUCCESS) {
         _ = linux.close(fd);
@@ -97,6 +98,14 @@ pub fn dial(alloc: std.mem.Allocator, addr: []const u8) DialError!*TcpConn {
 
 /// Ядро само детектит мёртвый peer (30с тишины TCP-уровня, без прикладных
 /// запросов) — presence-пинги остаются только для статуса «онлайн».
+/// TCP_NODELAY: отключаем Nagle — интерактивные кадры (пинг, звонок)
+/// не ждут коалесценции 40 мс. Латентность важнее микросэкономии пакетов.
+pub fn setNoDelay(fd: posix.socket_t) void {
+    const one: c_int = 1;
+    const rc = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
+    _ = linux.errno(rc);
+}
+
 pub fn setKeepalive(fd: posix.socket_t) void {
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1))) catch return;
     posix.setsockopt(fd, linux.IPPROTO.TCP, 4, &std.mem.toBytes(@as(c_int, 30))) catch return; // KEEPIDLE
@@ -115,6 +124,7 @@ pub const Listener = struct {
         const rc = linux.accept4(self.fd, @ptrCast(&sa), &sl, 0);
         if (linux.errno(rc) != .SUCCESS) return error.Network;
         const cfd: posix.socket_t = @intCast(rc);
+        setNoDelay(cfd);
         const tc = alloc.create(TcpConn) catch {
             _ = linux.close(cfd);
             return error.OutOfMemory;

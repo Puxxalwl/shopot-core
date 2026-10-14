@@ -1,6 +1,8 @@
-//! Аудио звонка: кадры 20 мс (8 кГц, моно, i16 = 320 байт), каждый кадр
+//! Аудио звонка: кадры 20 мс (16 кГц, моно, i16 = 640 байт), каждый кадр
 //! шифруется своим ключом HKDF(call_secret, seq) — компрометация кадра не
 //! раскрывает соседние. Транспорт уже даёт AEAD-слой, здесь свой контур.
+//! На проводе кадр сжат IMA-ADPCM (4:1): провод = [codec u8][AEAD-блок];
+//! codec 1 = PCM, 2 = ADPCM (164 байта на кадр, 72 кбит/с).
 //!
 //! Устройство: PCM подаётся/выводится через файловые дескрипторы (fifo/pipe).
 //! Ноль OS-пакетов: микрофон подключается любой программой, которая умеет
@@ -14,10 +16,16 @@ const shopot = @import("shopot");
 const call_keys = shopot.crypto.call_keys;
 const aead = shopot.crypto.aead;
 
-pub const sample_rate = 8000;
+pub const sample_rate = 16000;
 pub const frame_ms = 20;
-pub const frame_bytes = sample_rate / 1000 * 2; // 320 байт i16 моно
+pub const frame_samples = sample_rate / 1000 * frame_ms; // 320 выборок
+pub const frame_bytes = frame_samples * 2; // 640 байт i16 моно
 pub const box_bytes = frame_bytes + aead.tag_length;
+/// Кодек кадра на проводе (первый байт data CALL_AUDIO).
+pub const codec_pcm: u8 = 1;
+pub const codec_adpcm: u8 = 2;
+/// ADPCM-блок одного кадра: заголовок 4 + 160 полубайтов.
+pub const adpcm_block = 4 + frame_samples / 2; // 164
 
 pub const CallOp = struct {
     /// CALL_SIGNAL op-коды.
@@ -27,19 +35,23 @@ pub const CallOp = struct {
     pub const hangup: u8 = 3;
 };
 
-/// Шифрует кадр: box = AEAD(key(seq), nonce(seq), plain; AD=call_id).
-pub fn sealFrame(out: *[box_bytes]u8, call_secret: [32]u8, call_id: [16]u8, seq: u32, plain: []const u8) void {
+/// Шифрует кадр произвольной длины (PCM или ADPCM-блок):
+/// out.len >= plain.len + aead.tag_length. Возвращает длину бокса.
+pub fn sealFrame(out: []u8, call_secret: [32]u8, call_id: [16]u8, seq: u32, plain: []const u8) usize {
     const key = call_keys.keyFor(call_secret, seq);
     const nonce = aead.nonceFor(seq);
     aead.seal(out, plain, key, nonce, &call_id);
+    return plain.len + aead.tag_length;
 }
 
-/// Расшифровывает кадр. Чужой/переигранный кадр — ошибка Tampered.
-pub fn openFrame(plain_out: *[frame_bytes]u8, call_secret: [32]u8, call_id: [16]u8, seq: u32, box_: []const u8) !void {
-    if (box_.len > box_bytes) return error.Tampered;
+/// Расшифровывает кадр в plain_out (вместимость >= бокса минус тег).
+/// Возвращает длину plaintext. Чужой/переигранный — ошибка Tampered.
+pub fn openFrame(plain_out: []u8, call_secret: [32]u8, call_id: [16]u8, seq: u32, box_: []const u8) error{Tampered}!usize {
+    if (box_.len < aead.tag_length or box_.len > plain_out.len + aead.tag_length) return error.Tampered;
     const key = call_keys.keyFor(call_secret, seq);
     const nonce = aead.nonceFor(seq);
-    return aead.open(plain_out, box_, key, nonce, &call_id) catch error.Tampered;
+    aead.open(plain_out, box_, key, nonce, &call_id) catch return error.Tampered;
+    return box_.len - aead.tag_length;
 }
 
 /// Аудио-порт: два дескриптора (микрофон/динамик). Их даёт ОС или fifo.
@@ -120,11 +132,19 @@ test "audio: кадр шифруется/расшифровывается, чу�
     var frame: [frame_bytes]u8 = undefined;
     @memset(&frame, 0x55);
     var box_: [box_bytes]u8 = undefined;
-    sealFrame(&box_, secret, cid, 42, &frame);
+    const sealed = sealFrame(&box_, secret, cid, 42, &frame);
+    try testing.expectEqual(box_bytes, sealed);
     // чужой seq не расшифрует
     var out: [frame_bytes]u8 = undefined;
-    try testing.expectError(error.Tampered, openFrame(&out, secret, cid, 43, &box_));
-    // свой — расшифрует побайтово
-    try openFrame(&out, secret, cid, 42, &box_);
+    try testing.expectError(error.Tampered, openFrame(&out, secret, cid, 43, &box_[0..sealed]));
+    // свой — расшифрует побайтово; короткий ADPCM-блок тоже валиден
+    try testing.expectEqual(frame_bytes, try openFrame(&out, secret, cid, 42, &box_[0..sealed]));
     try testing.expectEqualSlices(u8, &frame, &out);
+    var ablock: [adpcm_block]u8 = undefined;
+    @memset(&ablock, 0x33);
+    var abox: [adpcm_block + aead.tag_length]u8 = undefined;
+    const sealed2 = sealFrame(&abox, secret, cid, 7, &ablock);
+    var out2: [adpcm_block]u8 = undefined;
+    try testing.expectEqual(adpcm_block, try openFrame(&out2, secret, cid, 7, &abox[0..sealed2]));
+    try testing.expectEqualSlices(u8, &ablock, &out2);
 }

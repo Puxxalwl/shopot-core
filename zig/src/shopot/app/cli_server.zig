@@ -209,9 +209,9 @@ fn selectedCid(app: *main.App) ?i64 {
 }
 
 const known_cmds = [_][]const u8{
-    "help",      "contacts", "invite",  "add",     "msg",    "react", "block",      "unblock",
-    "call",      "answer",   "hangup",  "connect", "listen", "id",    "gethistory", "getmessage",
-    "setavatar", "avatar",   "setname",
+    "help",      "contacts", "invite",  "add",      "msg",    "react", "block",      "unblock",
+    "call",      "answer",   "hangup",  "connect",  "listen", "id",    "gethistory", "getmessage",
+    "setavatar", "avatar",   "setname", "sendfile",
 };
 
 fn isKnownCmd(word: []const u8) bool {

@@ -53,6 +53,8 @@ pub const Tag = enum(u8) {
     avatar_ack = 0x51,
     /// AVATAR_REQ: просьба переслать аватар с этим id.
     avatar_req = 0x52,
+    file_meta = 0x60,
+    file_data = 0x61,
 };
 
 /// Максимум длины имени в JOIN.
@@ -84,9 +86,11 @@ pub const max_text_body = 4096;
 pub const max_audio_data = 1024;
 /// Максимум данных AVATAR: влезает в один obf-кадр класса 16384.
 pub const max_avatar_data = 16000;
+pub const max_file_chunk = 16000;
+pub const max_file_name = 64;
 
 /// Максимальная длина закодированного кадра (AVATAR с телом 16000).
-pub const max_encoded_len = 1 + id_len + 2 + max_avatar_data;
+pub const max_encoded_len = 1 + id_len + 4 + 2 + max_file_chunk;
 
 /// TEXT (0x10): текстовое сообщение.
 pub const Text = struct {
@@ -181,6 +185,28 @@ pub const AvatarReq = struct {
     avatar_id: [id_len]u8,
 };
 
+/// FILE_META (0x60): анонс передачи файла. file_id = SHA-256(файла)[0..16]
+/// (контент-адресация, как у аватаров). Отправляется ДО чанков FILE_DATA.
+pub const FileMeta = struct {
+    file_id: [16]u8,
+    /// Имя файла (UTF-8, без путей), <= 64 байтов.
+    name: []const u8,
+    /// Полный размер файла, байт.
+    size: u32,
+    /// SHA-256 всего файла: приём сверяет перед сохранением.
+    sha: [32]u8,
+};
+
+/// FILE_DATA (0x61): чанк файла. Порядок задаёт seq (0..n-1); приём
+/// собирает по порядку. Чанк <= max_file_chunk, каждый = один obf-кадр.
+pub const FileData = struct {
+    file_id: [16]u8,
+    /// Номер чанка (порядковый, с нуля).
+    seq: u32,
+    /// Байты файла, <= max_file_chunk.
+    data: []const u8,
+};
+
 /// JOIN (0x40): держатель инвайт-кода доказывает право на подключение.
 /// Отправляется первым конвертом сразу после рукопожатия.
 pub const Join = struct {
@@ -224,6 +250,8 @@ pub const Envelope = union(enum) {
     avatar_ack: AvatarAck,
     /// AVATAR_REQ (0x52).
     avatar_req: AvatarReq,
+    file_meta: FileMeta,
+    file_data: FileData,
 };
 
 /// Ошибки кодирования: мал буфер или payload превышает максимум протокола.
@@ -241,6 +269,8 @@ pub fn encodedLen(e: Envelope) usize {
         .join => |m| 1 + 64 + 1 + m.name.len + join_sig_len + join_hmac_len,
         .profile => |m| 1 + 1 + m.name.len + id_len,
         .avatar => |m| 1 + id_len + 2 + m.data.len,
+        .file_meta => |m| 1 + id_len + 1 + m.name.len + 4 + 32,
+        .file_data => |m| 1 + id_len + 4 + 2 + m.data.len,
         .avatar_ack, .avatar_req => 1 + id_len,
     };
 }
@@ -322,6 +352,22 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
         .avatar_req => |m| {
             try w.put(@backingInt(Tag.avatar_req));
             try w.putFixed(&m.avatar_id);
+        },
+        .file_meta => |m| {
+            if (m.name.len > max_file_name) return error.TooBig;
+            try w.put(@backingInt(Tag.file_meta));
+            try w.putFixed(&m.file_id);
+            try w.put(@intCast(m.name.len));
+            try w.putFixed(m.name);
+            try w.putInt(u32, m.size);
+            try w.putFixed(&m.sha);
+        },
+        .file_data => |m| {
+            if (m.data.len > max_file_chunk) return error.TooBig;
+            try w.put(@backingInt(Tag.file_data));
+            try w.putFixed(&m.file_id);
+            try w.putInt(u32, m.seq);
+            try w.putBytes(m.data);
         },
     }
     return w.buf[0..w.pos];
@@ -414,6 +460,27 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
         @backingInt(Tag.avatar_req) => .{ .avatar_req = .{
             .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
         } },
+        @backingInt(Tag.file_meta) => blk: {
+            const file_id = try readId(&r);
+            const name_len = try r.getU8();
+            if (name_len > max_file_name) return error.BadLen;
+            const name = try r.getFixed(name_len);
+            const size = try r.getInt(u32);
+            const sha = try r.getFixed(32);
+            break :blk .{ .file_meta = .{
+                .file_id = file_id,
+                .name = name,
+                .size = size,
+                .sha = sha[0..32].*,
+            } };
+        },
+        @backingInt(Tag.file_data) => blk: {
+            const file_id = try readId(&r);
+            const seq = try r.getInt(u32);
+            const data = try r.getBytes();
+            if (data.len > max_file_chunk) return error.BadLen;
+            break :blk .{ .file_data = .{ .file_id = file_id, .seq = seq, .data = data } };
+        },
         else => return error.UnknownTag,
     };
 
@@ -686,4 +753,38 @@ test "envelope: ACK roundtrip" {
     try testing.expectEqual(1 + 16, bytes.len);
     const back = try decode(bytes);
     try testing.expectEqualSlices(u8, &filled(16, 0xC1), &back.ack.msg_id);
+}
+
+test "envelope: FILE_META/FILE_DATA roundtrip" {
+    const fid: [16]u8 = filled(id_len, 0xAB);
+    var sha: [32]u8 = undefined;
+    @memset(&sha, 0x5C);
+    const m: Envelope = .{ .file_meta = .{
+        .file_id = fid,
+        .name = "отчёт.pdf",
+        .size = 12345,
+        .sha = sha,
+    } };
+    var buf: [max_encoded_len]u8 = undefined;
+    const enc = try encode(&buf, m);
+    const back = try decode(enc);
+    try testing.expectEqualSlices(u8, &fid, &back.file_meta.file_id);
+    try testing.expectEqualStrings("отчёт.pdf", back.file_meta.name);
+    try testing.expectEqual(@as(u32, 12345), back.file_meta.size);
+    try testing.expectEqualSlices(u8, &sha, &back.file_meta.sha);
+
+    var data: [4096]u8 = undefined;
+    @memset(&data, 0x77);
+    const d: Envelope = .{ .file_data = .{ .file_id = fid, .seq = 3, .data = &data } };
+    const enc2 = try encode(&buf, d);
+    const back2 = try decode(enc2);
+    try testing.expectEqualSlices(u8, &fid, &back2.file_data.file_id);
+    try testing.expectEqual(@as(u32, 3), back2.file_data.seq);
+    try testing.expectEqualSlices(u8, &data, back2.file_data.data);
+
+    // имя > max_file_name -> TooBig
+    var long_name: [max_file_name + 1]u8 = undefined;
+    @memset(&long_name, 'x');
+    const bad: Envelope = .{ .file_meta = .{ .file_id = fid, .name = &long_name, .size = 1, .sha = sha } };
+    try testing.expectError(error.TooBig, encode(&buf, bad));
 }

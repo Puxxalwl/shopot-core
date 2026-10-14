@@ -74,6 +74,10 @@ pub const Events = struct {
     onAvatar: ?*const fn (ctx: *anyopaque, from: *const Contact, avatar_id: [16]u8, data: []const u8) void = null,
     /// Пир просит наш аватар с этим id (приложение перекачивает, если есть).
     onAvatarReq: ?*const fn (ctx: *anyopaque, from: *const Contact, avatar_id: [16]u8) void = null,
+    /// Анонс файла FILE_META (приложение создаёт состояние приёма).
+    onFileMeta: ?*const fn (ctx: *anyopaque, from: *const Contact, meta: envelope.FileMeta) void = null,
+    /// Чанк FILE_DATA (приложение накапливает; по завершении — хэш и событие).
+    onFileData: ?*const fn (ctx: *anyopaque, from: *const Contact, data: envelope.FileData) void = null,
 };
 
 /// Запись outbox: TEXT, ждущий сессии/ACK.
@@ -242,6 +246,21 @@ pub const Engine = struct {
         return id;
     }
 
+    /// Анонс файла: FILE_META до первого чанка. file_id/sha вычисляет
+    /// вызывающий (контент-адресация SHA-256(file)[0..16]).
+    pub fn sendFileMeta(self: *Engine, contact_id: i64, file_id: [16]u8, name: []const u8, size: u32, sha: [32]u8) EngineError!void {
+        if (name.len > envelope.max_file_name) return EngineError.TooBig;
+        const s = self.sessions.get(contact_id) orelse return EngineError.NoSession;
+        s.sendEnvelope(.{ .file_meta = .{ .file_id = file_id, .name = name, .size = size, .sha = sha } }) catch return EngineError.NoSession;
+    }
+
+    /// Чанк файла FILE_DATA: seq с нуля, подряд; data <= max_file_chunk.
+    pub fn sendFileChunk(self: *Engine, contact_id: i64, file_id: [16]u8, seq: u32, data: []const u8) EngineError!void {
+        if (data.len == 0 or data.len > envelope.max_file_chunk) return EngineError.TooBig;
+        const s = self.sessions.get(contact_id) orelse return EngineError.NoSession;
+        s.sendEnvelope(.{ .file_data = .{ .file_id = file_id, .seq = seq, .data = data } }) catch return EngineError.NoSession;
+    }
+
     /// Сессия поднята: слить outbox по cid (идемпотентно — дедуп на приёме).
     pub fn flushOutbox(self: *Engine, contact_id: i64) void {
         if (self.findIndex(contact_id) == null) return;
@@ -406,6 +425,12 @@ pub const Engine = struct {
             .avatar_ack => {},
             .avatar_req => |ar| {
                 if (self.ev.onAvatarReq) |cb| cb(self.ev.ctx, c, ar.avatar_id);
+            },
+            .file_meta => |fm| {
+                if (self.ev.onFileMeta) |cb| cb(self.ev.ctx, c, fm);
+            },
+            .file_data => |fd| {
+                if (self.ev.onFileData) |cb| cb(self.ev.ctx, c, fd);
             },
             .react => |r| {
                 if (self.ev.onReaction) |cb| cb(self.ev.ctx, c, .{ .msg_id = r.msg_id, .from = c.bundle, .code = r.code });
