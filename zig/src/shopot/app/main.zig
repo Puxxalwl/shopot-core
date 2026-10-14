@@ -32,7 +32,8 @@ const usage =
 fn shopotDir(io: std.Io, home: []const u8) ![512]u8 {
     if (home.len == 0) return error.NoHome;
     var buf: [512]u8 = undefined;
-    std.Io.Dir.createDirAbsolute(io, try std.fmt.bufPrint(&buf, "{s}/.shopot", .{home}), .default_dir) catch {};
+    // 0700: каталог с сидом/логом/сокетом — только владелец
+    std.Io.Dir.createDirAbsolute(io, try std.fmt.bufPrint(&buf, "{s}/.shopot", .{home}), @fromBackingInt(@intCast(0o700))) catch {};
     return buf;
 }
 
@@ -58,7 +59,7 @@ fn saveSeed(io: std.Io, home: []const u8, seed: [32]u8) !void {
     f.setPermissions(io, .fromMode(0o600)) catch {};
 }
 
-fn toHex(out: []u8, bytes: []const u8) ![]u8 {
+pub fn toHex(out: []u8, bytes: []const u8) ![]u8 {
     var n: usize = 0;
     for (bytes) |b| {
         const p = try std.fmt.bufPrint(out[n..], "{x:0>2}", .{b});
@@ -126,6 +127,8 @@ pub const App = struct {
     invites: [4]InviteReg = @splat(.{}),
     /// JOIN-данные по cid: отправить первым конвертом после рукопожатия.
     join_map: std.AutoHashMapUnmanaged(i64, JoinInfo) = .empty,
+    /// Кэш аватаров: avatar_id -> байты (из лога kind AVATAR).
+    avatars: std.AutoHashMapUnmanaged([16]u8, []u8) = .empty,
 
     running: bool = true,
 
@@ -192,10 +195,12 @@ pub const App = struct {
         if (self.hb.getPtr(cid)) |st| st.onInbound(now);
         // сессия поднята — слить outbox (доставка офлайн-хвоста)
         self.eng.flushOutbox(cid);
+        // PROFILE-эхо: имя + avatar_id пир-у при каждом установлении
+        self.eng.sendProfile(cid) catch {};
     }
 
     fn events(self: *App) engine_mod.Events {
-        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv };
+        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv, .onAvatar = onAvatarEv, .onAvatarReq = onAvatarReqEv };
     }
 };
 
@@ -344,13 +349,60 @@ fn onTextEv(ctx: *anyopaque, from: *const engine_mod.Contact, msg_id: [16]u8, _:
     hx = hex_buf[0..];
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
-    persistMsg(app, @intCast(idx + 1), false, msg_id, true, body);
+    const now = app.nowMs();
+    persistMsg(app, @intCast(idx + 1), false, msg_id, true, now, body);
+    // машиночитаемое событие: imsg <cid> <имя> <msg_id_hex> <ts> <текст>
+    cli_srv.fanoutImsgLocked(app, @intCast(idx + 1), from.getName(), msg_id, now, body);
     if (app.tui) {
         app.msgLineLocked(idx, .theirs, from.getName(), body);
     } else {
         std.debug.print("\n<< [{s}] {s}  (msg {s})\n> ", .{ from.getName(), body, hx });
     }
     cli_srv.fanoutMsgLocked(app, @intCast(idx + 1), from.getName(), body);
+}
+
+/// Получен аватар: кэш (память + лог), фанаут события avatar <cid> <id_hex>.
+fn onAvatarEv(ctx: *anyopaque, from: *const engine_mod.Contact, avatar_id: [16]u8, data: []const u8) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const idx = contactIndexOf(app, from) orelse return;
+    // кэш: могли уже положить (дедуп по id)
+    if (!app.avatars.contains(avatar_id)) {
+        const copy = app.alloc.dupe(u8, data) catch return;
+        app.avatars.put(app.alloc, avatar_id, copy) catch {
+            app.alloc.free(copy);
+            return;
+        };
+        if (app.log) |log| {
+            var buf: [18 + 16000]u8 = undefined;
+            @memcpy(buf[0..16], &avatar_id);
+            std.mem.writeInt(u16, buf[16..18], @intCast(data.len), .little);
+            @memcpy(buf[18 .. 18 + data.len], data);
+            _ = log.append(.avatar, buf[0 .. 18 + data.len]) catch {};
+        }
+    }
+    var hxb: [32]u8 = undefined;
+    const hx = toHex(&hxb, &avatar_id) catch return;
+    var line: [96]u8 = undefined;
+    const t = std.fmt.bufPrint(&line, "аватар {s}: {d} байт", .{ from.getName(), data.len }) catch return;
+    if (app.tui) {
+        app.sysLineLocked(idx, t);
+    } else {
+        std.debug.print("\n<< {s}\n> ", .{t});
+    }
+    var ml: [64]u8 = undefined;
+    const mt = std.fmt.bufPrint(&ml, "avatar {s}", .{hx}) catch return;
+    cli_srv.fanoutSysLocked(app, @intCast(idx + 1), from.getName(), mt);
+}
+
+/// Пир просит аватар с id: перекачать, если это наш текущий.
+fn onAvatarReqEv(ctx: *anyopaque, from: *const engine_mod.Contact, avatar_id: [16]u8) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const idx = contactIndexOf(app, from) orelse return;
+    const cid: i64 = @intCast(idx + 1);
+    // наш текущий аватар? (самоисцеление: profile сказал id, мы перекачали)
+    if (!std.mem.eql(u8, &app.eng.my_avatar_id, &avatar_id)) return;
+    const data = app.avatars.get(avatar_id) orelse return;
+    _ = app.eng.sendAvatar(cid, data) catch {};
 }
 
 /// ACK дошёл: сообщение доставлено на устройство пир-а.
@@ -384,6 +436,7 @@ fn onReactionEv(ctx: *anyopaque, from: *const engine_mod.Contact, r: engine_mod.
     } else {
         std.debug.print("\n<< [{s}] {s}\n> ", .{ from.getName(), t });
     }
+    persistReact(app, @intCast(idx + 1), false, r.msg_id, r.code, app.nowMs());
     // машиночитаемое событие для UDS-клиентов: react <msg_id_hex> <codepoint>
     var ml: [64]u8 = undefined;
     const mt = std.fmt.bufPrint(&ml, "react {s} {d}", .{ toHex(&hex_buf, &r.msg_id) catch "?", r.code }) catch return;
@@ -427,6 +480,7 @@ fn onCallSignalEv(ctx: *anyopaque, from: *const engine_mod.Contact, op: u8, call
             const secret = if (app.eng.sessions.get(cid)) |sess| sess.callSecret(call_id) else zero_secret;
             c.* = .{ .cid = cid, .call_id = call_id, .secret = secret };
             app.call = c;
+            cli_srv.fanoutCallLocked(app, cid, "offer", call_id);
             if (app.tui) {
                 var line: [128]u8 = undefined;
                 const t = std.fmt.bufPrint(&line, "входящий звонок — a: принять, h: отклонить", .{}) catch return;
@@ -440,6 +494,7 @@ fn onCallSignalEv(ctx: *anyopaque, from: *const engine_mod.Contact, op: u8, call
             const c = app.call orelse return;
             if (!std.mem.eql(u8, &c.call_id, &call_id)) return;
             startCallAudio(app, c);
+            cli_srv.fanoutCallLocked(app, c.cid, "accept", call_id);
             if (app.tui) {
                 var line: [96]u8 = undefined;
                 const t = std.fmt.bufPrint(&line, "линия открыта", .{}) catch return;
@@ -452,12 +507,13 @@ fn onCallSignalEv(ctx: *anyopaque, from: *const engine_mod.Contact, op: u8, call
         audio_mod.CallOp.reject => {
             const c = app.call orelse return;
             if (!std.mem.eql(u8, &c.call_id, &call_id)) return;
-            endCallLocked(app, "отклонён");
+            cli_srv.fanoutCallLocked(app, c.cid, "reject", call_id);
+            endCallLocked(app, "отклонён", call_id);
         },
         audio_mod.CallOp.hangup => {
             const c = app.call orelse return;
             if (!std.mem.eql(u8, &c.call_id, &call_id)) return;
-            endCallLocked(app, "повесил трубку");
+            endCallLocked(app, "повесил трубку", call_id);
         },
         else => {},
     }
@@ -524,7 +580,7 @@ fn micLoop(app: *App) void {
         // seq u32 в кадре CALL_AUDIO: на максимуме ключ/nonce кадра начали бы
         // повторяться — обрываем звонок раньше (практически недостижимо: ~99 суток)
         if (frame_seq == std.math.maxInt(u32)) {
-            endCallLocked(app, "достигнут предел длины звонка");
+            endCallLocked(app, "достигнут предел длины звонка", c.call_id);
             continue;
         }
         audio_mod.sealFrame(&box_, c.secret, c.call_id, frame_seq, acc[0..]);
@@ -535,7 +591,7 @@ fn micLoop(app: *App) void {
 }
 
 /// Завершить звонок: остановить поток, закрыть аудио, освободить состояние.
-fn endCallLocked(app: *App, why: []const u8) void {
+fn endCallLocked(app: *App, why: []const u8, call_id: [16]u8) void {
     const c = app.call orelse return;
     app.call = null; // micLoop видит null и выходит без обращений к c
     c.stop_flag.store(true, .release);
@@ -558,6 +614,7 @@ fn endCallLocked(app: *App, why: []const u8) void {
     else
         "?";
     cli_srv.fanoutSysLocked(app, cid, cname, why);
+    cli_srv.fanoutCallLocked(app, cid, "end", call_id);
 }
 
 fn wrapConn(ctx: *anyopaque, raw: interfaces.Conn, keys: shopot.crypto.handshake.SessionKeys, alloc: std.mem.Allocator) anyerror!interfaces.Conn {
@@ -620,6 +677,7 @@ fn cmdCall(app: *App, args: []const u8) !void {
         app.unlock();
         return error.NoSession;
     };
+    cli_srv.fanoutCallLocked(app, cid, "offer", call_id);
     app.unlock();
     if (app.tui) {
         app.lock();
@@ -638,6 +696,7 @@ fn cmdAnswer(app: *App) !void {
     if (c.start_ms == 0) c.start_ms = app.nowMs();
     _ = app.eng.callSignal(c.cid, audio_mod.CallOp.accept, c.call_id) catch return error.NoSession;
     startCallAudio(app, c);
+    cli_srv.fanoutCallLocked(app, c.cid, "accept", c.call_id);
     if (app.tui) {
         app.sysLineLocked(@intCast(c.cid - 1), "линия открыта");
     } else {
@@ -650,7 +709,7 @@ fn cmdHangup(app: *App) !void {
     defer app.unlock();
     const c = app.call orelse return error.NoCall;
     _ = app.eng.callSignal(c.cid, audio_mod.CallOp.hangup, c.call_id) catch {};
-    endCallLocked(app, "вы повесили трубку");
+    endCallLocked(app, "вы повесили трубку", c.call_id);
 }
 
 // ------------------------------------------------- автоподключение (LAN)
@@ -1007,7 +1066,26 @@ fn cmdAdd(app: *App, args: []const u8) !void {
     };
 }
 
-fn cmdContacts(app: *App) void {
+/// id: свой bundle и отпечаток (сверка голосом/QR между пользователями).
+fn cmdId(app: *App) void {
+    app.lock();
+    defer app.unlock();
+    const bundle = app.id.bundle();
+    var hex_buf: [130]u8 = undefined;
+    const hx = toHex(&hex_buf, &bundle) catch return;
+    var fp_buf: [96]u8 = undefined;
+    const fp = app.id.fingerprintTo(&fp_buf) catch return;
+    var lb: [160]u8 = undefined;
+    const l1 = std.fmt.bufPrint(&lb, "bundle {s}", .{hx}) catch return;
+    fb(app, null, l1);
+    var lb2: [128]u8 = undefined;
+    const l2 = std.fmt.bufPrint(&lb2, "fingerprint {s}", .{fp}) catch return;
+    fb(app, null, l2);
+}
+
+fn cmdContacts(app: *App, rest: []const u8) void {
+    // contacts -m: машиночитаемо — c <cid> <online|offline> <blocked> <имя>
+    const machine = std.mem.startsWith(u8, std.mem.trim(u8, rest, " "), "-m");
     var lines_buf: [16][128]u8 = undefined;
     var lens: [16]usize = @splat(0);
     var n: usize = 0;
@@ -1018,6 +1096,17 @@ fn cmdContacts(app: *App) void {
         for (app.eng.contacts.items, 0..) |c, i| {
             if (n >= lines_buf.len) break;
             const cid: i64 = @intCast(i + 1);
+            if (machine) {
+                const t = std.fmt.bufPrint(&lines_buf[n], "c {d} {s} {d} {s}", .{
+                    cid,
+                    if (c.online) "online" else "offline",
+                    @intFromBool(c.blocked),
+                    c.getName(),
+                }) catch continue;
+                lens[n] = t.len;
+                n += 1;
+                continue;
+            }
             const seen: ?i64 = app.eng.lastSeen(cid);
             const ago = if (seen) |sv| now - sv else -1;
             var q: usize = 0;
@@ -1037,11 +1126,16 @@ fn cmdContacts(app: *App) void {
         }
     }
     if (n == 0) {
-        fb(app, null, "нет контактов");
+        fb(app, null, if (machine) "c_end 0" else "нет контактов");
         return;
     }
     for (lines_buf[0..n], lens[0..n]) |*line, l| {
         fb(app, null, line[0..l]);
+    }
+    if (machine) {
+        var fb2: [24]u8 = undefined;
+        const t = std.fmt.bufPrint(&fb2, "c_end {d}", .{n}) catch return;
+        fb(app, null, t);
     }
 }
 
@@ -1074,9 +1168,11 @@ fn establishTo(app: *App, addr: []const u8, cid: i64, role: session_mod.Handshak
         app.alloc.destroy(sc);
         return e;
     };
-    try app.bindSession(cid, s, sc);
-    // держатель инвайта: первым конвертом — JOIN (подаётся ДО любого текста)
+    // держатель инвайта: JOIN — ПЕРВЫМ конвертом, до bind/PROFILE:
+    // пир-сторона в pending-режиме закрывает соединение на любом конверте,
+    // кроме JOIN
     sendJoinIfDue(app, cid, s);
+    try app.bindSession(cid, s, sc);
 }
 
 /// Отправка JOIN по join_map (после установления сессии, без app.mu).
@@ -1149,7 +1245,7 @@ fn cmdMsg(app: *App, args: []const u8) !void {
     app.lock();
     defer app.unlock();
     const oc = try app.eng.sendText(cid, body);
-    persistMsg(app, cid, true, oc.msg_id, oc.result == .sent, body);
+    persistMsg(app, cid, true, oc.msg_id, oc.result == .sent, app.nowMs(), body);
     if (oc.result == .queued) {
         persistOutboxAdd(app);
         var qb: [80]u8 = undefined;
@@ -1175,6 +1271,7 @@ fn cmdReact(app: *App, args: []const u8) !void {
     app.lock();
     defer app.unlock();
     try app.eng.react(cid, mid, envelope.react_add, code);
+    persistReact(app, cid, true, mid, code, app.nowMs());
 }
 
 /// Unicode code point из аргумента: 100, 0x2764, U+2764, ❤ (сам глиф).
@@ -1294,9 +1391,22 @@ fn persistOutboxAck(app: *App, cid: i64, msg_id: [16]u8) void {
     _ = log.append(.outbox, &buf) catch {};
 }
 
+/// Записать реакцию в лог (kind react: [cid u16][flags u8][msg_id 16]
+/// [code u32][ts u64]; бит0 flags = моя реакция).
+fn persistReact(app: *App, cid: i64, mine: bool, msg_id: [16]u8, code: u32, ts_ms: i64) void {
+    const log = app.log orelse return;
+    var buf: [31]u8 = undefined;
+    std.mem.writeInt(u16, buf[0..2], @intCast(cid), .little);
+    buf[2] = @intFromBool(mine);
+    @memcpy(buf[3 .. 3 + 16], &msg_id);
+    std.mem.writeInt(u32, buf[19..23], code, .little);
+    std.mem.writeInt(u64, buf[23..31], @intCast(ts_ms), .little);
+    _ = log.append(.react, buf[0..31]) catch {};
+}
+
 /// Записать сообщение в историю (kind msg, шифрованный лог).
 /// ts — реальное локальное время (мс), метка в конверте остаётся приватной.
-fn persistMsg(app: *App, cid: i64, mine: bool, msg_id: [16]u8, delivered: bool, body: []const u8) void {
+fn persistMsg(app: *App, cid: i64, mine: bool, msg_id: [16]u8, delivered: bool, ts_ms: i64, body: []const u8) void {
     const log = app.log orelse return;
     if (body.len == 0 or body.len > 4096) return;
     var buf: [3 + 16 + 8 + 2 + 4096]u8 = undefined;
@@ -1304,10 +1414,102 @@ fn persistMsg(app: *App, cid: i64, mine: bool, msg_id: [16]u8, delivered: bool, 
     // бит0 = mine, бит1 = delivered
     buf[2] = @as(u8, @intFromBool(mine)) | (@as(u8, @intFromBool(delivered)) << 1);
     @memcpy(buf[3 .. 3 + 16], &msg_id);
-    std.mem.writeInt(u64, buf[19..27], @intCast(app.nowMs()), .little);
+    std.mem.writeInt(u64, buf[19..27], @intCast(ts_ms), .little);
     std.mem.writeInt(u16, buf[27..29], @intCast(body.len), .little);
     @memcpy(buf[29 .. 29 + body.len], body);
     _ = log.append(.msg, buf[0 .. 29 + body.len]) catch {};
+}
+
+/// setname <имя>: моё отображаемое имя (лог set:2 + PROFILE пир-ам онлайн).
+fn cmdSetName(app: *App, args: []const u8) !void {
+    const name = std.mem.trim(u8, args, " ");
+    if (name.len == 0 or name.len > 32) return error.BadArgs;
+    app.lock();
+    defer app.unlock();
+    app.eng.setMyProfile(name, app.eng.my_avatar_id);
+    if (app.log) |log| {
+        var nb: [33]u8 = undefined;
+        nb[0] = 2;
+        @memcpy(nb[1 .. 1 + name.len], name);
+        _ = log.append(.set, nb[0 .. 1 + name.len]) catch {};
+    }
+    for (app.eng.contacts.items, 0..) |_, i| {
+        const cid: i64 = @intCast(i + 1);
+        if (app.eng.sessions.contains(cid)) {
+            app.eng.sendProfile(cid) catch {};
+        }
+    }
+    fb(app, null, "имя задано");
+}
+
+/// setavatar <путь>: задать мой аватар (кэш + лог set:1 + PROFILE пир-ам онлайн).
+fn cmdSetAvatar(app: *App, args: []const u8) !void {
+    const path = std.mem.trim(u8, args, " ");
+    if (path.len == 0) return error.BadArgs;
+    const f = std.Io.Dir.openFileAbsolute(app.io, path, .{ .mode = .read_only }) catch
+        return error.FileNotFound;
+    defer f.close(app.io);
+    const data = app.alloc.alloc(u8, envelope.max_avatar_data) catch return error.OutOfMemory;
+    defer app.alloc.free(data);
+    const n = f.readPositionalAll(app.io, data, 0) catch return error.FileNotFound;
+    const bytes = data[0..n];
+    if (bytes.len == 0) return error.TooBig;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const id = digest[0..16].*;
+    {
+        app.lock();
+        defer app.unlock();
+        if (!app.avatars.contains(id)) {
+            const copy = app.alloc.dupe(u8, bytes) catch return error.OutOfMemory;
+            app.avatars.put(app.alloc, id, copy) catch return error.OutOfMemory;
+        }
+        app.eng.setMyProfile(app.eng.myName(), id);
+        if (app.log) |log| {
+            var rb: [17]u8 = undefined;
+            rb[0] = 1;
+            @memcpy(rb[1..17], &id);
+            _ = log.append(.set, rb[0..17]) catch {};
+        }
+        // кэш байтов — тоже kind avatar, чтобы peer-REQ перекачивал и после рестарта
+        if (app.log) |log| {
+            var ab: [18 + 16000]u8 = undefined;
+            @memcpy(ab[0..16], &id);
+            std.mem.writeInt(u16, ab[16..18], @intCast(data.len), .little);
+            @memcpy(ab[18 .. 18 + bytes.len], bytes);
+            _ = log.append(.avatar, ab[0 .. 18 + bytes.len]) catch {};
+        }
+        // PROFILE всем онлайн-сессиям
+        for (app.eng.contacts.items, 0..) |_, i| {
+            const cid: i64 = @intCast(i + 1);
+            if (app.eng.sessions.contains(cid)) {
+                app.eng.sendProfile(cid) catch {};
+            }
+        }
+    }
+    var hxb: [32]u8 = undefined;
+    const hx = toHex(&hxb, &id) catch return;
+    var line: [96]u8 = undefined;
+    const t = std.fmt.bufPrint(&line, "аватар задан: {s} ({d} байт)", .{ hx, bytes.len }) catch return;
+    fb(app, null, t);
+}
+
+/// avatar <cid>: id текущего аватара контакта (или "нет").
+fn cmdAvatar(app: *App, args: []const u8) !void {
+    const cid = try std.fmt.parseInt(i64, std.mem.trim(u8, args, " "), 10);
+    app.lock();
+    defer app.unlock();
+    if (cid < 1 or cid > app.eng.contacts.items.len) return error.NoContact;
+    const c = &app.eng.contacts.items[@intCast(cid - 1)];
+    if (std.mem.eql(u8, &c.avatar_id, &@as([16]u8, @splat(0)))) {
+        fb(app, @intCast(cid - 1), "нет аватара");
+        return;
+    }
+    var hxb: [32]u8 = undefined;
+    const hx = toHex(&hxb, &c.avatar_id) catch return;
+    var line: [64]u8 = undefined;
+    const t = std.fmt.bufPrint(&line, "avatar {s}", .{hx}) catch return;
+    fb(app, @intCast(cid - 1), t);
 }
 
 /// history <cid> [limit]: последние N сообщений контакта (по логу).
@@ -1391,7 +1593,8 @@ fn cmdGetMessage(app: *App, args: []const u8) !void {
         last = rec;
     }
     const rec = last orelse {
-        fb(app, null, "не найдено");
+        // "!" — маркер ошибки: тег @<n> ответит err
+        fb(app, null, "! не найдено");
         return;
     };
     const flags = rec[2];
@@ -1409,6 +1612,26 @@ fn cmdGetMessage(app: *App, args: []const u8) !void {
         rec[29..@min(29 + blen, rec.len)],
     }) catch return;
     fb(app, null, t);
+    // реакции на это сообщение: react <mine|theirs> <codepoint> <ts_ms>
+    const rrecs = log.readAll(.react, app.alloc) catch return;
+    defer {
+        for (rrecs) |rr| app.alloc.free(rr);
+        app.alloc.free(rrecs);
+    }
+    for (rrecs) |rr| {
+        if (rr.len < 31) continue;
+        if (!std.mem.eql(u8, rr[3 .. 3 + 16], &want)) continue;
+        const rflags = rr[2];
+        const rcode = std.mem.readInt(u32, rr[19..23], .little);
+        const rts = std.mem.readInt(u64, rr[23..31], .little);
+        var rl: [64]u8 = undefined;
+        const rt = std.fmt.bufPrint(&rl, "react {s} {d} {d}", .{
+            if (rflags & 1 != 0) "mine" else "theirs",
+            rcode,
+            rts,
+        }) catch continue;
+        fb(app, null, rt);
+    }
 }
 
 fn loadContacts(app: *App) void {
@@ -1469,6 +1692,32 @@ fn loadContacts(app: *App) void {
             app.alloc.free(body);
         };
     }
+    // аватары: кэш id -> байты (свои и чужие)
+    const avs = log.readAll(.avatar, app.alloc) catch return;
+    defer {
+        for (avs) |r| app.alloc.free(r);
+        app.alloc.free(avs);
+    }
+    for (avs) |rec| {
+        if (rec.len < 18) continue;
+        const alen = std.mem.readInt(u16, rec[16..18], .little);
+        if (alen == 0 or alen > 16000 or rec.len < 18 + alen) continue;
+        const id: [16]u8 = rec[0..16].*;
+        const copy = app.alloc.dupe(u8, rec[18 .. 18 + alen]) catch continue;
+        app.avatars.put(app.alloc, id, copy) catch {
+            app.alloc.free(copy);
+        };
+    }
+    // свой профиль: set:1 = avatar_id
+    const sets = log.readAll(.set, app.alloc) catch return;
+    defer {
+        for (sets) |r| app.alloc.free(r);
+        app.alloc.free(sets);
+    }
+    for (sets) |rec| {
+        if (rec.len == 17 and rec[0] == 1) app.eng.my_avatar_id = rec[1..17].*;
+        if (rec.len >= 2 and rec[0] == 2) app.eng.setMyProfile(rec[1..rec.len], app.eng.my_avatar_id);
+    }
     // блокировки поверх загруженных контактов
     const blocks = log.readAll(.block, app.alloc) catch return;
     defer {
@@ -1522,7 +1771,9 @@ pub fn execCmd(app: *App, trimmed: []const u8) bool {
     } else if (std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "q")) {
         app.running = false;
     } else if (std.mem.eql(u8, cmd, "contacts")) {
-        cmdContacts(app);
+        cmdContacts(app, rest);
+    } else if (std.mem.eql(u8, cmd, "id")) {
+        cmdId(app);
     } else if (std.mem.eql(u8, cmd, "invite")) {
         cmdInvite(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "приглашение", e));
     } else if (std.mem.eql(u8, cmd, "add")) {
@@ -1531,6 +1782,12 @@ pub fn execCmd(app: *App, trimmed: []const u8) bool {
         cmdMsg(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "msg", e));
     } else if (std.mem.eql(u8, cmd, "react")) {
         cmdReact(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "react", e));
+    } else if (std.mem.eql(u8, cmd, "setname")) {
+        cmdSetName(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "setname", e));
+    } else if (std.mem.eql(u8, cmd, "setavatar")) {
+        cmdSetAvatar(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "setavatar", e));
+    } else if (std.mem.eql(u8, cmd, "avatar")) {
+        cmdAvatar(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "avatar", e));
     } else if (std.mem.eql(u8, cmd, "gethistory") or std.mem.eql(u8, cmd, "history")) {
         cmdGetHistory(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "gethistory", e));
     } else if (std.mem.eql(u8, cmd, "getmessage")) {

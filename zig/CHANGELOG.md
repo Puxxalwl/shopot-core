@@ -1,5 +1,22 @@
 # Changelog — shopot-zig
 
+## [неизданное] — 7 доработок UDS-апи для GUI + аватары (T4)
+
+- **Теги корреляции**: `@<n> <команда>` → ответы `@<n> ...`, финал `@<n> ok|err`;
+  события тегов не несут.
+- **imsg-событие**: `imsg <cid> <имя> <msg_id> <ts> <текст>` (параллельно msg).
+- **call-события**: `call <cid> offer|accept|reject|end <call_id>`.
+- **id через UDS**: bundle + fingerprint.
+- **contacts -m**: `c <cid> <online|offline> <blocked> <имя>` + `c_end <n>`.
+- **Права**: ~/.shopot 0700, api.sock 0700.
+- **Реакции в getmessage**: строки `react <mine|theirs> <codepoint> <ts>`,
+  записи kind REACT в логе.
+- **Аватары (T4)**: конверты PROFILE 0x42 / AVATAR 0x50 / AVATAR_ACK 0x51 /
+  AVATAR_REQ 0x52, команды setname/setavatar/avatar, событие
+  `avatar <cid> <id>`, кэш в логе (kind AVATAR/SET), самоисцеление через REQ.
+- **Порядок JOIN**: JOIN подаётся до bind/PROFILE (иначе pending-пир рвёт
+  соединение — баг найден e2e).
+
 ## [неизданное] — UDS-апи как единственный интерфейс + история сообщений
 
 ### Удалён интерактивный CLI

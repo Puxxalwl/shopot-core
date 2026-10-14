@@ -26,6 +26,8 @@ pub const Contact = struct {
     addr_buf: [64]u8 = @splat(0),
     addr_len: u8 = 0,
     addr_port: u16 = 0,
+    /// Текущий avatar_id собеседника (SHA-256(данных)[0..16]); нули — нет.
+    avatar_id: [16]u8 = @splat(0),
 
     /// Запомнить адрес (host без порта + порт). Порт 0 — адрес неизвестен.
     pub fn setAddr(self: *Contact, host: []const u8, port: u16) void {
@@ -68,6 +70,10 @@ pub const Events = struct {
     onBlockedNotice: ?*const fn (ctx: *anyopaque, from: *const Contact) void = null,
     /// Доставка подтверждена: ACK по msg_id дошёл (сообщение дошло до пир-устройства).
     onDelivered: ?*const fn (ctx: *anyopaque, from: *const Contact, msg_id: [16]u8) void = null,
+    /// Получен аватар: байты и id (приложение кладёт в кэш/лог).
+    onAvatar: ?*const fn (ctx: *anyopaque, from: *const Contact, avatar_id: [16]u8, data: []const u8) void = null,
+    /// Пир просит наш аватар с этим id (приложение перекачивает, если есть).
+    onAvatarReq: ?*const fn (ctx: *anyopaque, from: *const Contact, avatar_id: [16]u8) void = null,
 };
 
 /// Запись outbox: TEXT, ждущий сессии/ACK.
@@ -102,6 +108,11 @@ pub const Engine = struct {
 
     /// Outbox: TEXT без сессии ждёт здесь (память + лог kind OUTBOX у приложения).
     outbox: std.ArrayListUnmanaged(OutboxEntry) = .empty,
+    /// Моё отображаемое имя (уходит в PROFILE).
+    my_name: [32]u8 = @splat(0),
+    my_name_len: u8 = 0,
+    /// Мой текущий avatar_id (нулевое — аватара нет).
+    my_avatar_id: [16]u8 = @splat(0),
     /// Дедуп входящих msg_id: cid -> последние seen_window id.
     seen: std.AutoHashMap(i64, std.ArrayListUnmanaged([16]u8)) = undefined,
 
@@ -196,6 +207,39 @@ pub const Engine = struct {
             self.alloc.free(copy);
             return error.OutOfMemory;
         };
+    }
+
+    /// Задать моё имя/avatar_id (эхо в PROFILE при каждом handshake).
+    pub fn setMyProfile(self: *Engine, name: []const u8, avatar_id: [16]u8) void {
+        const n = @min(name.len, self.my_name.len);
+        @memcpy(self.my_name[0..n], name[0..n]);
+        self.my_name_len = @intCast(n);
+        self.my_avatar_id = avatar_id;
+    }
+
+    /// Моё имя (для PROFILE).
+    pub fn myName(self: *Engine) []const u8 {
+        return self.my_name[0..self.my_name_len];
+    }
+
+    /// Отправить PROFILE (имя + avatar_id) — при handshake/смене.
+    pub fn sendProfile(self: *Engine, contact_id: i64) EngineError!void {
+        const s = self.sessions.get(contact_id) orelse return EngineError.NoSession;
+        s.sendEnvelope(.{ .profile = .{
+            .name = self.myName(),
+            .avatar_id = self.my_avatar_id,
+        } }) catch return EngineError.NoSession;
+    }
+
+    /// Отправить байты аватара (id = SHA-256(data)[0..16], считаем здесь).
+    pub fn sendAvatar(self: *Engine, contact_id: i64, data: []const u8) EngineError![16]u8 {
+        if (data.len == 0 or data.len > envelope.max_avatar_data) return EngineError.TooBig;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+        const id = digest[0..16].*;
+        const s = self.sessions.get(contact_id) orelse return EngineError.NoSession;
+        s.sendEnvelope(.{ .avatar = .{ .avatar_id = id, .data = data } }) catch return EngineError.NoSession;
+        return id;
     }
 
     /// Сессия поднята: слить outbox по cid (идемпотентно — дедуп на приёме).
@@ -332,6 +376,36 @@ pub const Engine = struct {
             },
             .ack => |a| {
                 self.outboxAcked(contact_id, a.msg_id, c);
+            },
+            .profile => |pr| {
+                // эхо: обновляем имя и запоминаемый avatar_id пир-а;
+                // пустое имя = не менять; расхождение id -> просим перекачать
+                if (pr.name.len > 0) c.setName(pr.name);
+                const known = c.avatar_id;
+                c.avatar_id = pr.avatar_id;
+                if (self.sessions.get(contact_id)) |sess| {
+                    const changed = !std.mem.eql(u8, &known, &pr.avatar_id);
+                    if (changed and !std.mem.eql(u8, &pr.avatar_id, &@as([16]u8, @splat(0)))) {
+                        sess.sendEnvelope(.{ .avatar_req = .{ .avatar_id = pr.avatar_id } }) catch {};
+                    }
+                }
+            },
+            .avatar => |av| {
+                // контент-адресация: сверка id с хэшем данных
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(av.data, &digest, .{});
+                if (!std.mem.eql(u8, digest[0..16], &av.avatar_id)) return; // битый id
+                // дедуп по байтам — на уровне приложения (кэш avatars);
+                // здесь всегда отдаём данные: PROFILE мог опередить байты
+                c.avatar_id = av.avatar_id;
+                if (self.ev.onAvatar) |cb| cb(self.ev.ctx, c, av.avatar_id, av.data);
+                if (self.sessions.get(contact_id)) |sess| {
+                    sess.sendEnvelope(.{ .avatar_ack = .{ .avatar_id = av.avatar_id } }) catch {};
+                }
+            },
+            .avatar_ack => {},
+            .avatar_req => |ar| {
+                if (self.ev.onAvatarReq) |cb| cb(self.ev.ctx, c, ar.avatar_id);
             },
             .react => |r| {
                 if (self.ev.onReaction) |cb| cb(self.ev.ctx, c, .{ .msg_id = r.msg_id, .from = c.bundle, .code = r.code });

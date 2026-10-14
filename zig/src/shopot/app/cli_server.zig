@@ -50,6 +50,13 @@ pub const Conn = struct {
     /// Сериализует записи в сокет (ответы из fb + события из движка).
     /// Спин-блок: запись микросекундная, конкурентов мало.
     wmu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Корреляция запрос/ответ: тег последней команды вида @<n>.
+    /// Активен только на время исполнения команды; ответы получают
+    /// префикс "@<n> ", события (ev*) — никогда.
+    tag_buf: [16]u8 = @splat(0),
+    tag_len: u8 = 0,
+    /// Команда ответила строкой с "!" — финал будет "@<n> err".
+    had_err: bool = false,
 
     fn sendRaw(self: *Conn, bytes: []const u8) void {
         while (self.wmu.swap(true, .acquire)) std.Thread.yield() catch {};
@@ -57,10 +64,17 @@ pub const Conn = struct {
         _ = rawWrite(self.fd, bytes);
     }
 
-    /// Строка-ответ на команду (приходит из fb).
+    /// Строка-ответ на команду (приходит из fb). Если активен тег @<n>,
+    /// ответ получает префикс "@<n> "; строки с "!" помечают ошибку.
     pub fn writeText(self: *Conn, txt: []const u8) void {
-        var buf: [max_line + 16]u8 = undefined;
-        const t = std.fmt.bufPrint(&buf, "{s}\n", .{cut(txt, max_line)}) catch return;
+        var buf: [max_line + 24]u8 = undefined;
+        const t = if (self.tag_len > 0) blk: {
+            if (txt.len > 0 and txt[0] == '!') self.had_err = true;
+            const tag = self.tag_buf[0..self.tag_len];
+            break :blk std.fmt.bufPrint(&buf, "@{s} {s}\n", .{ tag, cut(txt, max_line) }) catch return;
+        } else blk: {
+            break :blk std.fmt.bufPrint(&buf, "{s}\n", .{cut(txt, max_line)}) catch return;
+        };
         self.sendRaw(t);
     }
 
@@ -75,6 +89,22 @@ pub const Conn = struct {
     pub fn evSys(self: *Conn, cid: i64, body: []const u8) void {
         var buf: [256]u8 = undefined;
         const t = std.fmt.bufPrint(&buf, "sys {d} {s}\n", .{ cid, cut(body, 220) }) catch return;
+        self.sendRaw(t);
+    }
+
+    /// Событие: входящее сообщение с машинными полями (msg_id, ts).
+    pub fn evImsg(self: *Conn, cid: i64, name: []const u8, msg_id_hex: []const u8, ts_ms: i64, body: []const u8) void {
+        var buf: [max_line + 48]u8 = undefined;
+        const t = std.fmt.bufPrint(&buf, "imsg {d} {s} {s} {d} {s}\n", .{
+            cid, cut(name, 31), msg_id_hex, ts_ms, cut(body, max_line - 64),
+        }) catch return;
+        self.sendRaw(t);
+    }
+
+    /// Событие: перемена состояния звонка (offer|accept|reject|end).
+    pub fn evCall(self: *Conn, cid: i64, verb: []const u8, call_id_hex: []const u8) void {
+        var buf: [96]u8 = undefined;
+        const t = std.fmt.bufPrint(&buf, "call {d} {s} {s}\n", .{ cid, verb, call_id_hex }) catch return;
         self.sendRaw(t);
     }
 
@@ -125,6 +155,22 @@ pub fn fanoutMsgLocked(app: *main.App, cid: i64, name: []const u8, body: []const
     for (srv.conns.items) |c| c.evMsg(cid, name, body);
 }
 
+/// imsg-событие всем CLI-клиентам (ВЫЗЫВАТЬ ПОД app.mu).
+pub fn fanoutImsgLocked(app: *main.App, cid: i64, name: []const u8, msg_id: [16]u8, ts_ms: i64, body: []const u8) void {
+    const srv = app.cli orelse return;
+    var hex: [32]u8 = undefined;
+    const hx = main.toHex(&hex, &msg_id) catch return;
+    for (srv.conns.items) |c| c.evImsg(cid, name, hx, ts_ms, body);
+}
+
+/// call-событие всем CLI-клиентам (ВЫЗЫВАТЬ ПОД app.mu).
+pub fn fanoutCallLocked(app: *main.App, cid: i64, verb: []const u8, call_id: [16]u8) void {
+    const srv = app.cli orelse return;
+    var hex: [32]u8 = undefined;
+    const hx = main.toHex(&hex, &call_id) catch return;
+    for (srv.conns.items) |c| c.evCall(cid, verb, hx);
+}
+
 /// Служебная строка всем CLI-клиентам (ВЫЗЫВАТЬ ПОД app.mu).
 pub fn fanoutSysLocked(app: *main.App, cid: i64, name: []const u8, body: []const u8) void {
     _ = name; // имя не нужно UDS-событию sys <cid> <текст>
@@ -163,8 +209,9 @@ fn selectedCid(app: *main.App) ?i64 {
 }
 
 const known_cmds = [_][]const u8{
-    "help", "contacts", "invite", "add",     "msg",    "react",      "block",      "unblock",
-    "call", "answer",   "hangup", "connect", "listen", "gethistory", "getmessage",
+    "help",      "contacts", "invite",  "add",     "msg",    "react", "block",      "unblock",
+    "call",      "answer",   "hangup",  "connect", "listen", "id",    "gethistory", "getmessage",
+    "setavatar", "avatar",   "setname",
 };
 
 fn isKnownCmd(word: []const u8) bool {
@@ -174,18 +221,60 @@ fn isKnownCmd(word: []const u8) bool {
     return false;
 }
 
+/// Разобрать ведущий тег "@<n> ": возвращает команду без тега или null.
+fn parseTag(line: []const u8) ?struct { tag: []const u8, rest: []const u8 } {
+    if (line.len < 2 or line[0] != '@') return null;
+    var n: usize = 1;
+    while (n < line.len and line[n] >= '0' and line[n] <= '9') n += 1;
+    if (n == 1 or n > 16) return null;
+    if (n >= line.len or line[n] != ' ') return null;
+    return .{ .tag = line[1..n], .rest = line[n + 1 ..] };
+}
+
+/// Отправить финальный маркер ответа: "@<n> ok" или "@<n> err".
+fn tagFinal(conn: *Conn, ok: bool) void {
+    var buf: [32]u8 = undefined;
+    const t = std.fmt.bufPrint(&buf, "@{s} {s}\n", .{
+        conn.tag_buf[0..conn.tag_len],
+        if (ok) "ok" else "err",
+    }) catch return;
+    conn.sendRaw(t);
+}
+
 /// Одна строка UDS-апи. Возвращает false — закрыть соединение.
+/// С тегом "@<n> <команда>": каждый ответ — "@<n> <строка>", финал —
+/// "@<n> ok" (успех) или "@<n> err" (команда ответила "! ...").
 fn handleUdsLine(srv: *Server, conn: *Conn, line: []const u8) bool {
     const app = srv.app;
     if (line.len == 0) return true;
-    var it = std.mem.tokenizeAny(u8, line, " ");
+
+    // тег корреляции: @<n> <команда>
+    var payload: []const u8 = line;
+    if (parseTag(line)) |tg| {
+        const tl = @min(tg.tag.len, conn.tag_buf.len);
+        @memcpy(conn.tag_buf[0..tl], tg.tag[0..tl]);
+        conn.tag_len = @intCast(tl);
+        conn.had_err = false;
+        payload = tg.rest;
+        defer {
+            tagFinal(conn, !conn.had_err);
+            conn.tag_len = 0;
+            conn.had_err = false;
+        }
+        return runPayload(app, conn, payload);
+    }
+    return runPayload(app, conn, payload);
+}
+
+fn runPayload(app: *main.App, conn: *Conn, payload: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, payload, " ");
     const first = it.next() orelse return true;
     if (std.mem.eql(u8, first, "quit") or std.mem.eql(u8, first, "q")) {
         conn.writeText("bye");
         return false;
     }
     if (isKnownCmd(first)) {
-        runCmd(app, conn, line);
+        runCmd(app, conn, payload);
         return true;
     }
     // голый текст — сообщение в выбранный чат
@@ -194,7 +283,7 @@ fn handleUdsLine(srv: *Server, conn: *Conn, line: []const u8) bool {
         return true;
     };
     var buf: [max_line]u8 = undefined;
-    const t = std.fmt.bufPrint(&buf, "msg {d} {s}", .{ cid, cut(line, max_line - 24) }) catch return true;
+    const t = std.fmt.bufPrint(&buf, "msg {d} {s}", .{ cid, cut(payload, max_line - 24) }) catch return true;
     runCmd(app, conn, t);
     return true;
 }
@@ -291,6 +380,14 @@ pub fn start(app: *main.App, home: []const u8) void {
             _ = linux.close(ufd);
             return;
         }
+    }
+    // сокет только владельцу: UDS-права не наследуют umask автоматически
+    {
+        var zbuf: [128]u8 = @splat(0);
+        const zlen = @min(sock_path.len, zbuf.len - 1);
+        @memcpy(zbuf[0..zlen], sock_path[0..zlen]);
+        const crc = linux.fchmodat(linux.AT.FDCWD, @ptrCast(&zbuf), 0o700);
+        _ = linux.errno(crc);
     }
     {
         const lrc = linux.listen(ufd, 8);

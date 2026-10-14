@@ -16,6 +16,10 @@
 //!   CALL_AUDIO    0x31: seq: u32, data: u16 + байты (≤ 1024)
 //!   JOIN          0x40: bundle: [64]u8, name: u8 + байты (≤ 32),
 //!                       sig: [64]u8, hmac: [32]u8
+//!   PROFILE       0x42: name: u8 + байты (≤ 32), avatar_id: [16]u8
+//!   AVATAR        0x50: avatar_id: [16]u8, data: u16 + байты (≤ 16000)
+//!   AVATAR_ACK   0x51: avatar_id: [16]u8
+//!   AVATAR_REQ   0x52: avatar_id: [16]u8
 
 const std = @import("std");
 const codec = @import("codec.zig");
@@ -40,6 +44,15 @@ pub const Tag = enum(u8) {
     call_audio = 0x31,
     /// JOIN: предъявление одностороннего инвайта (HMAC по секрету кода).
     join = 0x40,
+    /// PROFILE: имя и текущий avatar_id отправителя (эхо при каждом
+    /// установлении сессии).
+    profile = 0x42,
+    /// AVATAR: байты аватара (контент-адресованы SHA-256[0..16]).
+    avatar = 0x50,
+    /// AVATAR_ACK: аватар получен и сохранён.
+    avatar_ack = 0x51,
+    /// AVATAR_REQ: просьба переслать аватар с этим id.
+    avatar_req = 0x52,
 };
 
 /// Максимум длины имени в JOIN.
@@ -69,9 +82,11 @@ pub const id_len = 16;
 pub const max_text_body = 4096;
 /// Максимум длины DATA в CALL_AUDIO.
 pub const max_audio_data = 1024;
+/// Максимум данных AVATAR: влезает в один obf-кадр класса 16384.
+pub const max_avatar_data = 16000;
 
-/// Максимальная длина закодированного кадра (TEXT с телом 4096).
-pub const max_encoded_len = 1 + id_len + 8 + 2 + max_text_body;
+/// Максимальная длина закодированного кадра (AVATAR с телом 16000).
+pub const max_encoded_len = 1 + id_len + 2 + max_avatar_data;
 
 /// TEXT (0x10): текстовое сообщение.
 pub const Text = struct {
@@ -138,6 +153,34 @@ pub const CallAudio = struct {
     data: []const u8,
 };
 
+/// PROFILE (0x42): имя и текущий avatar_id; отправляется ядром при каждом
+/// установлении сессии, получатель обновляет имя контакта и знает, какой
+/// аватар запрашивать (несовпадение id -> AVATAR_REQ).
+pub const Profile = struct {
+    /// Отображаемое имя отправителя, ≤ 32 байтов.
+    name: []const u8,
+    /// Текущий avatar_id отправителя; нули — аватара нет.
+    avatar_id: [id_len]u8,
+};
+
+/// AVATAR (0x50): байты аватара (контент-адресованы id = SHA-256[0..16]).
+pub const Avatar = struct {
+    /// SHA-256(data)[0..16] — дедуп и адресация.
+    avatar_id: [id_len]u8,
+    /// Байты картинки, ≤ 16000; срез входного буфера после decode.
+    data: []const u8,
+};
+
+/// AVATAR_ACK (0x51): аватар получен и сохранён.
+pub const AvatarAck = struct {
+    avatar_id: [id_len]u8,
+};
+
+/// AVATAR_REQ (0x52): просьба переслать аватар с этим id.
+pub const AvatarReq = struct {
+    avatar_id: [id_len]u8,
+};
+
 /// JOIN (0x40): держатель инвайт-кода доказывает право на подключение.
 /// Отправляется первым конвертом сразу после рукопожатия.
 pub const Join = struct {
@@ -173,6 +216,14 @@ pub const Envelope = union(enum) {
     call_audio: CallAudio,
     /// JOIN (0x40).
     join: Join,
+    /// PROFILE (0x42).
+    profile: Profile,
+    /// AVATAR (0x50).
+    avatar: Avatar,
+    /// AVATAR_ACK (0x51).
+    avatar_ack: AvatarAck,
+    /// AVATAR_REQ (0x52).
+    avatar_req: AvatarReq,
 };
 
 /// Ошибки кодирования: мал буфер или payload превышает максимум протокола.
@@ -188,6 +239,9 @@ pub fn encodedLen(e: Envelope) usize {
         .presence_ping, .presence_pong => 1 + 4 + 8,
         .call_audio => |m| 1 + 4 + 2 + m.data.len,
         .join => |m| 1 + 64 + 1 + m.name.len + join_sig_len + join_hmac_len,
+        .profile => |m| 1 + 1 + m.name.len + id_len,
+        .avatar => |m| 1 + id_len + 2 + m.data.len,
+        .avatar_ack, .avatar_req => 1 + id_len,
     };
 }
 
@@ -247,6 +301,27 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
             try w.putFixed(m.name);
             try w.putFixed(&m.sig);
             try w.putFixed(&m.hmac);
+        },
+        .profile => |m| {
+            if (m.name.len > max_join_name) return error.TooBig;
+            try w.put(@backingInt(Tag.profile));
+            try w.put(@intCast(m.name.len));
+            try w.putFixed(m.name);
+            try w.putFixed(&m.avatar_id);
+        },
+        .avatar => |m| {
+            if (m.data.len > max_avatar_data) return error.TooBig;
+            try w.put(@backingInt(Tag.avatar));
+            try w.putFixed(&m.avatar_id);
+            try w.putBytes(m.data);
+        },
+        .avatar_ack => |m| {
+            try w.put(@backingInt(Tag.avatar_ack));
+            try w.putFixed(&m.avatar_id);
+        },
+        .avatar_req => |m| {
+            try w.put(@backingInt(Tag.avatar_req));
+            try w.putFixed(&m.avatar_id);
         },
     }
     return w.buf[0..w.pos];
@@ -313,6 +388,31 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
             },
             .sig = (try r.getFixed(join_sig_len))[0..join_sig_len].*,
             .hmac = (try r.getFixed(join_hmac_len))[0..join_hmac_len].*,
+        } },
+        @backingInt(Tag.profile) => .{
+            .profile = .{
+                .name = blk: {
+                    const nl = try r.getU8();
+                    // 0 = имя не меняется (только avatar_id в этом PROFILE)
+                    if (nl > max_join_name) return error.BadLen;
+                    break :blk try r.getFixed(nl);
+                },
+                .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
+            },
+        },
+        @backingInt(Tag.avatar) => .{ .avatar = .{
+            .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
+            .data = blk: {
+                const data = try r.getBytes();
+                if (data.len > max_avatar_data) return error.BadLen;
+                break :blk data;
+            },
+        } },
+        @backingInt(Tag.avatar_ack) => .{ .avatar_ack = .{
+            .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
+        } },
+        @backingInt(Tag.avatar_req) => .{ .avatar_req = .{
+            .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
         } },
         else => return error.UnknownTag,
     };
@@ -387,7 +487,7 @@ test "TEXT: пустое тело и максимум 4096" {
     @memset(&body, 'x');
     const full: Envelope = .{ .text = .{ .msg_id = filled(id_len, 1), .ts_ms = 5, .body = &body } };
     const wire = try encode(&buf, full);
-    try testing.expectEqual(max_encoded_len, wire.len);
+    try testing.expectEqual(1 + id_len + 8 + 2 + max_text_body, wire.len);
     const back_full = try decode(wire);
     try testing.expectEqualSlices(u8, &body, back_full.text.body);
     try testing.expect(back_full.text.body.ptr == wire.ptr + 1 + id_len + 8 + 2); // срез wire, без копии
