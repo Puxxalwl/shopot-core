@@ -33,8 +33,10 @@ const finish_info = "shopot-hs-finish";
 
 const payload_len = 32 + 64; // статический ключ || подпись Ed25519
 
-/// Длина m1: e1_pub.
-pub const m1_len = 32;
+/// Длина m1: e1_pub (32) || init enc_pk (32). enc_pk идёт открытым текстом
+/// только для маршрутизации у responder-а; личность доказывается подписью
+/// в m3 (транскрипт покрывает e1_pub, enc_pk проверяется через sig в m3).
+pub const m1_len = 64;
 
 /// Длина m2: e2_pub (32) || box (payload_len + tag).
 pub const m2_len = 32 + payload_len + aead.tag_length;
@@ -110,7 +112,8 @@ pub const Initiator = struct {
         Blake2s256.hash(domain, &h0, .{});
 
         const eph = X25519.KeyPair.generateDeterministic(eph_seed);
-        out_m1.* = eph.public_key;
+        out_m1[0..32].* = eph.public_key;
+        out_m1[32..64].* = my_id.enc_public;
 
         return .{
             .h = hashParts(&[_][]const u8{ &h0, out_m1 }),
@@ -189,8 +192,10 @@ pub const Responder = struct {
 
         const e1_public: [32]u8 = m1[0..32].*;
 
+        // транскрипт покрывает весь m1 (включая enc_pk инициатора):
+        // подмена любого байта меняет ключи и роняет подпись в m3
         var self = Responder{
-            .h = hashParts(&[_][]const u8{ &h0, &e1_public }),
+            .h = hashParts(&[_][]const u8{ &h0, m1 }),
             .ck = h0,
             .k2 = undefined,
             .e2_secret = undefined,

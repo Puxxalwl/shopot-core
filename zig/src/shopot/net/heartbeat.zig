@@ -58,7 +58,11 @@ pub const State = struct {
     pub fn tick(self: *State, now_ms: i64) HeartbeatAction {
         if (!self.online) return .none;
         const idle = now_ms - self.last_seen_ms >= self.idle_after_ms;
-        const due = now_ms - self.last_sent_ms >= self.interval_ms;
+        // Пропавший peer опрашивается всё реже: 5с -> 10 -> 20 -> 40 -> 60(кап).
+        // Пока идёт трафик — пингов нет вообще (idle_after не истёк).
+        const shift: u6 = @intCast(@min(self.missed -| 1, 4));
+        const eff = @min(self.interval_ms << shift, 60_000);
+        const due = now_ms - self.last_sent_ms >= eff;
         if (!idle or !due) return .none;
         if (self.missed >= self.misses_to_offline) {
             self.online = false; // ровно один mark_offline: дальше тики молчат

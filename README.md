@@ -1,218 +1,36 @@
-# shopot-core
+# shopot
 
-**Serverless P2P messaging engine. No accounts. No servers. No traces anywhere but the two devices.**
+Серверлесс P2P-мессенджер: **ноль своих серверов**, история только на устройстве.
+Реализация — чистый Zig (std-only, без пакетов и OS-зависимостей): [`zig/`](zig/).
 
-shopot-core is a C++20 library that lets two users exchange text messages,
-files and voice notes **directly** (WebRTC DataChannels, DTLS, peer-to-peer),
-with all history stored **exclusively on the devices** in an encrypted SQLite
-database. It is the engine only: desktop/mobile apps are built on top of it
-(one per OS), it ships with a demo CLI for testing.
+C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из master; архив — тег `cpp-archive`.
 
-- 🔑 **The account is a 12-word mnemonic** (BIP-39). No email, no phone, no
-  signup, nothing stored server-side (there is no server). New device → type
-  the 12 words → same identity. History does not travel — by design it lives
-  only on the device that saw the messages.
-- 🔐 **End-to-end encryption with forward secrecy.** X25519 + Ed25519
-  identities (libsodium), per-session ephemeral keys signed by the identity
-  keys, XSalsa20-Poly1305 AEAD. Recorded traffic is worthless even if a
-  device is later seized.
-- 📦 **Offline delivery without any server** — the way it has to be: a message
-  to an offline peer waits in the *local* encrypted outbox; when both peers
-  meet online (handshake on connect), the buffer flushes and cleans itself.
-- 📁 **Files of any size** stream in 16 KiB chunks with backpressure and a
-  SHA-256 integrity check. Voice notes are files flagged `voice` — recording
-  is the app's job (engine stays OS-free).
-- 🕵️ **Metadata minimization.** The only third party ever contacted is a
-  public STUN server (discovers your NAT address; sees IPs, never data, and
-  can be disabled). Connection codes can be compared out-of-band via safety
-  numbers to defeat MITM.
+## Сборка
 
-## Why "manual" signaling?
+Нужен только [Zig 0.17.0](https://ziglang.org/download/). Затем:
 
-True zero-server operation means nothing out there introduces peers to each
-other. So the *app* shows a short code, and the user passes it to the peer
-through **any** existing channel (any messenger, QR, phone call):
+    make            # = cd zig && zig build -Doptimize=ReleaseFast
+    make test
 
-```
-Alice                       Bob
-  |-- make_offer() ------->  |  code A (base64url, one line)
-  |                          |-- handle_offer(codeA) → code B
-  |<------ handle_answer --- |
-  |==== encrypted P2P session established, outboxes flush ====|
-```
+Бинарник: `zig/zig-out/bin/shopot-zig`.
 
-Codes are single-use, per-connection. This is the honest price of "no servers,
-period". The transport is abstracted (`IChannel`), so an app that wants
-automatic rendezvous can plug in public infrastructure (Nostr relays,
-BitTorrent trackers) **without touching the core** — see Roadmap.
+## Использование
 
-## Build
+    shopot-zig init          # личность: ~/.shopot/zig-seed (0600)
+    shopot-zig invite <имя>  # короткий код shopot1.<base64> — передай его
+    shopot-zig chat          # TUI (или REPL, если stdin не терминал)
 
-Dependencies: CMake ≥ 3.24, a C++20 compiler, `libsodium`, `sqlite3`.
-libdatachannel is fetched automatically (uses system GnuTLS on Linux).
+В чате обе стороны делают `add <код>` — **соединение поднимается само**
+(UDP-мультикаст в LAN; код вида `shopot1...@ip:port` работает через интернет).
 
-```bash
-# Arch:  sudo pacman -S libsodium sqlite cmake
-# Debian/Ubuntu: sudo apt install libsodium-dev libsqlite3-dev cmake
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-./build/shopot-tests          # crypto + storage + full loopback protocol e2e
-```
+Клавиши TUI: enter — отправить, tab — контакт, c — звонок, a — принять,
+h — положить трубку, b — блокировка, /команда — как в REPL, q — выход.
 
-Options: `SHOPOT_WITH_RTC=OFF` (core only, transport-agnostic),
-`SHOPOT_BUILD_CLI=OFF`, `SHOPOT_BUILD_TESTS=OFF`.
+## Криптография
 
-## Download (no compiler needed)
+- XX-подобное рукопожатие (X25519 + Ed25519, подписи транскрипта)
+- Двойное шифрование сообщений: рэтчет-цепочки поверх AEAD-потока
+- Звонки: кадры 20 мс, ключ кадра = HKDF(секрет звонка, seq), транспорт — свой AEAD
+- Хранилище: append-only AEAD-лог, ни одного байта открытого текста
 
-Ready-made binaries are attached to each
-[GitHub release](https://github.com/Puxxalwl/shopot-core/releases) — Linux x64
-and macOS arm64, built by CI on every version tag. Unpack and run:
-
-```bash
-tar xzf shopot-cli-linux-x64.tar.gz && ./shopot-cli-linux-x64/shopot-cli
-```
-
-Runtime deps are the stock system libraries: libsqlite3 and openssl are
-preinstalled everywhere; on Fedora/RHEL add `sudo dnf install libsodium`,
-on Debian/Ubuntu `sudo apt install libsodium23` (macOS: `brew install
-libsodium`). `RUNTIME-DEPS.txt` inside each archive lists the exact
-libraries the binary was linked against.
-
-## Try it: two terminals
-
-In a real terminal `shopot-cli` opens the full-screen chat interface —
-contact list, scrolling history with day marks, delivery ticks (✓ sent,
-✓✓ delivered, … queued), photo/file/voice cards with live progress bars,
-attachment field (Ctrl+O), one-command invites. Pipes/scripts get the classic
-line REPL automatically (`--plain` forces it anywhere).
-
-```bash
-./build/shopot-cli --db alice.db --dl dl-alice   # pick "new", write down words
-./build/shopot-cli --db bob.db   --dl dl-bob     # same
-```
-
-TUI keys: **Tab** — switch chat · **↑↓ / PgUp / PgDn / wheel** — history ·
-**Ctrl+O** — attach file or photo · **/invite**, **/addi**, **/fp**, **/auto**,
-**/voice <path>**, **/help**, **/quit**.
-
-The same flow through the plain REPL:
-
-```bash
-./build/shopot-cli --db alice.db --dl dl-alice   # pick "new", write down words
-./build/shopot-cli --db bob.db   --dl dl-bob     # same
-```
-
-```
-alice> bundle                     → send the bundle to Bob (any channel)
-bob>   add alice <bundle>
-bob>   bundle                     → send to Alice
-alice> add bob <bundle>
-alice> offer 1                    → code A → send to Bob
-bob>   answer 1 <codeA>           → code B → send to Alice
-alice> accept 1 <codeB>
-     ... [1] ONLINE on both sides ...
-alice> msg 1 привет               (queued if Bob were offline, delivered on meet)
-bob>   send 1 /path/to/file.zip
-bob>   hist 1
-```
-
-## Embedding (your app per OS)
-
-```cpp
-#include <shopot/shopot.hpp>
-
-shopot::Config cfg;
-cfg.db_path = "app.db";
-cfg.download_dir = "downloads";
-
-shopot::Events ev;
-ev.on_message   = [](const shopot::Message& m){ /* render bubble */ };
-ev.on_presence  = [](int64_t cid, bool online){ /* status dot */ };
-ev.on_status    = [](const std::string& id, shopot::MsgStatus s){ /* ticks */ };
-ev.on_file_ready= [](int64_t cid, const shopot::Message& m, const std::string& path){};
-
-shopot::Engine engine(cfg, mnemonic, ev);
-
-auto cid   = engine.add_contact(peer_bundle, "Alice");
-
-// connect — automatic: both peers call connect_auto, they find each other
-// through public relays (topics/keys derive from the room hash; relays see
-// nothing readable). Manual codes still work: make_offer / handle_answer.
-engine.connect_auto(cid);
-
-auto msgId = engine.send_text(cid, "hi");       // safe while offline: queues
-auto file  = engine.send_file(cid, "/tmp/voice.opus", "audio/ogg",
-                              shopot::MsgKind::Voice);
-auto hist  = engine.history(cid, 50);           // newest first
-```
-
-All callbacks fire on one serialized dispatcher thread. All API calls are
-thread-safe.
-
-## Documentation
-
-- [docs/PROTOCOL.md](docs/PROTOCOL.md) — full wire protocol v2 spec (interoperable reimplementations)
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — modules, threading, data flow, porting guide
-- [SECURITY.md](SECURITY.md) — reporting, crypto inventory, hardening
-- [CONTRIBUTING.md](CONTRIBUTING.md) — build, ground rules, PRs
-- [scripts/](scripts/) — one-command end-to-end runs: manual codes and automatic rendezvous
-
-## Protocol (v2)
-
-| layer      | choice                                                        |
-|------------|---------------------------------------------------------------|
-| identity   | BIP-39 entropy → HKDF → X25519 + Ed25519 + storage key        |
-| handshake  | hello: ephemeral X25519, Ed25519-signed, room-hash bound      |
-| session    | **double ratchet**: fresh key per message, alternating DH rotation every 256 sends (post-compromise healing) |
-| AEAD       | XSalsa20-Poly1305, random 24-byte nonces                       |
-| transport  | WebRTC DataChannel (reliable, ordered), STUN-only NAT traversal |
-| wire       | ratchet header per frame; JSON envelopes; 64 KiB binary chunks |
-| storage    | SQLite (WAL); every sensitive blob sealed with the storage key |
-| integrity  | SHA-256 per file, verified before delivery to the app          |
-
-Wire frames: `0x10` hello (plaintext JSON, signed) · `0x11` sealed envelope
-(text / ack / file-meta / file-done) · `0x12` sealed file chunk — the latter
-two carry a 40-byte ratchet header; chunk routing fields live inside the AEAD.
-
-Measured engine throughput (loopback, full path incl. ratchet + SQLite):
-**~32 MiB/s**; live-path sends are O(1) — the outbox re-flush runs only once
-per session establishment, so long offline queues never degrade live chat.
-
-## Threat model — honest version
-
-**Defeats:** mass surveillance (E2E + **per-message forward secrecy** via the
-double ratchet), server breaches (no servers), history seizure of *one* device
-(DB is encrypted; the key comes from the mnemonic), account takeovers (no
-accounts), metadata collection (no contacts/graph on any server). A
-mid-session leak of ratchet state heals at the next DH rotation
-(post-compromise security).
-
-**Does not defeat:** a compromised endpoint (nothing can), physical access to
-an unlocked device, a global passive adversary correlating *timing* of the two
-peers' traffic (use the Tor-pluggable transport — Roadmap), MITM during code
-exchange (defeated by comparing fingerprints out-of-band). The optional
-automatic rendezvous adds one more observer: the public relay, which learns
-"two anonymous IPs searched for the same opaque topic around the same time"
-— nothing readable, nothing attributable, but it is a metadata witness.
-
-## Roadmap
-
-- [x] **Double Ratchet** — fresh message key per frame, alternating DH
-      rotation (post-compromise healing), race-free by construction
-- [x] **64 KiB chunks + O(1) live sends** — 32 MiB/s engine path on loopback
-- [x] **Automatic rendezvous** — both peers press "connect" and find each
-      other via public MQTT-over-TLS relays; topic and keys derive from the
-      pairwise room hash, so relays see only an opaque hash and a sealed blob
-- [x] One-way invite codes (onboarding with a single string, offline-safe)
-- [x] Automatic reconnect keeper (exit/re-enter with the same db and queued
-      messages flush on their own)
-- [ ] Alternative rendezvous backends: Nostr relays / BitTorrent trackers
-      (pluggable `ISignaling` interface is in place)
-- [ ] File transfer resume across sessions (chunk bitmaps already stored)
-- [ ] Tor onion-service transport (no STUN, no IP leakage at all)
-- [ ] Voice messages: engine-level opus framing helpers
-- [ ] Reference apps: Android (JNI), iOS, desktop (Qt/Tauri)
-
-## License
-
-MIT. Use it, fork it, ship it.
+См. `zig/docs/PROTOCOL.md`, SECURITY.md.

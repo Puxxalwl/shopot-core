@@ -91,7 +91,17 @@ pub fn dial(alloc: std.mem.Allocator, addr: []const u8) DialError!*TcpConn {
         return error.OutOfMemory;
     };
     tc.* = .{ .fd = fd };
+    setKeepalive(fd);
     return tc;
+}
+
+/// Ядро само детектит мёртвый peer (30с тишины TCP-уровня, без прикладных
+/// запросов) — presence-пинги остаются только для статуса «онлайн».
+pub fn setKeepalive(fd: posix.socket_t) void {
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1))) catch return;
+    posix.setsockopt(fd, linux.IPPROTO.TCP, 4, &std.mem.toBytes(@as(c_int, 30))) catch return; // KEEPIDLE
+    posix.setsockopt(fd, linux.IPPROTO.TCP, 5, &std.mem.toBytes(@as(c_int, 10))) catch return; // KEEPINTVL
+    posix.setsockopt(fd, linux.IPPROTO.TCP, 9, &std.mem.toBytes(@as(c_int, 3))) catch return; // KEEPCNT
 }
 
 /// Готовый к accept() слушатель.
@@ -110,6 +120,7 @@ pub const Listener = struct {
             return error.OutOfMemory;
         };
         tc.* = .{ .fd = cfd };
+        setKeepalive(cfd);
         return tc;
     }
 

@@ -44,6 +44,7 @@ const sealed_tag: u8 = 0xA1; // ratchet-sealed TEXT frame marker
 pub const Session = struct {
     conn: interfaces.Conn,
     ratchet: ratchet_mod.Ratchet,
+    keys: handshake.SessionKeys,
     ev: Events,
     send_mu: std.Io.Mutex = .init,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
@@ -117,6 +118,90 @@ pub const Session = struct {
         self.* = .{
             .conn = wrapped,
             .ratchet = ratchet_mod.Ratchet.init(chain_send, chain_recv),
+            .keys = keys,
+            .ev = ev,
+            .alloc = alloc,
+            .io = io,
+        };
+        self.rx_thread = std.Thread.spawn(.{}, rxLoop, .{self}) catch {
+            wrapped.close();
+            alloc.destroy(self);
+            return SessionError.OutOfSpace;
+        };
+        return self;
+    }
+
+    /// Responder с готовым (уже прочитанным из транспорта) m1: вызывающий
+    /// сам решает, чей это контакт, по любому признаку из m1 (например,
+    /// enc_pk = m1[32..64] = bundle[0..32]) и возвращает cid или null.
+    /// cid используется только как метка для вызывающего (события сессии
+    /// не зависят от него), поэтому ядро остаётся независимым от app.
+    pub const IdentifyResult = struct {
+        /// sign_pk найденного контакта (bundle[32..64]); null — не наш контакт.
+        sign_pk: [32]u8,
+    };
+
+    pub const IdentifyFn = *const fn (ctx: *anyopaque, enc_pk: [32]u8) ?IdentifyResult;
+
+    pub fn establishIdentified(
+        alloc: std.mem.Allocator,
+        conn: interfaces.Conn,
+        m1: []const u8,
+        my_id: *const identity_mod.Identity,
+        eph_seed: [32]u8,
+        identify: IdentifyFn,
+        identify_ctx: *anyopaque,
+        wrap_ctx: *anyopaque,
+        wrap: WrapFn,
+        ev: Events,
+        io: std.Io,
+    ) SessionError!?*Session {
+        if (m1.len != handshake.m1_len) return SessionError.HandshakeFailed;
+        const enc_pk: [32]u8 = m1[32..64].*;
+        const found = identify(identify_ctx, enc_pk) orelse return null;
+        var m2: [handshake.m2_len]u8 = undefined;
+        var m3: [handshake.m3_len]u8 = undefined;
+        var hs = handshake.Responder.recv1(&m2, my_id, m1[0..handshake.m1_len], eph_seed) catch
+            return SessionError.HandshakeFailed;
+        writeFrame(conn, &m2) catch return SessionError.Closed;
+        _ = readFrame(conn, &m3) catch return SessionError.Closed;
+        const keys = hs.recv3(&m3, found.sign_pk) catch |e| switch (e) {
+            error.BadSignature => return SessionError.BadSignature,
+            else => return SessionError.HandshakeFailed,
+        };
+        return finishEstablish(alloc, conn, keys, .responder, wrap_ctx, wrap, ev, io);
+    }
+
+    /// Общий хвост establish: wrap, ratchet-цепочки, Session, rx-поток.
+    fn finishEstablish(
+        alloc: std.mem.Allocator,
+        conn: interfaces.Conn,
+        keys: handshake.SessionKeys,
+        role: HandshakeRole,
+        wrap_ctx: *anyopaque,
+        wrap: WrapFn,
+        ev: Events,
+        io: std.Io,
+    ) SessionError!*Session {
+        const wrapped = wrap(wrap_ctx, conn, keys, alloc) catch return SessionError.OutOfSpace;
+        var chain_send: [32]u8 = undefined;
+        var chain_recv: [32]u8 = undefined;
+        switch (role) {
+            .initiator => {
+                kdf.expand(keys.transcript, "shopot-chain-1", &chain_send);
+                kdf.expand(keys.transcript, "shopot-chain-2", &chain_recv);
+            },
+            .responder => {
+                kdf.expand(keys.transcript, "shopot-chain-2", &chain_send);
+                kdf.expand(keys.transcript, "shopot-chain-1", &chain_recv);
+            },
+        }
+        const self = alloc.create(Session) catch return SessionError.OutOfSpace;
+        errdefer alloc.destroy(self);
+        self.* = .{
+            .conn = wrapped,
+            .ratchet = ratchet_mod.Ratchet.init(chain_send, chain_recv),
+            .keys = keys,
             .ev = ev,
             .alloc = alloc,
             .io = io,
@@ -158,6 +243,17 @@ pub const Session = struct {
 
     /// Everything else rides the transport layer only (presence, reactions,
     /// call signaling and audio have their own per-call keys).
+    /// Секрет звонка: HKDF из транскрипта рукопожатия + call_id. Обе стороны
+    /// одной сессии выводят одинаковое значение, разные звонки — разные ключи.
+    pub fn callSecret(self: *Session, call_id: [16]u8) [32]u8 {
+        var info: [16 + "shopot-call-secret".len]u8 = undefined;
+        info[0..16].* = call_id;
+        @memcpy(info[16..], "shopot-call-secret");
+        var out: [32]u8 = undefined;
+        kdf.expand(self.keys.transcript, &info, &out);
+        return out;
+    }
+
     pub fn sendEnvelope(self: *Session, env: envelope.Envelope) SessionError!void {
         var buf: [envelope.max_encoded_len]u8 = undefined;
         const plain = envelope.encode(&buf, env) catch return SessionError.TooBig;
