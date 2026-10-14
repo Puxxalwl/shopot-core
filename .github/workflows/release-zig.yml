@@ -33,13 +33,14 @@ jobs:
         working-directory: zig
         run: zig build -Doptimize=ReleaseFast
       - name: Package
+        working-directory: zig
         shell: bash
         run: |
           NAME="shopot-zig-${{ matrix.target }}"
           mkdir -p "dist/$NAME"
           cp zig-out/bin/shopot-zig "dist/$NAME/"
-          cp README.md "dist/$NAME/" 2>/dev/null || true
-          tar czf "$NAME.tar.gz" -C dist "$NAME"
+          cp ../README.md "dist/$NAME/" 2>/dev/null || true
+          tar czf "../../$NAME.tar.gz" -C dist "$NAME"
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
