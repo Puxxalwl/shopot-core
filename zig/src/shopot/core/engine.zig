@@ -12,6 +12,8 @@ pub const EngineError = error{
     NoSession,
     NoSpace,
     Store,
+    OutOfMemory,
+    TooBig,
 };
 
 pub const Contact = struct {
@@ -20,6 +22,24 @@ pub const Contact = struct {
     bundle: [64]u8 = @splat(0), // enc_pk || sign_pk
     online: bool = false,
     blocked: bool = false,
+    /// Последний известный адрес host:port (для автодозвона офлайн-контактов).
+    addr_buf: [64]u8 = @splat(0),
+    addr_len: u8 = 0,
+    addr_port: u16 = 0,
+
+    /// Запомнить адрес (host без порта + порт). Порт 0 — адрес неизвестен.
+    pub fn setAddr(self: *Contact, host: []const u8, port: u16) void {
+        if (host.len == 0 or host.len > self.addr_buf.len or port == 0) return;
+        @memcpy(self.addr_buf[0..host.len], host);
+        self.addr_len = @intCast(host.len);
+        self.addr_port = port;
+    }
+
+    /// host:port в буфер (для dial), null — адреса нет.
+    pub fn addr(self: *const Contact, buf: []u8) ?[]const u8 {
+        if (self.addr_len == 0 or self.addr_port == 0) return null;
+        return std.fmt.bufPrint(buf, "{s}:{d}", .{ self.addr_buf[0..self.addr_len], self.addr_port }) catch null;
+    }
 
     pub fn setName(self: *Contact, name: []const u8) void {
         const n = @min(name.len, self.name.len);
@@ -45,7 +65,25 @@ pub const Events = struct {
     onCallSignal: ?*const fn (ctx: *anyopaque, from: *const Contact, op: u8, call_id: [16]u8) void = null,
     onCallAudio: ?*const fn (ctx: *anyopaque, from: *const Contact, seq: u32, data: []const u8) void = null,
     onBlockedNotice: ?*const fn (ctx: *anyopaque, from: *const Contact) void = null,
+    /// Доставка подтверждена: ACK по msg_id дошёл (сообщение дошло до пир-устройства).
+    onDelivered: ?*const fn (ctx: *anyopaque, from: *const Contact, msg_id: [16]u8) void = null,
 };
+
+/// Запись outbox: TEXT, ждущий сессии/ACK.
+pub const OutboxEntry = struct {
+    cid: i64,
+    msg_id: [16]u8,
+    ts_ms: u64,
+    /// Копия тела (alloc); свободается при ACK/истечении.
+    body: []u8,
+};
+
+/// Окно дедупа входящих msg_id на контакт.
+pub const seen_window = 64;
+/// Капа outbox: старее — вытесняется.
+pub const outbox_cap = 1000;
+/// TTL записи outbox, мс (30 дней).
+pub const outbox_ttl_ms: u64 = 30 * 24 * 3600 * 1000;
 
 pub const Engine = struct {
     alloc: std.mem.Allocator,
@@ -61,6 +99,11 @@ pub const Engine = struct {
     // presence: millisecond precision, passive
     last_seen_ms: std.AutoHashMap(i64, i64),
 
+    /// Outbox: TEXT без сессии ждёт здесь (память + лог kind OUTBOX у приложения).
+    outbox: std.ArrayListUnmanaged(OutboxEntry) = .empty,
+    /// Дедуп входящих msg_id: cid -> последние seen_window id.
+    seen: std.AutoHashMap(i64, std.ArrayListUnmanaged([16]u8)) = undefined,
+
     pub fn init(alloc: std.mem.Allocator, io: std.Io, id: identity_mod.Identity, ev: Events) Engine {
         return .{
             .alloc = alloc,
@@ -69,6 +112,7 @@ pub const Engine = struct {
             .ev = ev,
             .sessions = std.AutoHashMap(i64, *session_mod.Session).init(alloc),
             .last_seen_ms = std.AutoHashMap(i64, i64).init(alloc),
+            .seen = std.AutoHashMap(i64, std.ArrayListUnmanaged([16]u8)).init(alloc),
         };
     }
 
@@ -81,6 +125,11 @@ pub const Engine = struct {
         self.contacts.deinit(self.alloc);
         self.contact_ids.deinit(self.alloc);
         self.last_seen_ms.deinit();
+        for (self.outbox.items) |*e| self.alloc.free(e.body);
+        self.outbox.deinit(self.alloc);
+        var sit = self.seen.valueIterator();
+        while (sit.next()) |list| list.deinit(self.alloc);
+        self.seen.deinit();
     }
 
     pub fn addContact(self: *Engine, name: []const u8, bundle: [64]u8) !usize {
@@ -100,11 +149,14 @@ pub const Engine = struct {
         return idx;
     }
 
+    /// Куда попал TEXT после sendText.
+    pub const SendResult = enum { sent, queued };
+
     /// Send text to a contact. Blocked peers are rejected locally.
-    pub fn sendText(self: *Engine, contact_id: i64, body: []const u8) EngineError!void {
+    /// Нет сессии — сообщение уходит в outbox (доставим при появлении).
+    pub fn sendText(self: *Engine, contact_id: i64, body: []const u8) EngineError!SendResult {
         const idx = self.findIndex(contact_id) orelse return EngineError.NoSession;
         if (self.contacts.items[idx].blocked) return EngineError.Blocked;
-        const s = self.sessions.get(contact_id) orelse return EngineError.NoSession;
         var msg_id: [16]u8 = undefined;
         self.io.random(&msg_id);
         var ts_buf: [8]u8 = undefined;
@@ -115,7 +167,89 @@ pub const Engine = struct {
             .ts_ms = ts_ms,
             .body = body,
         } };
-        s.sendEnvelope(env) catch return EngineError.NoSession;
+        if (self.sessions.get(contact_id)) |s| {
+            s.sendEnvelope(env) catch {
+                // сессия умерла между проверкой и записью — в очередь
+                self.outboxAppend(contact_id, msg_id, ts_ms, body) catch {};
+                return .queued;
+            };
+            return .sent;
+        }
+        self.outboxAppend(contact_id, msg_id, ts_ms, body) catch return EngineError.OutOfMemory;
+        return .queued;
+    }
+
+    /// Положить TEXT в outbox (капа outbox_cap: старое вытесняется).
+    fn outboxAppend(self: *Engine, cid: i64, msg_id: [16]u8, ts_ms: u64, body: []const u8) !void {
+        if (body.len == 0 or body.len > envelope.max_text_body) return error.TooBig;
+        if (self.outbox.items.len >= outbox_cap) {
+            const old = self.outbox.orderedRemove(0);
+            self.alloc.free(old.body);
+        }
+        const copy = try self.alloc.dupe(u8, body);
+        self.outbox.append(self.alloc, .{ .cid = cid, .msg_id = msg_id, .ts_ms = ts_ms, .body = copy }) catch {
+            self.alloc.free(copy);
+            return error.OutOfMemory;
+        };
+    }
+
+    /// Сессия поднята: слить outbox по cid (идемпотентно — дедуп на приёме).
+    pub fn flushOutbox(self: *Engine, contact_id: i64) void {
+        if (self.findIndex(contact_id) == null) return;
+        if (self.sessions.get(contact_id)) |s| {
+            var i: usize = 0;
+            while (i < self.outbox.items.len) {
+                const e = self.outbox.items[i];
+                const fresh = e.ts_ms + outbox_ttl_ms > @as(u64, @intCast(self.nowMs()));
+                if (e.cid != contact_id or !fresh) {
+                    if (e.cid == contact_id and !fresh) {
+                        const old = self.outbox.orderedRemove(i);
+                        self.alloc.free(old.body);
+                        continue;
+                    }
+                    i += 1;
+                    continue;
+                }
+                s.sendEnvelope(.{ .text = .{ .msg_id = e.msg_id, .ts_ms = e.ts_ms, .body = e.body } }) catch {
+                    i += 1;
+                    continue;
+                };
+                i += 1;
+            }
+        }
+    }
+
+    /// ACK дошёл: выкинуть запись outbox, событие onDelivered.
+    fn outboxAcked(self: *Engine, cid: i64, msg_id: [16]u8, c: *const Contact) void {
+        var i: usize = 0;
+        while (i < self.outbox.items.len) {
+            if (self.outbox.items[i].cid == cid and std.mem.eql(u8, &self.outbox.items[i].msg_id, &msg_id)) {
+                const old = self.outbox.orderedRemove(i);
+                self.alloc.free(old.body);
+            } else {
+                i += 1;
+            }
+        }
+        if (self.ev.onDelivered) |cb| cb(self.ev.ctx, c, msg_id);
+    }
+
+    /// Дедуп: true — уже видели этот msg_id от контакта.
+    fn seenHas(self: *Engine, cid: i64, msg_id: [16]u8) bool {
+        const gop = self.seen.getOrPut(cid) catch return false;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        const list = gop.value_ptr;
+        for (list.items) |m| {
+            if (std.mem.eql(u8, &m, &msg_id)) return true;
+        }
+        return false;
+    }
+
+    fn seenPut(self: *Engine, cid: i64, msg_id: [16]u8) void {
+        const gop = self.seen.getOrPut(cid) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        const list = gop.value_ptr;
+        list.append(self.alloc, msg_id) catch return;
+        if (list.items.len > seen_window) _ = list.orderedRemove(0);
     }
 
     pub fn react(self: *Engine, contact_id: i64, msg_id: [16]u8, op: u8, code: u8) EngineError!void {
@@ -178,7 +312,21 @@ pub const Engine = struct {
         if (c.blocked) return; // hard ignore for blocked peers
         switch (env) {
             .text => |t| {
+                if (self.seenHas(contact_id, t.msg_id)) {
+                    // повтор после реконнекта — уже доставлено; зеркальный ACK
+                    if (self.sessions.get(contact_id)) |sess| {
+                        sess.sendEnvelope(.{ .ack = .{ .msg_id = t.msg_id } }) catch {};
+                    }
+                    return;
+                }
+                self.seenPut(contact_id, t.msg_id);
                 if (self.ev.onText) |cb| cb(self.ev.ctx, c, t.msg_id, @intCast(t.ts_ms), t.body);
+                if (self.sessions.get(contact_id)) |sess| {
+                    sess.sendEnvelope(.{ .ack = .{ .msg_id = t.msg_id } }) catch {};
+                }
+            },
+            .ack => |a| {
+                self.outboxAcked(contact_id, a.msg_id, c);
             },
             .react => |r| {
                 if (self.ev.onReaction) |cb| cb(self.ev.ctx, c, .{ .msg_id = r.msg_id, .from = c.bundle, .code = r.code });
@@ -222,7 +370,7 @@ test "engine block and react flow" {
     defer eng.deinit();
     const idx = try eng.addContact("peer", peer.bundle());
     const cid: i64 = @intCast(idx + 1);
-    try std.testing.expectError(EngineError.NoSession, eng.sendText(cid, "hi"));
+    try std.testing.expectEqual(Engine.SendResult.queued, try eng.sendText(cid, "hi"));
     try eng.block(cid);
     try std.testing.expect(eng.contacts.items[idx].blocked);
     try eng.unblock(cid);

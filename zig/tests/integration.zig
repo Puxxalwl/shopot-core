@@ -115,6 +115,7 @@ const Harness = struct {
     text_ts: std.ArrayListUnmanaged(u64) = .empty,
     reacts: std.ArrayListUnmanaged(envelope.React) = .empty,
     pings: std.ArrayListUnmanaged(u32) = .empty,
+    delivered: std.ArrayListUnmanaged([16]u8) = .empty,
 
     fn onEnvelope(ctx: *anyopaque, env: envelope.Envelope) void {
         const self: *Harness = @ptrCast(@alignCast(ctx));
@@ -299,6 +300,10 @@ const eng_events = struct {
         const h: *Harness = @ptrCast(@alignCast(ctx));
         h.reacts.append(h.alloc, .{ .msg_id = r.msg_id, .op = envelope.react_add, .code = r.code }) catch {};
     }
+    fn onDelivered(ctx: *anyopaque, _: *const shopot.core.engine.Contact, msg_id: [16]u8) void {
+        const h: *Harness = @ptrCast(@alignCast(ctx));
+        h.delivered.append(h.alloc, msg_id) catch {};
+    }
 };
 
 fn engineDispatch(ctx: *anyopaque, env: envelope.Envelope) void {
@@ -379,7 +384,7 @@ test "block: traffic from blocked peer is dropped engine-wide" {
     eng_b.sessions.put(1, sb) catch return error.OutOfMemory;
 
     // before block: text goes through the full engine dispatch
-    try eng_b.sendText(1, "hello a");
+    _ = try eng_b.sendText(1, "hello a");
     try waitTexts(&ha, "hello a");
 
     // A blocks B: engine marks flag, warns peer, tears the session down
@@ -388,7 +393,7 @@ test "block: traffic from blocked peer is dropped engine-wide" {
     try std.testing.expectError(shopot.core.engine.EngineError.Blocked, eng_a.sendText(cid_b, "nope"));
 
     // B (unaware yet or ignoring) keeps sending: everything is dropped at A
-    try eng_b.sendText(1, "should vanish");
+    _ = try eng_b.sendText(1, "should vanish");
     try eng_b.react(1, @splat(9), envelope.react_add, 5);
     std.Thread.yield() catch {};
     std.Io.sleep(io_g.stored, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
@@ -427,4 +432,134 @@ test "block: traffic from blocked peer is dropped engine-wide" {
     hb.reacts.deinit(alloc);
     ha.pings.deinit(alloc);
     hb.pings.deinit(alloc);
+}
+
+// ------------------------------------------------------ outbox flow (E2E)
+test "outbox: очередь офлайн, доставка при сессии, ACK, дедуп" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    io_g.stored = io;
+    io_g.alloc = alloc;
+
+    obf_idx = 0;
+    obf_tracker = .{ null, null };
+    const id_a = try identity.Identity.fromSeed(filled(21));
+    const id_b = try identity.Identity.fromSeed(filled(23));
+    const pair = try pipePair(alloc);
+    var ca = pair[0];
+    var cb = pair[1];
+
+    var ha = Harness{ .alloc = alloc };
+    var hb = Harness{ .alloc = alloc };
+
+    var eng_a = shopot.core.engine.Engine.init(alloc, io, id_a, .{
+        .ctx = &ha,
+        .onText = eng_events.onText,
+        .onDelivered = eng_events.onDelivered,
+    });
+    var eng_b = shopot.core.engine.Engine.init(alloc, io, id_b, .{
+        .ctx = &hb,
+        .onText = eng_events.onText,
+        .onDelivered = eng_events.onDelivered,
+    });
+
+    const idx_b = try eng_a.addContact("b", id_b.bundle());
+    _ = try eng_b.addContact("a", id_a.bundle());
+    const cid_b: i64 = @intCast(idx_b + 1);
+
+    var ctx_a = EngineCtx{ .engine = &eng_a, .contact_id = cid_b, .harness = &ha };
+    var ctx_b = EngineCtx{ .engine = &eng_b, .contact_id = 1, .harness = &hb };
+
+    // 1) офлайн: TEXT уходит в очередь, не в ошибку
+    try std.testing.expectEqual(shopot.core.engine.Engine.SendResult.queued, try eng_b.sendText(1, "offline-digest"));
+    try std.testing.expectEqual(@as(usize, 1), eng_b.outbox.items.len);
+
+    // 2) поднимаем сессии
+    var sb_opt: ?*session_mod.Session = null;
+    const th_b = try std.Thread.spawn(.{}, struct {
+        fn go(conn: interfaces.Conn, id_b_ptr: *const identity.Identity, peer_sign: [32]u8, ctx: *EngineCtx, out: *?*session_mod.Session) void {
+            out.* = session_mod.Session.establish(
+                io_g.alloc,
+                conn,
+                .responder,
+                id_b_ptr,
+                peer_sign,
+                filled(6),
+                @ptrCast(&wrap_slot),
+                wrapConn,
+                .{ .ctx = ctx, .onEnvelope = engineDispatch, .onClosed = Harness.onClosed },
+                io_g.stored,
+            ) catch null;
+        }
+    }.go, .{ cb.conn(), &id_b, id_a.bundle()[32..64].*, &ctx_b, &sb_opt });
+
+    const sa = try session_mod.Session.establish(
+        alloc,
+        ca.conn(),
+        .initiator,
+        &id_a,
+        id_b.bundle()[32..64].*,
+        filled(4),
+        @ptrCast(&wrap_slot),
+        wrapConn,
+        .{ .ctx = &ctx_a, .onEnvelope = engineDispatch, .onClosed = Harness.onClosed },
+        io,
+    );
+    th_b.join();
+    const sb = sb_opt orelse return error.ResponderFailed;
+
+    eng_a.sessions.put(cid_b, sa) catch return error.OutOfMemory;
+    eng_b.sessions.put(1, sb) catch return error.OutOfMemory;
+
+    // 3) сессия поднялась — слить очередь
+    eng_b.flushOutbox(1);
+    try waitTexts(&ha, "offline-digest");
+
+    // 4) ACK от A погасил запись outbox у B (доставлено)
+    for (0..200) |_| {
+        if (eng_b.outbox.items.len == 0) break;
+        std.Io.sleep(io_g.stored, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 0), eng_b.outbox.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hb.delivered.items.len);
+
+    // 5) дедуп: один и тот же TEXT дважды — получен один раз (B -> A)
+    const dup_mid: [16]u8 = @splat(0xD1);
+    const dup = envelope.Envelope{ .text = .{ .msg_id = dup_mid, .ts_ms = 77, .body = "dup" } };
+    try sb.sendEnvelope(dup);
+    try waitTexts(&ha, "dup");
+    try sb.sendEnvelope(dup);
+    std.Thread.yield() catch {};
+    std.Io.sleep(io_g.stored, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+    var n: usize = 0;
+    for (ha.texts.items) |t| {
+        if (std.mem.eql(u8, t, "dup")) n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), n);
+
+    sb.close();
+    _ = eng_a.sessions.remove(cid_b);
+    sa.close();
+    _ = eng_b.sessions.remove(1);
+    eng_a.deinit();
+    eng_b.deinit();
+    for (obf_tracker) |oc| {
+        if (oc) |o| {
+            o.deinit();
+            alloc.destroy(o);
+        }
+    }
+    alloc.destroy(sa);
+    alloc.destroy(sb);
+    ca.me.inbox.deinit(alloc);
+    cb.me.inbox.deinit(alloc);
+    alloc.destroy(ca.me);
+    alloc.destroy(cb.me);
+    for (ha.texts.items) |tx| alloc.free(tx);
+    for (hb.texts.items) |tx| alloc.free(tx);
+    ha.texts.deinit(alloc);
+    ha.text_ts.deinit(alloc);
+    hb.texts.deinit(alloc);
+    hb.text_ts.deinit(alloc);
+    hb.delivered.deinit(alloc);
 }

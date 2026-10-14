@@ -71,6 +71,8 @@ pub const Kind = enum(u8) {
     set = 5,
     /// Метка удаления (payload — u32 LE удаляемого seq).
     tombstone = 6,
+    /// Outbox: 1 = [1][cid u16][msg_id 16][ts u64][len u16][body], 0 = [0][cid u16][msg_id 16].
+    outbox = 7,
 };
 
 /// Единая ошибка модуля: файловые операции + память + семантика формата.

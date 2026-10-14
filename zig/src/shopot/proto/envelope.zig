@@ -7,6 +7,7 @@
 //!
 //! Раскладка кадров:
 //!   TEXT          0x10: msg_id: [16]u8, ts_ms: u64, body: u16 + байты (≤ 4096)
+//!   ACK           0x15: msg_id: [16]u8
 //!   REACT         0x13: msg_id: [16]u8, op: u8, code: u8
 //!   BLOCK_NOTICE  0x14: reason: u8
 //!   PRESENCE_PING 0x20: seq: u32, ts_ms: u64
@@ -27,6 +28,8 @@ pub const Tag = enum(u8) {
     react = 0x13,
     /// Уведомление о блокировке.
     block_notice = 0x14,
+    /// ACK доставки TEXT (высылается получателем каждого сообщения).
+    ack = 0x15,
     /// Пинг присутствия.
     presence_ping = 0x20,
     /// Ответ на пинг присутствия.
@@ -90,6 +93,12 @@ pub const React = struct {
     code: u8,
 };
 
+/// ACK (0x15): подтверждение доставки TEXT с этим msg_id.
+pub const Ack = struct {
+    /// Идентификатор доставленного сообщения.
+    msg_id: [id_len]u8,
+};
+
 /// BLOCK_NOTICE (0x14): уведомление о блокировке.
 pub const BlockNotice = struct {
     /// Код причины блокировки.
@@ -151,6 +160,8 @@ pub const Envelope = union(enum) {
     react: React,
     /// BLOCK_NOTICE (0x14).
     block_notice: BlockNotice,
+    /// ACK (0x15).
+    ack: Ack,
     /// PRESENCE_PING (0x20).
     presence_ping: PresencePing,
     /// PRESENCE_PONG (0x21).
@@ -172,6 +183,7 @@ pub fn encodedLen(e: Envelope) usize {
         .text => |m| 1 + id_len + 8 + 2 + m.body.len,
         .react, .call_signal => 1 + id_len + 1,
         .block_notice => 2,
+        .ack => 1 + id_len,
         .presence_ping, .presence_pong => 1 + 4 + 8,
         .call_audio => |m| 1 + 4 + 2 + m.data.len,
         .join => |m| 1 + 64 + 1 + m.name.len + join_sig_len + join_hmac_len,
@@ -200,6 +212,10 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
         .block_notice => |m| {
             try w.put(@backingInt(Tag.block_notice));
             try w.put(m.reason);
+        },
+        .ack => |m| {
+            try w.put(@backingInt(Tag.ack));
+            try w.putFixed(&m.msg_id);
         },
         .presence_ping => |m| {
             try w.put(@backingInt(Tag.presence_ping));
@@ -283,6 +299,9 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
                 if (data.len > max_audio_data) return error.BadLen;
                 break :blk data;
             },
+        } },
+        @backingInt(Tag.ack) => .{ .ack = .{
+            .msg_id = try readId(&r),
         } },
         @backingInt(Tag.join) => .{ .join = .{
             .bundle = (try r.getFixed(64))[0..64].*,
@@ -555,4 +574,13 @@ test "envelope: JOIN roundtrip" {
     try testing.expectEqualSlices(u8, &filled(32, 0x33), &back.join.hmac);
     // мусорный хвост — BadLen
     try testing.expectError(error.Truncated, decode(bytes[0 .. bytes.len - 1]));
+}
+
+test "envelope: ACK roundtrip" {
+    var buf: [max_encoded_len]u8 = undefined;
+    const e = Envelope{ .ack = .{ .msg_id = filled(16, 0xC1) } };
+    const bytes = try encode(&buf, e);
+    try testing.expectEqual(1 + 16, bytes.len);
+    const back = try decode(bytes);
+    try testing.expectEqualSlices(u8, &filled(16, 0xC1), &back.ack.msg_id);
 }

@@ -199,10 +199,12 @@ pub const App = struct {
         const now = self.nowMs();
         self.eng.markSeen(cid, now);
         if (self.hb.getPtr(cid)) |st| st.onInbound(now);
+        // сессия поднята — слить outbox (доставка офлайн-хвоста)
+        self.eng.flushOutbox(cid);
     }
 
     fn events(self: *App) engine_mod.Events {
-        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv };
+        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv };
     }
 };
 
@@ -304,6 +306,8 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
                 };
                 cid = @intCast(ni + 1);
                 app.hb.put(cid, .{}) catch {};
+                // контакт переживает рестарт: пишем в шифрованный лог
+                if (app.log) |log| logContact(app, log, j.name, j.bundle, null);
             }
             if (!failed) {
                 sc.cid = cid;
@@ -355,6 +359,24 @@ fn onTextEv(ctx: *anyopaque, from: *const engine_mod.Contact, msg_id: [16]u8, _:
         std.debug.print("\n<< [{s}] {s}  (msg {s})\n> ", .{ from.getName(), body, hx });
     }
     cli_srv.fanoutMsgLocked(app, @intCast(idx + 1), from.getName(), body);
+}
+
+/// ACK дошёл: сообщение доставлено на устройство пир-а.
+fn onDeliveredEv(ctx: *anyopaque, from: *const engine_mod.Contact, msg_id: [16]u8) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const idx = contactIndexOf(app, from) orelse return;
+    var hex_buf: [32]u8 = undefined;
+    const hx = toHex(&hex_buf, &msg_id) catch return;
+    var line: [64]u8 = undefined;
+    const t = std.fmt.bufPrint(&line, "доставлено: {s}", .{hx}) catch return;
+    if (app.tui) {
+        app.sysLineLocked(idx, t);
+    } else {
+        std.debug.print("\n<< {s}\n> ", .{t});
+    }
+    const cid: i64 = @intCast(idx + 1);
+    persistOutboxAck(app, cid, msg_id);
+    cli_srv.fanoutSysLocked(app, cid, from.getName(), t);
 }
 
 fn onReactionEv(ctx: *anyopaque, from: *const engine_mod.Contact, r: engine_mod.Reaction) void {
@@ -638,13 +660,70 @@ fn cmdHangup(app: *App) !void {
 /// Фоновый поток: раз в 2 секунды рассылает анонс (bundle + порт) в
 /// мультикаст-группу и слушает чужие. Видит анонс добавленного контакта —
 /// сам звонит по TCP. Кто чей bundle меньше — тот инициатор (без дублей).
+/// IPv4 в строку (без порта).
+fn fmtIpBuf(buf: *[16]u8, ip: [4]u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch "?";
+}
+
+/// Автодозвон офлайн-контактов по сохранённым адресам: backoff 1с -> 60с
+/// с джиттером. Пир в LAN — сработает и анонс (linkerLoop); автодозвон
+/// покрывает сети без мультикаста и перезагрузки демона.
+fn autodialLoop(app: *App) void {
+    var next_try = std.AutoHashMapUnmanaged(i64, i64).empty;
+    defer next_try.deinit(app.alloc);
+    var attempts = std.AutoHashMapUnmanaged(i64, u32).empty;
+    defer attempts.deinit(app.alloc);
+    const sleep1: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
+    while (app.running) {
+        _ = std.os.linux.nanosleep(&sleep1, null);
+        const now = app.nowMs();
+        // кого звонить: офлайн, есть адрес, время пришло
+        var dial_cid: i64 = -1;
+        var ab: [80]u8 = undefined;
+        var addr_copy: [80]u8 = undefined;
+        var addr_len: usize = 0;
+        {
+            app.lock();
+            defer app.unlock();
+            for (app.eng.contacts.items, 0..) |*c, i| {
+                const cid: i64 = @intCast(i + 1);
+                if (app.eng.sessions.get(cid) != null or c.blocked) {
+                    _ = attempts.remove(cid);
+                    continue;
+                }
+                const a = c.addr(&ab) orelse continue;
+                const nt = next_try.get(cid) orelse 0;
+                if (nt > now) continue;
+                dial_cid = cid;
+                addr_len = a.len;
+                @memcpy(addr_copy[0..a.len], a);
+                break;
+            }
+        }
+        if (dial_cid >= 0) {
+            establishTo(app, addr_copy[0..addr_len], dial_cid, .initiator) catch {};
+            // backoff: 1s,2s,4s,8s,16s,32s -> потолок 60s (+ джиттер до 50%)
+            app.lock();
+            defer app.unlock();
+            const at = (attempts.get(dial_cid) orelse 0) + 1;
+            attempts.put(app.alloc, dial_cid, at) catch {};
+            const shift: u6 = @intCast(@min(at, 6));
+            const base: i64 = @as(i64, 1000) << shift;
+            const capped: i64 = @min(base, 60_000);
+            const jitter: i64 = @mod(now, @divTrunc(capped, 2) + 1);
+            next_try.put(app.alloc, dial_cid, now + capped + jitter) catch {};
+        }
+    }
+}
+
 fn linkerLoop(app: *App) void {
     var disc = discover_mod.Discovery.init() catch return;
     defer disc.deinit();
     const my_bundle = app.id.bundle();
     const sleep: std.os.linux.timespec = .{ .sec = 2, .nsec = 0 };
     while (app.running) {
-        _ = std.os.linux.nanosleep(&sleep, null);
+        // анонс ПЕРВЫМ делом итерации: старт демона = immediate-анонс,
+        // пир с pending-outbox узнаёт о нас за ~RTT, а не через цикл сна
         disc.announce(my_bundle, app.listen_port);
         var heard: usize = 0;
         while (heard < 8) : (heard += 1) {
@@ -657,6 +736,12 @@ fn linkerLoop(app: *App) void {
             const join_due = app.join_map.contains(cid);
             app.unlock();
             if (linked or blocked) continue;
+            // адрес анонса — сохранить для автодозвона (последний известный)
+            {
+                var ab_ip: [16]u8 = undefined;
+                const c = &app.eng.contacts.items[@intCast(cid - 1)];
+                c.setAddr(fmtIpBuf(&ab_ip, a.ip), a.port);
+            }
             // инициатор — сторона с меньшим bundle (детерминизм, без гонки);
             // держатель инвайт-кода инициирует ВСЕГДА: приглашающий его не знает
             const i_init = std.mem.order(u8, &my_bundle, &a.bundle) == .lt;
@@ -673,6 +758,7 @@ fn linkerLoop(app: *App) void {
                 app.eng.markSeen(cid, app.nowMs());
             app.unlock();
         }
+        _ = std.os.linux.nanosleep(&sleep, null);
     }
 }
 
@@ -903,12 +989,9 @@ fn cmdAdd(app: *App, args: []const u8) !void {
         const idx = try app.eng.addContact(name, bundle);
         cid = @intCast(idx + 1);
         try app.hb.put(cid, .{});
+        if (addr) |a| saveContactAddr(app, cid, a);
         if (app.log) |log| {
-            var buf: [97]u8 = undefined;
-            buf[0] = @intCast(name.len);
-            @memcpy(buf[1 .. 1 + name.len], name);
-            @memcpy(buf[1 + name.len .. 1 + name.len + 64], &bundle);
-            _ = log.append(.contact, buf[0 .. 1 + name.len + 64]) catch {};
+            logContact(app, log, name, bundle, addr);
         }
     }
     var msg: [96]u8 = undefined;
@@ -940,12 +1023,17 @@ fn cmdContacts(app: *App) void {
             const cid: i64 = @intCast(i + 1);
             const seen: ?i64 = app.eng.lastSeen(cid);
             const ago = if (seen) |sv| now - sv else -1;
-            const t = std.fmt.bufPrint(&lines_buf[n], "id {d}: {s} {s}{s} (last seen: {d} мс назад)", .{
+            var q: usize = 0;
+            for (app.eng.outbox.items) |*e| {
+                if (e.cid == cid) q += 1;
+            }
+            const t = std.fmt.bufPrint(&lines_buf[n], "id {d}: {s} {s}{s} (last seen: {d} мс назад){s}", .{
                 cid,
                 c.getName(),
                 if (c.online) "[online]" else "[offline]",
                 if (c.blocked) " [BLOCKED]" else "",
                 ago,
+                if (q > 0) " [в очереди]" else "",
             }) catch continue;
             lens[n] = t.len;
             n += 1;
@@ -1063,7 +1151,13 @@ fn cmdMsg(app: *App, args: []const u8) !void {
     const cid = try std.fmt.parseInt(i64, id_str, 10);
     app.lock();
     defer app.unlock();
-    try app.eng.sendText(cid, body);
+    const r = try app.eng.sendText(cid, body);
+    if (r == .queued) {
+        persistOutboxAdd(app);
+        var qb: [80]u8 = undefined;
+        const t = std.fmt.bufPrint(&qb, "в очереди: доставлю, когда {s} появится", .{app.eng.contacts.items[@intCast(cid - 1)].getName()}) catch "в очереди";
+        fb(app, @intCast(cid - 1), t);
+    }
 }
 
 fn cmdReact(app: *App, args: []const u8) !void {
@@ -1102,6 +1196,85 @@ fn cmdBlock(app: *App, args: []const u8, flag: bool) !void {
     }
 }
 
+/// Записать контакт в лог (с адресом, если известен).
+fn logContact(app: *App, log: *store_mod.Log, name: []const u8, bundle: [64]u8, addr_: ?[]const u8) void {
+    const a: []const u8 = addr_ orelse "";
+    var buf: [64 + 1 + 32 + 1 + 64 + 2]u8 = undefined;
+    var n: usize = 0;
+    buf[0] = @intCast(name.len);
+    n = 1;
+    @memcpy(buf[n .. n + name.len], name);
+    n += name.len;
+    @memcpy(buf[n .. n + 64], &bundle);
+    n += 64;
+    // хвост адреса: [alen][host][port u16 LE] (для совместимости со старыми логами)
+    const host_port = splitHostPort(a);
+    const alen = host_port.host.len;
+    if (alen > 0 and alen <= 64) {
+        buf[n] = @intCast(alen);
+        n += 1;
+        @memcpy(buf[n .. n + alen], host_port.host);
+        n += alen;
+        std.mem.writeInt(u16, buf[n..][0..2], host_port.port, .little);
+        n += 2;
+    }
+    _ = log.append(.contact, buf[0..n]) catch {};
+    _ = app;
+}
+
+const HostPort = struct { host: []const u8, port: u16 };
+
+/// "host:port" -> {host, port}; без порта — port 0.
+fn splitHostPort(a: []const u8) HostPort {
+    if (std.mem.lastIndexOfScalar(u8, a, ':')) |c| {
+        const port = std.fmt.parseInt(u16, a[c + 1 ..], 10) catch 0;
+        return .{ .host = a[0..c], .port = port };
+    }
+    return .{ .host = a, .port = 0 };
+}
+
+/// Запомнить адрес контакта (в памяти и логе).
+fn saveContactAddr(app: *App, cid: i64, host_port_str: []const u8) void {
+    const hp = splitHostPort(host_port_str);
+    const c = &app.eng.contacts.items[@intCast(cid - 1)];
+    if (hp.port == 0) return;
+    // не перезаписываем адрес логом при каждом чихе — только если изменился
+    if (c.addr_len == hp.host.len and c.addr_port == hp.port and
+        std.mem.eql(u8, c.addr_buf[0..c.addr_len], hp.host)) return;
+    c.setAddr(hp.host, hp.port);
+    if (app.log) |log| {
+        logContact(app, log, c.getName(), c.bundle, host_port_str);
+    }
+}
+
+/// Записать в лог последнюю запись outbox (вызов ПОД локом сразу после
+/// sendText == .queued: она наша, очередь под локом).
+fn persistOutboxAdd(app: *App) void {
+    const log = app.log orelse return;
+    const items = app.eng.outbox.items;
+    if (items.len == 0) return;
+    const e = items[items.len - 1];
+    if (e.body.len > 4096) return;
+    var buf: [3 + 16 + 8 + 2 + 4096]u8 = undefined;
+    std.mem.writeInt(u16, buf[1..3], @intCast(e.cid), .little);
+    buf[0] = 1;
+    @memcpy(buf[3 .. 3 + 16], &e.msg_id);
+    std.mem.writeInt(u64, buf[19..27], e.ts_ms, .little);
+    std.mem.writeInt(u16, buf[27..29], @intCast(e.body.len), .little);
+    @memcpy(buf[29 .. 29 + e.body.len], e.body);
+    _ = log.append(.outbox, buf[0 .. 29 + e.body.len]) catch {};
+}
+
+/// Записать в лог погашение (ACK) записи outbox.
+fn persistOutboxAck(app: *App, cid: i64, msg_id: [16]u8) void {
+    const log = app.log orelse return;
+    var buf: [3 + 16]u8 = undefined;
+    buf[0] = 0;
+    std.mem.writeInt(u16, buf[1..3], @intCast(cid), .little);
+    @memcpy(buf[3 .. 3 + 16], &msg_id);
+    _ = log.append(.outbox, &buf) catch {};
+}
+
 fn loadContacts(app: *App) void {
     const log = app.log orelse return;
     const recs = log.readAll(.contact, app.alloc) catch return;
@@ -1117,6 +1290,48 @@ fn loadContacts(app: *App) void {
         const bundle: [64]u8 = rec[1 + nlen ..][0..64].*;
         const idx = app.eng.addContact(name, bundle) catch return;
         app.hb.put(@intCast(idx + 1), .{}) catch {};
+        // хвост адреса: [alen][host][port LE] (последняя запись побеждает)
+        const c = &app.eng.contacts.items[idx];
+        const tail = 1 + nlen + 64;
+        if (rec.len >= tail + 1) {
+            const alen: usize = rec[tail];
+            if (alen > 0 and alen <= 64 and rec.len >= tail + 1 + alen + 2) {
+                const port = std.mem.readInt(u16, rec[tail + 1 + alen ..][0..2], .little);
+                c.setAddr(rec[tail + 1 .. tail + 1 + alen], port);
+            }
+        }
+    }
+    // outbox: добавление/погашение в порядке записи лога
+    const obs = log.readAll(.outbox, app.alloc) catch return;
+    defer {
+        for (obs) |r| app.alloc.free(r);
+        app.alloc.free(obs);
+    }
+    for (obs) |rec| {
+        if (rec.len < 3) continue;
+        const cid: i64 = @intCast(std.mem.readInt(u16, rec[1..3], .little));
+        if (cid < 1 or cid > app.eng.contacts.items.len) continue;
+        if (rec[0] == 0) {
+            if (rec.len < 3 + 16) continue;
+            const msg_id: [16]u8 = rec[3 .. 3 + 16].*;
+            var i: usize = 0;
+            while (i < app.eng.outbox.items.len) {
+                if (app.eng.outbox.items[i].cid == cid and std.mem.eql(u8, &app.eng.outbox.items[i].msg_id, &msg_id)) {
+                    const old = app.eng.outbox.orderedRemove(i);
+                    app.alloc.free(old.body);
+                } else i += 1;
+            }
+            continue;
+        }
+        if (rec.len < 3 + 16 + 8 + 2) continue;
+        const msg_id: [16]u8 = rec[3 .. 3 + 16].*;
+        const ts_ms = std.mem.readInt(u64, rec[19..27], .little);
+        const blen = std.mem.readInt(u16, rec[27..29], .little);
+        if (blen == 0 or blen > 4096 or rec.len < 29 + blen) continue;
+        const body = app.alloc.dupe(u8, rec[29 .. 29 + blen]) catch continue;
+        app.eng.outbox.append(app.alloc, .{ .cid = cid, .msg_id = msg_id, .ts_ms = ts_ms, .body = body }) catch {
+            app.alloc.free(body);
+        };
     }
     // блокировки поверх загруженных контактов
     const blocks = log.readAll(.block, app.alloc) catch return;
@@ -1280,11 +1495,16 @@ fn tuiLoop(app: *App) !void {
                     } else {
                         const cid: i64 = @intCast(app.sel + 1);
                         const name = app.eng.contacts.items[app.sel].getName();
-                        app.eng.sendText(cid, input[0..input_len]) catch |e| {
+                        const r = app.eng.sendText(cid, input[0..input_len]) catch |e| {
                             var eb: [64]u8 = undefined;
                             const t = std.fmt.bufPrint(&eb, "! ошибка: {s}", .{@errorName(e)}) catch "!";
                             app.sysLineLocked(app.sel, t);
+                            return;
                         };
+                        if (r == .queued) {
+                            persistOutboxAdd(app);
+                            app.sysLineLocked(app.sel, "в очереди: доставлю, когда контакт появится");
+                        }
                         app.msgLineLocked(app.sel, .mine, name, input[0..input_len]);
                     }
                     app.unlock();
