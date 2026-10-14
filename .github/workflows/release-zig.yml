@@ -1,0 +1,47 @@
+name: release-zig
+
+# Zig core binaries on every zig-v* tag.
+on:
+  push:
+    tags: ["zig-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-linux
+          - os: macos-14
+            target: aarch64-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig 0.17.0
+        run: |
+          curl -sL https://ziglang.org/download/0.17.0/zig-${{ matrix.target }}-0.17.0.tar.xz -o zig.tar.xz
+          tar xJf zig.tar.xz
+          echo "$PWD/zig-${{ matrix.target }}-0.17.0" >> $GITHUB_PATH
+      - name: Test
+        working-directory: zig
+        run: zig build test
+      - name: Build
+        working-directory: zig
+        run: zig build -Doptimize=ReleaseFast
+      - name: Package
+        shell: bash
+        run: |
+          NAME="shopot-zig-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp zig-out/bin/shopot-zig "dist/$NAME/"
+          cp README.md "dist/$NAME/" 2>/dev/null || true
+          tar czf "$NAME.tar.gz" -C dist "$NAME"
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.tar.gz"
+          generate_release_notes: true

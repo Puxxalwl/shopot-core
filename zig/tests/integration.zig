@@ -1,0 +1,273 @@
+//! Full-stack integration: two sessions over an in-memory pipe pair —
+//! handshake, obfuscated stream, ratchet-sealed TEXT, reactions, presence.
+//! No network, no real time.
+const std = @import("std");
+const shopot = @import("shopot");
+const interfaces = shopot.interfaces;
+const handshake = shopot.crypto.handshake;
+const identity = shopot.crypto.identity;
+const envelope = shopot.proto.envelope;
+const session_mod = shopot.core.session;
+const obfuscate = shopot.net.obfuscate;
+
+// -------------------------------------------------------------- pipe pair
+const io_g = struct {
+    var stored: std.Io = undefined;
+    var alloc: std.mem.Allocator = undefined;
+};
+
+const Entry = struct {
+    data: []u8,
+    off: usize = 0,
+};
+
+const Pipe = struct {
+    mu: std.Io.Mutex = .init,
+    cv: std.Io.Condition = .init,
+    inbox: std.ArrayListUnmanaged(Entry) = .empty,
+    closed: bool = false,
+
+    fn push(self: *Pipe, data: []const u8, alloc: std.mem.Allocator) void {
+        self.mu.lockUncancelable(io_g.stored);
+        defer self.mu.unlock(io_g.stored);
+        if (self.closed) return;
+        const copy = alloc.dupe(u8, data) catch return;
+        self.inbox.append(alloc, .{ .data = copy }) catch {
+            alloc.free(copy);
+            return;
+        };
+        self.cv.signal(io_g.stored);
+    }
+
+    fn close(self: *Pipe) void {
+        self.mu.lockUncancelable(io_g.stored);
+        self.closed = true;
+        self.mu.unlock(io_g.stored);
+        self.cv.broadcast(io_g.stored);
+    }
+};
+
+const PipeConn = struct {
+    me: *Pipe,
+    peer_pipe: *Pipe,
+    alloc: std.mem.Allocator,
+
+    fn readAllImpl(ptr: *anyopaque, buf: []u8) interfaces.ConnError!void {
+        const self: *PipeConn = @ptrCast(@alignCast(ptr));
+        var done: usize = 0;
+        while (done < buf.len) {
+            self.me.mu.lockUncancelable(io_g.stored);
+            while (self.me.inbox.items.len == 0 and !self.me.closed)
+                self.me.cv.waitUncancelable(io_g.stored, &self.me.mu);
+            if (self.me.inbox.items.len == 0) {
+                self.me.mu.unlock(io_g.stored);
+                return interfaces.ConnError.Closed;
+            }
+            const ent = &self.me.inbox.items[0];
+            const avail = ent.data.len - ent.off;
+            const take = @min(buf.len - done, avail);
+            @memcpy(buf[done .. done + take], ent.data[ent.off .. ent.off + take]);
+            ent.off += take;
+            if (ent.off == ent.data.len) {
+                const popped = self.me.inbox.orderedRemove(0);
+                io_g.alloc.free(popped.data);
+            }
+            self.me.mu.unlock(io_g.stored);
+            done += take;
+        }
+    }
+
+    fn writeAllImpl(ptr: *anyopaque, buf: []const u8) interfaces.ConnError!void {
+        const self: *PipeConn = @ptrCast(@alignCast(ptr));
+        self.peer_pipe.push(buf, self.alloc);
+    }
+
+    fn closeImpl(ptr: *anyopaque) void {
+        const self: *PipeConn = @ptrCast(@alignCast(ptr));
+        self.me.close();
+    }
+
+    fn conn(self: *PipeConn) interfaces.Conn {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = interfaces.Conn.VTable{
+        .readAll = readAllImpl,
+        .writeAll = writeAllImpl,
+        .close = closeImpl,
+    };
+};
+
+fn pipePair(alloc: std.mem.Allocator) ![2]PipeConn {
+    const pa = try alloc.create(Pipe);
+    const pb = try alloc.create(Pipe);
+    pa.* = .{};
+    pb.* = .{};
+    const ca = PipeConn{ .me = pa, .peer_pipe = pb, .alloc = alloc };
+    const cb = PipeConn{ .me = pb, .peer_pipe = pa, .alloc = alloc };
+    return .{ ca, cb };
+}
+
+// -------------------------------------------------------------- harness
+const Harness = struct {
+    alloc: std.mem.Allocator,
+    texts: std.ArrayListUnmanaged([]u8) = .empty,
+    reacts: std.ArrayListUnmanaged(envelope.React) = .empty,
+    pings: std.ArrayListUnmanaged(u32) = .empty,
+
+    fn onEnvelope(ctx: *anyopaque, env: envelope.Envelope) void {
+        const self: *Harness = @ptrCast(@alignCast(ctx));
+        switch (env) {
+            .text => |t| {
+                const copy = self.alloc.dupe(u8, t.body) catch return;
+                self.texts.append(self.alloc, copy) catch {};
+            },
+            .react => |r| self.reacts.append(self.alloc, r) catch {},
+            .presence_ping => |p| self.pings.append(self.alloc, p.seq) catch {},
+            else => {},
+        }
+    }
+
+    fn onClosed(_: *anyopaque) void {}
+};
+
+fn wrapConn(_: *anyopaque, raw: interfaces.Conn, keys: handshake.SessionKeys, alloc: std.mem.Allocator) anyerror!interfaces.Conn {
+    var key: [32]u8 = undefined;
+    shopot.crypto.kdf.expand(keys.transcript, "shopot-obf-v3", &key);
+    const oc = try alloc.create(obfuscate.ObfConn);
+    oc.* = try obfuscate.ObfConn.init(alloc, std.testing.io, raw, &key);
+    if (obf_idx < 2) {
+        obf_tracker[obf_idx] = oc;
+        obf_idx += 1;
+    }
+    return obfuscate.obfConn(oc);
+}
+
+test "two sessions: handshake, sealed text, reaction, presence" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    io_g.stored = io;
+    io_g.alloc = alloc;
+    const id_a = try identity.Identity.fromSeed(filled(7));
+    const id_b = try identity.Identity.fromSeed(filled(9));
+
+    const pair = try pipePair(alloc);
+    var ca = pair[0];
+    var cb = pair[1];
+
+    var ha = Harness{ .alloc = alloc };
+    var hb = Harness{ .alloc = alloc };
+
+    var sb_opt: ?*session_mod.Session = null;
+    const th_b = try std.Thread.spawn(.{}, establishB, .{ alloc, cb.conn(), &id_b, id_a.bundle()[32..64].*, &hb, &sb_opt });
+
+    const sa = try session_mod.Session.establish(
+        alloc,
+        ca.conn(),
+        .initiator,
+        &id_a,
+        id_b.bundle()[32..64].*,
+        filled(1),
+        @ptrCast(&wrap_slot),
+        wrapConn,
+        .{ .ctx = &ha, .onEnvelope = Harness.onEnvelope, .onClosed = Harness.onClosed },
+        io,
+    );
+    th_b.join();
+    const sb = sb_opt orelse return error.ResponderFailed;
+
+    try sa.sendText("privet, b!");
+    try sb.sendText("privet, a!");
+    try waitTexts(&ha, "privet, a!"); // A receives what B sent
+    try waitTexts(&hb, "privet, b!"); // B receives what A sent
+
+    const msg_id: [16]u8 = @splat(3);
+    try sa.sendEnvelope(.{ .react = .{ .msg_id = msg_id, .op = envelope.react_add, .code = 4 } });
+    try waitReact(&hb);
+
+    try sa.sendEnvelope(.{ .presence_ping = .{ .seq = 42, .ts_ms = 1234567 } });
+    try waitPing(&hb, 42);
+
+    sa.close();
+    sb.close();
+    for (obf_tracker) |oc| {
+        if (oc) |o| {
+            o.deinit();
+            alloc.destroy(o);
+        }
+    }
+    alloc.destroy(sa);
+    alloc.destroy(sb);
+    ca.me.inbox.deinit(alloc);
+    cb.me.inbox.deinit(alloc);
+    alloc.destroy(ca.me);
+    alloc.destroy(cb.me);
+    for (ha.texts.items) |t| alloc.free(t);
+    for (hb.texts.items) |t| alloc.free(t);
+    ha.texts.deinit(alloc);
+    hb.texts.deinit(alloc);
+    ha.reacts.deinit(alloc);
+    hb.reacts.deinit(alloc);
+    ha.pings.deinit(alloc);
+    hb.pings.deinit(alloc);
+}
+
+var wrap_slot: u8 = 0;
+var obf_tracker: [2]?*obfuscate.ObfConn = .{ null, null };
+var obf_idx: usize = 0;
+
+fn establishB(
+    alloc: std.mem.Allocator,
+    conn: interfaces.Conn,
+    id_b: *const identity.Identity,
+    peer_sign: [32]u8,
+    hb: *Harness,
+    out: *?*session_mod.Session,
+) void {
+    out.* = session_mod.Session.establish(
+        alloc,
+        conn,
+        .responder,
+        id_b,
+        peer_sign,
+        filled(2),
+        @ptrCast(&wrap_slot),
+        wrapConn,
+        .{ .ctx = hb, .onEnvelope = Harness.onEnvelope, .onClosed = Harness.onClosed },
+        io_g.stored,
+    ) catch null;
+}
+
+fn filled(v: u8) [32]u8 {
+    const a: [32]u8 = @splat(v);
+    return a;
+}
+
+fn waitTexts(h: *Harness, want: []const u8) !void {
+    for (0..100) |_| {
+        for (h.texts.items) |t| {
+            if (std.mem.eql(u8, t, want)) return;
+        }
+        std.Io.sleep(io_g.stored, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn waitReact(h: *Harness) !void {
+    for (0..100) |_| {
+        if (h.reacts.items.len > 0) return;
+        std.Io.sleep(io_g.stored, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn waitPing(h: *Harness, seq: u32) !void {
+    for (0..100) |_| {
+        for (h.pings.items) |s| {
+            if (s == seq) return;
+        }
+        std.Io.sleep(io_g.stored, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    return error.TestUnexpectedResult;
+}
