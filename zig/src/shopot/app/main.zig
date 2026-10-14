@@ -16,6 +16,8 @@ const invite_mod = @import("invite.zig");
 const discover_mod = @import("discover.zig");
 const tui_mod = @import("tui.zig");
 const audio_mod = @import("audio.zig");
+const cli_srv = @import("cli_server.zig");
+const cli_mod = cli_srv;
 
 const usage =
     \\shopot-zig — шифрованный мессенджер (std-only Zig)
@@ -23,6 +25,9 @@ const usage =
     \\  init                        создать личность (~/.shopot/zig-seed, 0600)
     \\  id                          показать bundle и отпечаток
     \\  add <имя> <bundle-hex>      добавить контакт (hex 128 символов из `id`)
+    \\  chat                        интерактивный мессенджер (TUI) + CLI-апи
+    \\  serve                       демон без локального ввода (только CLI-апи:
+    \\                              UDS ~/.shopot/api.sock и C++-клиент 7788)
     \\  contacts                    список контактов
     \\  listen <addr:port> <id>     ждать этого контакта (сессия responder)
     \\  connect <addr:port> <id>    подключиться к контакту
@@ -100,7 +105,7 @@ const CallState = struct {
 };
 
 // ------------------------------------------------------------------ app
-const App = struct {
+pub const App = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
     id: *identity.Identity,
@@ -119,15 +124,27 @@ const App = struct {
     sel: usize = 0, // выбранный чат (индекс контакта)
     tz: i32 = 0, // смещение локальной TZ, сек
     tui: bool = false,
+    // ---- CLI-сервер (UDS-апи + мост для C++-клиента) ----
+    cli: ?*cli_srv.Server = null, // сервер (включён, когда != null)
+    cli_out: ?*cli_srv.Conn = null, // кому fb отдаёт ответы команд (под cli_mu)
+    cli_mu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // приёмник fb-ответов
 
     running: bool = true,
 
     /// Спин-блок: держится микросекунды (append в список), потоков мало.
-    fn lock(self: *App) void {
+    pub fn lock(self: *App) void {
         while (self.mu.swap(true, .acquire)) std.Thread.yield() catch {};
     }
-    fn unlock(self: *App) void {
+    pub fn unlock(self: *App) void {
         self.mu.store(false, .release);
+    }
+
+    /// Спин-лок cli_mu — приёмника ответов fb (тот же паттерн, что у mu).
+    pub fn cliLock(self: *App) void {
+        while (self.cli_mu.swap(true, .acquire)) std.Thread.yield() catch {};
+    }
+    pub fn cliUnlock(self: *App) void {
+        self.cli_mu.store(false, .release);
     }
 
     /// Время — прямой syscall: НЕ трогаем io, чтобы не конкурировать
@@ -217,39 +234,45 @@ fn onTextEv(ctx: *anyopaque, from: *const engine_mod.Contact, msg_id: [16]u8, _:
     _ = toHex(&hex_buf, &msg_id) catch {};
     hx = hex_buf[0..];
     const app: *App = @ptrCast(@alignCast(ctx));
+    const idx = contactIndexOf(app, from) orelse return;
     if (app.tui) {
-        const idx = contactIndexOf(app, from) orelse return;
         app.msgLineLocked(idx, .theirs, from.getName(), body);
-        return;
+    } else {
+        std.debug.print("\n<< [{s}] {s}  (msg {s})\n> ", .{ from.getName(), body, hx });
     }
-    std.debug.print("\n<< [{s}] {s}  (msg {s})\n> ", .{ from.getName(), body, hx });
+    cli_srv.fanoutMsgLocked(app, @intCast(idx + 1), from.getName(), body);
 }
 
 fn onReactionEv(ctx: *anyopaque, from: *const engine_mod.Contact, r: engine_mod.Reaction) void {
     var hex_buf: [32]u8 = undefined;
     const app: *App = @ptrCast(@alignCast(ctx));
+    const idx = contactIndexOf(app, from) orelse return;
+    var line: [128]u8 = undefined;
+    const t = std.fmt.bufPrint(&line, "реакция {d} на {s}", .{ r.code, toHex(&hex_buf, &r.msg_id) catch "?" }) catch return;
     if (app.tui) {
-        const idx = contactIndexOf(app, from) orelse return;
-        var line: [128]u8 = undefined;
-        const t = std.fmt.bufPrint(&line, "реакция {d} на {s}", .{ r.code, toHex(&hex_buf, &r.msg_id) catch "?" }) catch return;
         app.sysLineLocked(idx, t);
-        return;
+    } else {
+        std.debug.print("\n<< [{s}] {s}\n> ", .{ from.getName(), t });
     }
-    std.debug.print("\n<< [{s}] реакция {d} на {s}\n> ", .{ from.getName(), r.code, toHex(&hex_buf, &r.msg_id) catch "?" });
+    cli_srv.fanoutSysLocked(app, @intCast(idx + 1), from.getName(), t);
 }
 
 fn onPresenceEv(ctx: *anyopaque, from: *const engine_mod.Contact, online: bool, _: i64) void {
     const app: *App = @ptrCast(@alignCast(ctx));
+    const idx = contactIndexOf(app, from) orelse return;
     if (app.tui) {
-        const idx = contactIndexOf(app, from) orelse return;
         app.sysLineLocked(idx, if (online) "• online" else "• offline");
-        return;
+    } else {
+        std.debug.print("\n<< [{s}] {s}\n> ", .{ from.getName(), if (online) "online" else "offline" });
     }
-    std.debug.print("\n<< [{s}] {s}\n> ", .{ from.getName(), if (online) "online" else "offline" });
+    cli_srv.fanoutPresenceLocked(app, @intCast(idx + 1), from.getName(), online);
 }
 
-fn onBlockedEv(_: *anyopaque, from: *const engine_mod.Contact) void {
+fn onBlockedEv(ctx: *anyopaque, from: *const engine_mod.Contact) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const idx = contactIndexOf(app, from) orelse return;
     std.debug.print("\n<< [{s}] заблокировал вас\n> ", .{from.getName()});
+    cli_srv.fanoutSysLocked(app, @intCast(idx + 1), from.getName(), "заблокировал вас");
 }
 
 // ------------------------------------------------------------- звонки
@@ -278,6 +301,7 @@ fn onCallSignalEv(ctx: *anyopaque, from: *const engine_mod.Contact, op: u8, call
             } else {
                 std.debug.print("\n<< входящий звонок от {s}: answer {d} — принять, hangup — отклонить\n> ", .{ from.getName(), cid });
             }
+            cli_srv.fanoutSysLocked(app, cid, from.getName(), "входящий звонок — !answer принять, !hangup отклонить");
         },
         audio_mod.CallOp.accept => {
             const c = app.call orelse return;
@@ -290,6 +314,7 @@ fn onCallSignalEv(ctx: *anyopaque, from: *const engine_mod.Contact, op: u8, call
             } else {
                 std.debug.print("\n<< {s} ответил, линия открыта\n> ", .{from.getName()});
             }
+            cli_srv.fanoutSysLocked(app, c.cid, from.getName(), "линия открыта");
         },
         audio_mod.CallOp.reject => {
             const c = app.call orelse return;
@@ -395,6 +420,11 @@ fn endCallLocked(app: *App, why: []const u8) void {
     } else {
         std.debug.print("\n<< звонок: {s}\n> ", .{why});
     }
+    const cname = if (app.eng.contacts.items.len >= @as(usize, @intCast(cid)))
+        app.eng.contacts.items[@intCast(cid - 1)].getName()
+    else
+        "?";
+    cli_srv.fanoutSysLocked(app, cid, cname, why);
 }
 
 fn wrapConn(ctx: *anyopaque, raw: interfaces.Conn, keys: shopot.crypto.handshake.SessionKeys, alloc: std.mem.Allocator) anyerror!interfaces.Conn {
@@ -640,12 +670,16 @@ fn cmdAdd(app: *App, args: []const u8) !void {
     const trimmed = std.mem.trim(u8, args, " ");
     var name: []const u8 = "";
     var bundle: [64]u8 = undefined;
+    var addr_buf: [80]u8 = undefined;
     var addr: ?[]const u8 = null;
     if (std.mem.startsWith(u8, trimmed, "shopot1.")) {
         const inv = try invite_mod.decode(trimmed);
         name = inv.name();
         bundle = inv.bundle;
-        addr = inv.addr();
+        // inv.addr() — только хост: порт живёт отдельно, собираем "host:port"
+        if (inv.host_len > 0) {
+            addr = std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ inv.addr().?, inv.port }) catch return error.BadArgs;
+        }
     } else {
         var it = std.mem.tokenizeAny(u8, trimmed, " ");
         name = it.next() orelse return error.BadArgs;
@@ -1099,6 +1133,15 @@ fn tuiLoop(app: *App) !void {
 
 /// Сообщение для пользователя: в TUI — строка ленты, в REPL — печать.
 fn fb(app: *App, idx: ?usize, txt: []const u8) void {
+    // CLI-клиент ждёт ответа команды — отдаём ему, а не в терминал
+    {
+        app.cliLock();
+        defer app.cliUnlock();
+        if (app.cli_out) |c| {
+            c.writeText(txt);
+            return;
+        }
+    }
     if (app.tui) {
         app.lock();
         app.sysLineLocked(idx, txt);
@@ -1347,6 +1390,9 @@ fn renderTui(app: *App, input: []const u8, scroll: *u32, frame: []u8) usize {
                         sb.add(T.c.bold);
                         sb.add("я");
                         sb.add(T.c.reset);
+                        // колонка автора — фикс. 12, как у theirs: текст ровно
+                        var padme: [14]u8 = @splat(' ');
+                        sb.add(padme[0..11]);
                         sb.add("  ");
                     },
                     .theirs => {
@@ -1485,7 +1531,7 @@ fn renderTui(app: *App, input: []const u8, scroll: *u32, frame: []u8) usize {
     // ---------------- подсказки (вне рамки)
     W.put(frame, &n, T.c.dim);
     var hints: [256]u8 = undefined;
-    const hl = T.trunc(&hints, " enter отправить · tab чат · ↑↓ лента · Alt+c звонок · Alt+a принять · Alt+h сброс · Alt+b блок · /cmd · Ctrl+C выход", w - 1);
+    const hl = T.trunc(&hints, " enter отправить · tab чат · ↑↓ лента · /cmd · Alt+c звонок · Alt+a принять · Alt+h сброс · Alt+b блок", w - 1);
     W.put(frame, &n, hl);
     W.put(frame, &n, T.c.reset);
 
@@ -1515,7 +1561,7 @@ fn repl(app: *App) !void {
 }
 
 /// Исполнение команды REPL/TUI (возвращает false для выхода).
-fn execCmd(app: *App, trimmed: []const u8) bool {
+pub fn execCmd(app: *App, trimmed: []const u8) bool {
     var errbuf: [96]u8 = undefined;
     var it = std.mem.tokenizeAny(u8, trimmed, " ");
     const cmd = it.next() orelse return true;
@@ -1610,7 +1656,7 @@ pub fn main(start: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, cmd, "chat")) {
+    if (std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "serve")) {
         // потоки: rx-сессий, тикер presence, accept-loop — аллокатор общий
         var dbg_state = std.heap.DebugAllocator(.{ .thread_safe = true }){};
         const alloc = dbg_state.allocator();
@@ -1688,12 +1734,22 @@ pub fn main(start: std.process.Init) !void {
             }
         }
 
-        // интерактивный терминал — полноэкранный TUI; иначе — построчный REPL
+        // CLI-фронт-енды: UDS-апи + мост для C++-клиента MessagingApp
+        cli_srv.start(&app, home);
+
+        // интерактивный терминал — полноэкранный TUI; иначе — построчный REPL;
+        // serve — безлокальный демон для CLI-клиентов (UDS/C++)
         const is_tty = blk: {
             _ = std.posix.tcgetattr(0) catch break :blk false;
             break :blk true;
         };
-        if (is_tty) {
+        if (std.mem.eql(u8, cmd, "serve")) {
+            std.debug.print("serve: работаю без локального ввода, жду CLI-клиентов\n", .{});
+            while (app.running) {
+                const req: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
+                _ = std.os.linux.nanosleep(&req, null);
+            }
+        } else if (is_tty) {
             try tuiLoop(&app);
         } else {
             try repl(&app);

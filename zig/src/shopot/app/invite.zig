@@ -35,9 +35,11 @@ pub fn encode(buf: []u8, bundle: [64]u8, name: []const u8, addr_: ?[]const u8) E
     raw[0..64].* = bundle;
     raw[64] = @intCast(name.len);
     @memcpy(raw[65 .. 65 + name.len], name);
-    var b64: [112]u8 = undefined;
-    const enc_len = std.base64.url_safe_no_pad.Encoder.calcSize(raw.len);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(b64[0..enc_len], &raw);
+    // канонический размер: bundle + 1 + имя (без мусорного хвоста raw).
+    // b64 от максимума (97 байт) = 130 знаков — буфер с запасом.
+    var b64: [132]u8 = undefined;
+    const enc_len = std.base64.url_safe_no_pad.Encoder.calcSize(65 + name.len);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(b64[0..enc_len], raw[0 .. 65 + name.len]);
     var n: usize = 0;
     const addr_len: usize = if (addr_) |a| (if (a.len > 0) a.len + 1 else 0) else 0;
     if (buf.len < "shopot1.".len + enc_len + addr_len) return Error.BadCode;
@@ -56,6 +58,16 @@ pub fn encode(buf: []u8, bundle: [64]u8, name: []const u8, addr_: ?[]const u8) E
     return buf[0..n];
 }
 
+test "invite: имя макс. длины + адрес не переполняют буфер" {
+    var buf: [256]u8 = undefined;
+    var name: [max_name]u8 = @splat('a');
+    const code = try encode(&buf, @splat(7), &name, "192.168.100.100:65535");
+    // декод обратно: имя и адрес выживают
+    const inv = try decode(code);
+    try std.testing.expectEqualSlices(u8, &name, inv.name());
+    try std.testing.expectEqualStrings("192.168.100.100:65535", inv.addr().?);
+}
+
 /// Разбирает код (с префиксом shopot1. или без).
 pub fn decode(code: []const u8) Error!Invite {
     var s = code;
@@ -70,11 +82,13 @@ pub fn decode(code: []const u8) Error!Invite {
     var raw: [64 + 1 + max_name]u8 = undefined;
     const dec = std.base64.url_safe_no_pad.Decoder;
     const n = dec.calcSizeForSlice(s) catch return Error.BadCode;
-    if (n != raw.len) return Error.BadCode;
-    dec.decode(&raw, s) catch return Error.BadCode;
+    // канонический размер: bundle + 1 + имя (65..97 байт)
+    if (n < 65 + 1 or n > raw.len) return Error.BadCode;
+    dec.decode(raw[0..n], s) catch return Error.BadCode;
     inv.bundle = raw[0..64].*;
     const nl = raw[64];
     if (nl == 0 or nl > max_name) return Error.BadName;
+    if (65 + @as(usize, nl) != n) return Error.BadCode;
     inv.name_len = nl;
     @memcpy(inv.name_buf[0..nl], raw[65 .. 65 + nl]);
     if (host_part.len > 0) {
