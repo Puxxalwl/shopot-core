@@ -1,29 +1,18 @@
-//! CLI-сервер: внешние консольные фронт-енды поверх одного ядра shopot.
+//! CLI-сервер: UDS-апи поверх одного ядра shopot.
 //!
-//! 1) UDS-апи — сокет $HOME/.shopot/api.sock, построчный протокол (без JSON,
-//!    как весь проект): команды те же, что в REPL/TUI — msg/call/answer/
-//!    hangup/block/unblock/contacts/help... Голый текст = сообщение в
-//!    выбранный чат. Ответы на команды — произвольные строки (те же тексты,
-//!    что видит TUI). События ядра приходят строками с префиксами:
-//!      msg <cid> <имя> <текст>   — входящее сообщение
-//!      sys <cid> <текст>         — служебная строка (звонки, presence)
-//!      presence <cid> on|off     — контакт на связи / пропал
-//!    quit — закрыть соединение (не демон).
-//!
-//! 2) TCP 127.0.0.1:7788 — протокол терминального клиента MessagingApp
-//!    (C++, вендорен в cpp-cli/, НЕ модифицирован): один recv = одно
-//!    "name,text". Клиент глотает неизвестные "/"-команды (см. его switch),
-//!    поэтому команды ядра идут через '!'-префикс: "!call 1", "!answer",
-//!    "!block 1". Прочий текст — сообщение в выбранный чат. События
-//!    отдаются тем же форматом "name,text".
-//!
-//! Оба фронт-енда разделяют состояние ядра: отправка из CLI видна в TUI,
-//! события приходят всем подключённым CLI-клиентам.
+//! Сокет $HOME/.shopot/api.sock, построчный протокол (без JSON, как весь
+//! проект): команды те же, что в REPL/TUI — msg/call/answer/hangup/block/
+//! unblock/contacts/help... Голый текст = сообщение в выбранный чат.
+//! Ответы на команды — произвольные строки (те же тексты, что видит TUI).
+//! События ядра приходят строками с префиксами:
+//!   msg <cid> <имя> <текст>   — входящее сообщение
+//!   sys <cid> <текст>         — служебная строка (звонки, presence)
+//!   presence <cid> on|off     — контакт на связи / пропал
+//! quit — закрыть соединение (не демон).
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 const main = @import("main.zig");
-const tcp = @import("shopot").net.tcp;
 
 /// Максимум одной строки протокола (как REPL).
 pub const max_line = 2048;
@@ -58,15 +47,10 @@ fn rawRead(fd: posix.socket_t, buf: []u8) ?usize {
 
 pub const Conn = struct {
     fd: posix.socket_t,
-    /// true — протокол MessagingApp (TCP), false — UDS-апи.
-    cpp: bool,
     srv: *Server,
     /// Сериализует записи в сокет (ответы из fb + события из движка).
     /// Спин-блок: запись микросекундная, конкурентов мало.
     wmu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Имя C++-клиента из первого кадра "name,joined the chat!".
-    name_buf: [32]u8 = @splat(0),
-    name: []const u8 = "",
 
     fn sendRaw(self: *Conn, bytes: []const u8) void {
         while (self.wmu.swap(true, .acquire)) std.Thread.yield() catch {};
@@ -74,37 +58,29 @@ pub const Conn = struct {
         _ = rawWrite(self.fd, bytes);
     }
 
-    /// Строка-ответ на команду (приходит из fb). C++-клиенту — от "shopot".
+    /// Строка-ответ на команду (приходит из fb).
     pub fn writeText(self: *Conn, txt: []const u8) void {
         var buf: [max_line + 16]u8 = undefined;
-        const t = if (self.cpp)
-            std.fmt.bufPrint(&buf, "shopot,{s}", .{cut(txt, max_line)}) catch return
-        else
-            std.fmt.bufPrint(&buf, "{s}\n", .{cut(txt, max_line)}) catch return;
+        const t = std.fmt.bufPrint(&buf, "{s}\n", .{cut(txt, max_line)}) catch return;
         self.sendRaw(t);
     }
 
     /// Событие: входящее сообщение контакта.
     pub fn evMsg(self: *Conn, cid: i64, name: []const u8, body: []const u8) void {
         var buf: [max_line + 16]u8 = undefined;
-        const t = if (self.cpp)
-            std.fmt.bufPrint(&buf, "{s},{s}", .{ cut(name, 31), cut(body, max_line - 32) }) catch return
-        else
-            std.fmt.bufPrint(&buf, "msg {d} {s} {s}\n", .{ cid, cut(name, 31), cut(body, max_line - 48) }) catch return;
+        const t = std.fmt.bufPrint(&buf, "msg {d} {s} {s}\n", .{ cid, cut(name, 31), cut(body, max_line - 48) }) catch return;
         self.sendRaw(t);
     }
 
     /// Событие: служебная строка (звонки, presence-перемены).
-    pub fn evSys(self: *Conn, cid: i64, name: []const u8, body: []const u8) void {
-        if (self.cpp) return self.evMsg(cid, name, body);
+    pub fn evSys(self: *Conn, cid: i64, body: []const u8) void {
         var buf: [256]u8 = undefined;
         const t = std.fmt.bufPrint(&buf, "sys {d} {s}\n", .{ cid, cut(body, 220) }) catch return;
         self.sendRaw(t);
     }
 
     /// Событие: контакт на связи / пропал.
-    pub fn evPresence(self: *Conn, cid: i64, name: []const u8, online: bool) void {
-        if (self.cpp) return self.evMsg(cid, name, if (online) "online" else "offline");
+    pub fn evPresence(self: *Conn, cid: i64, online: bool) void {
         var buf: [96]u8 = undefined;
         const t = std.fmt.bufPrint(&buf, "presence {d} {s}\n", .{ cid, if (online) "on" else "off" }) catch return;
         self.sendRaw(t);
@@ -152,14 +128,16 @@ pub fn fanoutMsgLocked(app: *main.App, cid: i64, name: []const u8, body: []const
 
 /// Служебная строка всем CLI-клиентам (ВЫЗЫВАТЬ ПОД app.mu).
 pub fn fanoutSysLocked(app: *main.App, cid: i64, name: []const u8, body: []const u8) void {
+    _ = name; // имя не нужно UDS-событию sys <cid> <текст>
     const srv = app.cli orelse return;
-    for (srv.conns.items) |c| c.evSys(cid, name, body);
+    for (srv.conns.items) |c| c.evSys(cid, body);
 }
 
 /// Presence-перемена всем CLI-клиентам (ВЫЗЫВАТЬ ПОД app.mu).
 pub fn fanoutPresenceLocked(app: *main.App, cid: i64, name: []const u8, online: bool) void {
+    _ = name;
     const srv = app.cli orelse return;
-    for (srv.conns.items) |c| c.evPresence(cid, name, online);
+    for (srv.conns.items) |c| c.evPresence(cid, online);
 }
 
 /// Выполнить команду ядра с перенаправлением ответов fb в соединение.
@@ -222,44 +200,6 @@ fn handleUdsLine(srv: *Server, conn: *Conn, line: []const u8) bool {
     return true;
 }
 
-/// Один кадр C++-клиента: "name,text". Возвращает false — закрыть соединение.
-fn handleCppChunk(srv: *Server, conn: *Conn, chunk: []const u8) bool {
-    const app = srv.app;
-    const comma = std.mem.indexOfScalar(u8, chunk, ',') orelse return true;
-    const name = chunk[0..comma];
-    const text = chunk[comma + 1 ..];
-    if (std.mem.eql(u8, text, "joined the chat!")) {
-        if (name.len > 0) {
-            const n = @min(name.len, conn.name_buf.len - 1);
-            @memcpy(conn.name_buf[0..n], name[0..n]);
-            conn.name = conn.name_buf[0..n];
-        }
-        conn.writeText("подключён к shopot. '!' — команды (!help), остальное — сообщение в чат");
-        return true;
-    }
-    if (std.mem.eql(u8, text, "disconnected!")) return false;
-    if (text.len > 0 and text[0] == '!') {
-        const cmd = text[1..];
-        var it = std.mem.tokenizeAny(u8, cmd, " ");
-        const first = it.next() orelse return true;
-        if (std.mem.eql(u8, first, "quit") or std.mem.eql(u8, first, "q")) {
-            conn.writeText("bye");
-            return false;
-        }
-        runCmd(app, conn, cmd);
-        return true;
-    }
-    if (text.len == 0) return true;
-    const cid = selectedCid(app) orelse {
-        conn.writeText("! нет контактов — add <код> сначала");
-        return true;
-    };
-    var buf: [max_line]u8 = undefined;
-    const t = std.fmt.bufPrint(&buf, "msg {d} {s}", .{ cid, cut(text, max_line - 24) }) catch return true;
-    runCmd(app, conn, t);
-    return true;
-}
-
 /// Поток одного CLI-клиента: читает, разбирает, исполняет.
 fn connLoop(srv: *Server, conn: *Conn) void {
     const app = srv.app;
@@ -270,11 +210,6 @@ fn connLoop(srv: *Server, conn: *Conn) void {
         const n = rawRead(conn.fd, &rbuf) orelse break;
         if (n == 0) break;
         const data = rbuf[0..n];
-        if (conn.cpp) {
-            // MessagingApp: один recv = одно "name,text" (как у апстрима)
-            if (!handleCppChunk(srv, conn, data)) break :outer;
-            continue;
-        }
         // UDS: построчно, хвост без \n копится
         var pos: usize = 0;
         while (pos < data.len) {
@@ -302,13 +237,13 @@ fn connLoop(srv: *Server, conn: *Conn) void {
     srv.removeConn(conn);
 }
 
-fn spawnConn(srv: *Server, fd: posix.socket_t, cpp: bool) void {
+fn spawnConn(srv: *Server, fd: posix.socket_t) void {
     const app = srv.app;
     const c = app.alloc.create(Conn) catch {
         _ = linux.close(fd);
         return;
     };
-    c.* = .{ .fd = fd, .cpp = cpp, .srv = srv };
+    c.* = .{ .fd = fd, .srv = srv };
     srv.addConn(c);
     const th = std.Thread.spawn(.{}, struct {
         fn go(s: *Server, cc: *Conn) void {
@@ -325,27 +260,11 @@ fn udsAcceptLoop(srv: *Server, lfd: posix.socket_t) void {
     while (srv.app.running) {
         const rc = linux.accept4(lfd, null, null, 0);
         if (linux.errno(rc) != .SUCCESS) continue;
-        spawnConn(srv, @intCast(rc), false);
+        spawnConn(srv, @intCast(rc));
     }
 }
 
-fn tcpAcceptLoop(srv: *Server, l: *tcp.Listener) void {
-    var fails: u32 = 0;
-    while (srv.app.running) {
-        const tc = l.accept(srv.app.alloc) catch {
-            fails += 1;
-            if (fails > 8) break;
-            continue;
-        };
-        fails = 0;
-        // забираем сырой fd: протокол CLI обслуживаем сами
-        const fd = tc.fd;
-        srv.app.alloc.destroy(tc);
-        spawnConn(srv, fd, true);
-    }
-}
-
-/// Поднять CLI-сервер: UDS-сокет + TCP-мост для C++-клиента.
+/// Поднять CLI-сервер: UDS-сокет $HOME/.shopot/api.sock.
 /// Вызывается один раз при старте chat/serve (до старта потоков фронт-енда).
 pub fn start(app: *main.App, home: []const u8) void {
     if (home.len == 0) return;
@@ -391,34 +310,4 @@ pub fn start(app: *main.App, home: []const u8) void {
     };
     ut.detach();
     std.debug.print("cli-апи: uds {s}\n", .{sock_path});
-
-    // --- TCP для C++-клиента (MessagingApp) ---
-    var port: u16 = 0;
-    var lsn: ?tcp.Listener = null;
-    var p: u16 = 7788;
-    while (p < 7790) : (p += 1) {
-        var ab: [24]u8 = undefined;
-        const a = std.fmt.bufPrint(&ab, "127.0.0.1:{d}", .{p}) catch break;
-        if (tcp.listen(a)) |l| {
-            lsn = l;
-            port = p;
-            break;
-        } else |_| {}
-    }
-    if (lsn) |l| {
-        const lp = app.alloc.create(tcp.Listener) catch return;
-        lp.* = l;
-        const tt = std.Thread.spawn(.{}, struct {
-            fn go(s: *Server, ll: *tcp.Listener) void {
-                tcpAcceptLoop(s, ll);
-            }
-        }.go, .{ srv, lp }) catch {
-            app.alloc.destroy(lp);
-            return;
-        };
-        tt.detach();
-        std.debug.print("c++-клиент: ./messagingApp {d} 127.0.0.1 (cpp-cli/)\n", .{port});
-    } else {
-        std.debug.print("c++-клиент: порты 7788-7789 заняты\n", .{});
-    }
 }

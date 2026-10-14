@@ -13,6 +13,8 @@
 //!   PRESENCE_PONG 0x21: seq: u32, ts_peer_ms: u64
 //!   CALL_SIGNAL   0x30: op: u8, call_id: [16]u8
 //!   CALL_AUDIO    0x31: seq: u32, data: u16 + байты (≤ 1024)
+//!   JOIN          0x40: bundle: [64]u8, name: u8 + байты (≤ 32),
+//!                       sig: [64]u8, hmac: [32]u8
 
 const std = @import("std");
 const codec = @import("codec.zig");
@@ -33,7 +35,16 @@ pub const Tag = enum(u8) {
     call_signal = 0x30,
     /// Аудиокадр звонка.
     call_audio = 0x31,
+    /// JOIN: предъявление одностороннего инвайта (HMAC по секрету кода).
+    join = 0x40,
 };
+
+/// Максимум длины имени в JOIN.
+pub const max_join_name = 32;
+/// Длина Ed25519-подписи в JOIN.
+pub const join_sig_len = 64;
+/// Длина HMAC-SHA256 в JOIN.
+pub const join_hmac_len = 32;
 
 /// REACT.op: добавить реакцию.
 pub const react_add: u8 = 1;
@@ -117,6 +128,21 @@ pub const CallAudio = struct {
     data: []const u8,
 };
 
+/// JOIN (0x40): держатель инвайт-кода доказывает право на подключение.
+/// Отправляется первым конвертом сразу после рукопожатия.
+pub const Join = struct {
+    /// Полный bundle подключающегося: enc_pk || sign_pk.
+    bundle: [64]u8,
+    /// Имя подключающегося, ≤ 32 байтов; срез входного буфера после decode.
+    name: []const u8,
+    /// Ed25519-подпись подписавшего над transcript рукопожатия —
+    /// связывает bundle с ключами сессии (анти-MITM).
+    sig: [join_sig_len]u8,
+    /// HMAC-SHA256(invite_secret, transcript) — доказательство держателя
+    /// кода; сверяется по реестру секретов приглашающего.
+    hmac: [join_hmac_len]u8,
+};
+
 /// Конверт протокола v3: один из семи кадров.
 pub const Envelope = union(enum) {
     /// TEXT (0x10).
@@ -133,6 +159,8 @@ pub const Envelope = union(enum) {
     call_signal: CallSignal,
     /// CALL_AUDIO (0x31).
     call_audio: CallAudio,
+    /// JOIN (0x40).
+    join: Join,
 };
 
 /// Ошибки кодирования: мал буфер или payload превышает максимум протокола.
@@ -146,6 +174,7 @@ pub fn encodedLen(e: Envelope) usize {
         .block_notice => 2,
         .presence_ping, .presence_pong => 1 + 4 + 8,
         .call_audio => |m| 1 + 4 + 2 + m.data.len,
+        .join => |m| 1 + 64 + 1 + m.name.len + join_sig_len + join_hmac_len,
     };
 }
 
@@ -192,6 +221,15 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
             try w.put(@backingInt(Tag.call_audio));
             try w.putInt(u32, m.seq);
             try w.putBytes(m.data);
+        },
+        .join => |m| {
+            if (m.name.len > max_join_name) return error.TooBig;
+            try w.put(@backingInt(Tag.join));
+            try w.putFixed(&m.bundle);
+            try w.put(@intCast(m.name.len));
+            try w.putFixed(m.name);
+            try w.putFixed(&m.sig);
+            try w.putFixed(&m.hmac);
         },
     }
     return w.buf[0..w.pos];
@@ -245,6 +283,16 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
                 if (data.len > max_audio_data) return error.BadLen;
                 break :blk data;
             },
+        } },
+        @backingInt(Tag.join) => .{ .join = .{
+            .bundle = (try r.getFixed(64))[0..64].*,
+            .name = blk: {
+                const nl = try r.getU8();
+                if (nl == 0 or nl > max_join_name) return error.BadLen;
+                break :blk try r.getFixed(nl);
+            },
+            .sig = (try r.getFixed(join_sig_len))[0..join_sig_len].*,
+            .hmac = (try r.getFixed(join_hmac_len))[0..join_hmac_len].*,
         } },
         else => return error.UnknownTag,
     };
@@ -488,4 +536,23 @@ test "encode: слишком маленький буфер -> NoSpace" {
     try testing.expectError(error.NoSpace, encode(buf[0..0], sampleText()));
     // BLOCK_NOTICE занимает 2 байта — в один байт не влезает.
     try testing.expectError(error.NoSpace, encode(buf[0..1], .{ .block_notice = .{ .reason = 0 } }));
+}
+
+test "envelope: JOIN roundtrip" {
+    var buf: [max_encoded_len]u8 = undefined;
+    const e = Envelope{ .join = .{
+        .bundle = filled(64, 0x5A),
+        .name = "mom",
+        .sig = filled(64, 0x77),
+        .hmac = filled(32, 0x33),
+    } };
+    const bytes = try encode(&buf, e);
+    try testing.expectEqual(1 + 64 + 1 + 3 + 64 + 32, bytes.len);
+    const back = try decode(bytes);
+    try testing.expectEqualSlices(u8, &filled(64, 0x5A), &back.join.bundle);
+    try testing.expectEqualStrings("mom", back.join.name);
+    try testing.expectEqualSlices(u8, &filled(64, 0x77), &back.join.sig);
+    try testing.expectEqualSlices(u8, &filled(32, 0x33), &back.join.hmac);
+    // мусорный хвост — BadLen
+    try testing.expectError(error.Truncated, decode(bytes[0 .. bytes.len - 1]));
 }

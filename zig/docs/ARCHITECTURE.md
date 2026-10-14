@@ -9,16 +9,16 @@
 4. Один смысл — один файл. Модуль импортирует только core/interfaces.zig, не соседей.
 
 ## Слои (сверху вниз)
-- app/    REPL (listen/connect/msg/react/block/call)                [lead]
-- core/   engine (контакты, блокировки, dispatch), session          [lead]
-- proto/  бинарные конверты, кодек без аллокаций                    [proto-agent]
-- crypto/ identity, handshake, ratchet, call_keys, aead, pad        [crypto-agent]
-- net/    транспорт TCP/UDS, обфускация потока, heartbeat           [net-agent]
-- store/  шифрованный append-only лог                               [store-agent]
+- app/    REPL/TUI/CLI-сервер (listen/connect/msg/react/block/call)
+- core/   engine (контакты, блокировки, dispatch), session
+- proto/  бинарные конверты, кодек без аллокаций
+- crypto/ identity, handshake, ratchet, call_keys, aead, pad
+- net/    транспорт TCP, обфускация потока, heartbeat
+- store/  шифрованный append-only лог
 
 ## Поток данных сообщения
 sendText -> envelope.encode (буфер на стеке) -> Conn.writeAll
-(обфускация: pad до класса размера + ChaCha20Poly1305 кадра) -> TCP/UDS.
+(обфускация: pad до класса размера + ChaCha20Poly1305 кадра) -> TCP.
 Приём: Conn.readAll -> decode -> Engine.dispatch -> блокировки -> callbacks.
 
 ## Потоки

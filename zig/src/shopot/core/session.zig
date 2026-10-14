@@ -172,6 +172,32 @@ pub const Session = struct {
         return finishEstablish(alloc, conn, keys, .responder, wrap_ctx, wrap, ev, io);
     }
 
+    /// Рукопожатие без опознания (pending-join): инициатор неизвестен,
+    /// подпись m3 не проверяется — личность и право на подключение
+    /// доказываются первым конвертом JOIN поверх поднятой сессии.
+    /// Вызывающий обязан закрыть сессию, если валидный JOIN не пришёл.
+    pub fn establishPending(
+        alloc: std.mem.Allocator,
+        conn: interfaces.Conn,
+        m1: []const u8,
+        my_id: *const identity_mod.Identity,
+        eph_seed: [32]u8,
+        wrap_ctx: *anyopaque,
+        wrap: WrapFn,
+        ev: Events,
+        io: std.Io,
+    ) SessionError!*Session {
+        if (m1.len != handshake.m1_len) return SessionError.HandshakeFailed;
+        var m2: [handshake.m2_len]u8 = undefined;
+        var m3: [handshake.m3_len]u8 = undefined;
+        var hs = handshake.Responder.recv1(&m2, my_id, m1[0..handshake.m1_len], eph_seed) catch
+            return SessionError.HandshakeFailed;
+        writeFrame(conn, &m2) catch return SessionError.Closed;
+        _ = readFrame(conn, &m3) catch return SessionError.Closed;
+        const keys = hs.recv3(&m3, null) catch return SessionError.HandshakeFailed;
+        return finishEstablish(alloc, conn, keys, .responder, wrap_ctx, wrap, ev, io);
+    }
+
     /// Общий хвост establish: wrap, ratchet-цепочки, Session, rx-поток.
     fn finishEstablish(
         alloc: std.mem.Allocator,

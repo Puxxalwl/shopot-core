@@ -202,6 +202,9 @@ pub const Engine = struct {
             .call_audio => |ca| {
                 if (self.ev.onCallAudio) |cb| cb(self.ev.ctx, c, ca.seq, ca.data);
             },
+            // JOIN обрабатывается слоем приложения ДО dispatch (pending-сессии);
+            // сюда попадает только повторный кадр на уже промоутнутой сессии
+            .join => {},
         }
     }
 };

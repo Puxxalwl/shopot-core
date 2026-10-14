@@ -230,9 +230,10 @@ pub const Responder = struct {
         return self;
     }
 
-    /// Обрабатывает m3 (проверяет sig по `peer_sign_public`),
-    /// возвращает сессионные ключи.
-    pub fn recv3(self: *Responder, m3: []const u8, peer_sign_public: [32]u8) Error!SessionKeys {
+    /// Обрабатывает m3. peer_sign_public == null — режим pending-join:
+    /// подпись НЕ проверяется (контакт неизвестен), личность доказывается
+    /// JOIN-конвертом поверх сессии. Возвращает сессионные ключи.
+    pub fn recv3(self: *Responder, m3: []const u8, peer_sign_public: ?[32]u8) Error!SessionKeys {
         if (m3.len != m3_len) return error.BadLength;
 
         // открыть box2: init_enc_pk || sig_i (ad = h3)
@@ -243,7 +244,9 @@ pub const Responder = struct {
         @memset(&payload, 0);
 
         // подпись инициатора над транскриптом h3
-        try identity.Identity.verify(peer_sign_public, &self.h, sig_i);
+        if (peer_sign_public) |pk| {
+            try identity.Identity.verify(pk, &self.h, sig_i);
+        }
 
         // транскрипт после m3
         self.h = hashParts(&[_][]const u8{ &self.h, m3 });

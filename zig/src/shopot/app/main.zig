@@ -24,10 +24,11 @@ const usage =
     \\
     \\  init                        создать личность (~/.shopot/zig-seed, 0600)
     \\  id                          показать bundle и отпечаток
-    \\  add <имя> <bundle-hex>      добавить контакт (hex 128 символов из `id`)
+    \\  invite [имя] [addr]         односторонний код: держатель делает add
+    \\  add <код|bundle-hex> [имя]  добавить контакт (код — одной командой)
     \\  chat                        интерактивный мессенджер (TUI) + CLI-апи
     \\  serve                       демон без локального ввода (только CLI-апи:
-    \\                              UDS ~/.shopot/api.sock и C++-клиент 7788)
+    \\                              UDS ~/.shopot/api.sock)
     \\  contacts                    список контактов
     \\  listen <addr:port> <id>     ждать этого контакта (сессия responder)
     \\  connect <addr:port> <id>    подключиться к контакту
@@ -124,10 +125,16 @@ pub const App = struct {
     sel: usize = 0, // выбранный чат (индекс контакта)
     tz: i32 = 0, // смещение локальной TZ, сек
     tui: bool = false,
-    // ---- CLI-сервер (UDS-апи + мост для C++-клиента) ----
+    // ---- CLI-сервер (UDS-апи) ----
     cli: ?*cli_srv.Server = null, // сервер (включён, когда != null)
     cli_out: ?*cli_srv.Conn = null, // кому fb отдаёт ответы команд (под cli_mu)
     cli_mu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // приёмник fb-ответов
+
+    // ---- Односторонние инвайты (v2) ----
+    /// Выданные приглашения: секрет ждёт предъявителя JOIN-конвертом.
+    invites: [4]InviteReg = @splat(.{}),
+    /// JOIN-данные по cid: отправить первым конвертом после рукопожатия.
+    join_map: std.AutoHashMapUnmanaged(i64, JoinInfo) = .empty,
 
     running: bool = true,
 
@@ -177,6 +184,11 @@ pub const App = struct {
     fn bindSession(self: *App, cid: i64, s: *session_mod.Session, sc: *SessCtx) !void {
         self.lock();
         defer self.unlock();
+        return self.bindSessionLocked(cid, s, sc);
+    }
+
+    /// bind без взятия лока — вызывать ПОД self.mu.
+    fn bindSessionLocked(self: *App, cid: i64, s: *session_mod.Session, sc: *SessCtx) !void {
         if (self.eng.sessions.get(cid)) |old| {
             old.close();
             self.eng.alloc.destroy(old);
@@ -194,14 +206,41 @@ pub const App = struct {
     }
 };
 
+/// Выданное одностороннее приглашение (реестр в App.invites).
+const InviteReg = struct {
+    secret: [invite_mod.secret_len]u8 = @splat(0),
+    created_ms: i64 = 0,
+    /// true — код уже redeemed (секрет погашен).
+    used: bool = false,
+};
+
+/// JOIN-данные, которые отправим после установления сессии.
+const JoinInfo = struct {
+    secret: [invite_mod.secret_len]u8 = @splat(0),
+    /// Моё имя — его увидит приглашающий.
+    name_buf: [32]u8 = @splat(0),
+    name_len: u8 = 0,
+
+    fn name(self: *const JoinInfo) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
 const SessCtx = struct {
     app: *App,
     cid: i64,
+    /// Сессия pending-join (cid == -1): связка для промоушена после JOIN.
+    s: ?*session_mod.Session = null,
 };
 
 fn envIn(ctx: *anyopaque, env: envelope.Envelope) void {
     const sc: *SessCtx = @ptrCast(@alignCast(ctx));
     const app = sc.app;
+    if (sc.cid == -1) {
+        // pending-join: единственный допустимый конверт — JOIN
+        handleJoinEnvelope(sc, env);
+        return;
+    }
     const now = app.nowMs();
     app.lock();
     defer app.unlock();
@@ -214,6 +253,81 @@ fn envIn(ctx: *anyopaque, env: envelope.Envelope) void {
         }
     }
     app.eng.dispatch(sc.cid, env);
+}
+
+/// JOIN на pending-сессии (sc.cid == -1): подпись привязывает bundle
+/// заявителя к транскрипту (ключам сессии), HMAC доказывает держателя
+/// инвайт-кода. Валидно — контакт добавляется, сессия биндится.
+fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
+    const app = sc.app;
+    const sess = sc.s orelse return;
+    const j = switch (env) {
+        .join => |j| j,
+        else => {
+            sess.close();
+            return;
+        },
+    };
+    const transcript = sess.keys.transcript;
+    // 1) подпись: bundle заявителя привязан к ключам этой сессии
+    identity.Identity.verify(j.bundle[32..64].*, &transcript, j.sig) catch {
+        sess.close();
+        return;
+    };
+    var failed = false;
+    var cid: i64 = 0;
+    {
+        app.lock();
+        defer app.unlock();
+        if (sc.cid != -1) return; // уже промоутнут (повторный кадр)
+        // 2) HMAC: секрет одного из живых (не погашенных) приглашений
+        var matched: ?usize = null;
+        for (&app.invites, 0..) |*reg, i| {
+            if (reg.used) continue;
+            var mac: [32]u8 = undefined;
+            std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &transcript, &reg.secret);
+            if (std.mem.eql(u8, &mac, &j.hmac)) {
+                matched = i;
+                break;
+            }
+        }
+        if (matched == null) {
+            failed = true;
+        } else {
+            app.invites[matched.?].used = true;
+            if (contactIdByBundle(app, j.bundle)) |existing| {
+                cid = existing; // переподключение держателем кода
+            } else {
+                const ni = app.eng.addContact(j.name, j.bundle) catch {
+                    failed = true;
+                    return;
+                };
+                cid = @intCast(ni + 1);
+                app.hb.put(cid, .{}) catch {};
+            }
+            if (!failed) {
+                sc.cid = cid;
+                app.bindSessionLocked(cid, sess, sc) catch {
+                    failed = true;
+                };
+            }
+        }
+    }
+    if (failed) {
+        sess.close();
+        return;
+    }
+    var msg: [96]u8 = undefined;
+    app.lock();
+    defer app.unlock();
+    const line = std.fmt.bufPrint(&msg, "контакт {s} подключился по инвайту (id {d})", .{ app.eng.contacts.items[@intCast(cid - 1)].getName(), cid }) catch return;
+    if (app.tui) {
+        app.sysLineLocked(@intCast(cid - 1), line);
+    } else {
+        std.debug.print("\n<< {s}\n> ", .{line});
+    }
+    cli_srv.fanoutSysLocked(app, cid, "", line);
+    cli_srv.fanoutPresenceLocked(app, cid, "", true);
 }
 
 fn onClosed(ctx: *anyopaque) void {
@@ -301,7 +415,7 @@ fn onCallSignalEv(ctx: *anyopaque, from: *const engine_mod.Contact, op: u8, call
             } else {
                 std.debug.print("\n<< входящий звонок от {s}: answer {d} — принять, hangup — отклонить\n> ", .{ from.getName(), cid });
             }
-            cli_srv.fanoutSysLocked(app, cid, from.getName(), "входящий звонок — !answer принять, !hangup отклонить");
+            cli_srv.fanoutSysLocked(app, cid, from.getName(), "входящий звонок — answer принять, hangup отклонить");
         },
         audio_mod.CallOp.accept => {
             const c = app.call orelse return;
@@ -540,11 +654,13 @@ fn linkerLoop(app: *App) void {
             app.lock();
             const linked = app.eng.sessions.get(cid) != null;
             const blocked = app.eng.contacts.items[@intCast(cid - 1)].blocked;
+            const join_due = app.join_map.contains(cid);
             app.unlock();
             if (linked or blocked) continue;
-            // инициатор — сторона с меньшим bundle (детерминизм, без гонки)
+            // инициатор — сторона с меньшим bundle (детерминизм, без гонки);
+            // держатель инвайт-кода инициирует ВСЕГДА: приглашающий его не знает
             const i_init = std.mem.order(u8, &my_bundle, &a.bundle) == .lt;
-            if (!i_init) continue;
+            if (!i_init and !join_due) continue;
             var ab: [32]u8 = undefined;
             const addr = discover_mod.fmtAddr(&ab, a.ip, a.port);
             establishTo(app, addr, cid, .initiator) catch continue;
@@ -570,6 +686,19 @@ fn identifyCb(ctx: *anyopaque, enc_pk: [32]u8) ?session_mod.Session.IdentifyResu
         }
     }
     return null;
+}
+
+/// Окно pending-join: 3 с на валидный JOIN, иначе сессия закрывается.
+fn joinTimeoutWatch(sc: *SessCtx) void {
+    const sleep3: std.os.linux.timespec = .{ .sec = 3, .nsec = 0 };
+    _ = std.os.linux.nanosleep(&sleep3, null);
+    const app = sc.app;
+    app.lock();
+    const still_pending = sc.cid == -1;
+    app.unlock();
+    if (still_pending) {
+        if (sc.s) |sp| sp.close();
+    }
 }
 
 fn autoAcceptLoop(app: *App, listener: *tcp.Listener) void {
@@ -612,7 +741,50 @@ fn autoAcceptLoop(app: *App, listener: *tcp.Listener) void {
             }
         }
         if (found_cid < 0) {
-            tc.deinit();
+            // держатель инвайт-кода: поднимаем pending-сессию без опознания
+            app.lock();
+            const has_invite = blk: {
+                for (&app.invites) |*reg| {
+                    if (!reg.used and reg.created_ms != 0) break :blk true;
+                }
+                break :blk false;
+            };
+            app.unlock();
+            if (has_invite) {
+                var eph2: [32]u8 = undefined;
+                app.io.random(&eph2);
+                const sc = app.alloc.create(SessCtx) catch {
+                    tc.deinit();
+                    continue;
+                };
+                sc.* = .{ .app = app, .cid = -1, .s = null };
+                const sp = session_mod.Session.establishPending(
+                    app.alloc,
+                    tc.conn(),
+                    &m1,
+                    app.id,
+                    eph2,
+                    app,
+                    wrapConn,
+                    .{ .ctx = sc, .onEnvelope = envIn, .onClosed = onClosed },
+                    app.io,
+                ) catch {
+                    app.alloc.destroy(sc);
+                    tc.deinit();
+                    continue;
+                };
+                sc.s = sp;
+                // окно 3 с: нет валидного JOIN — закрыть
+                const tt = std.Thread.spawn(.{}, joinTimeoutWatch, .{sc}) catch {
+                    sp.close();
+                    app.alloc.destroy(sc);
+                    tc.deinit();
+                    continue;
+                };
+                tt.detach();
+            } else {
+                tc.deinit();
+            }
             continue;
         }
         var eph: [32]u8 = undefined;
@@ -661,18 +833,45 @@ fn cmdInvite(app: *App, args: []const u8) !void {
     var it = std.mem.tokenizeAny(u8, args, " ");
     const name = it.next() orelse "shopot";
     const addr = it.next();
+    // односторонний v2-код: держатель добавляется ONE add-ом
+    var secret: [invite_mod.secret_len]u8 = undefined;
+    app.io.random(&secret);
+    {
+        app.lock();
+        defer app.unlock();
+        var slot: ?usize = null;
+        for (&app.invites, 0..) |*reg, i| {
+            if (reg.used or reg.created_ms == 0) {
+                slot = i;
+                break;
+            }
+        }
+        const i = slot orelse return error.TooManyInvites;
+        app.invites[i] = .{ .secret = secret, .created_ms = app.nowMs(), .used = false };
+    }
     var out: [256]u8 = undefined;
-    const code = try invite_mod.encode(&out, app.id.bundle(), name, addr);
+    const code = try invite_mod.encode2(&out, app.id.bundle(), secret, name, addr);
     fb(app, null, code);
+    fb(app, null, "односторонний код: отдай его — держатель сделает add, больше ничего не нужно");
 }
 
 fn cmdAdd(app: *App, args: []const u8) !void {
-    const trimmed = std.mem.trim(u8, args, " ");
+    var trimmed = std.mem.trim(u8, args, " ");
     var name: []const u8 = "";
     var bundle: [64]u8 = undefined;
     var addr_buf: [80]u8 = undefined;
     var addr: ?[]const u8 = null;
-    if (std.mem.startsWith(u8, trimmed, "shopot1.")) {
+    // моё имя для JOIN (видит приглашающий): хвост после кода
+    var my_name: []const u8 = "друг";
+    var join_after: ?JoinInfo = null;
+    if (std.mem.indexOfScalar(u8, trimmed, ' ')) |sp| {
+        if (std.mem.startsWith(u8, trimmed, invite_mod.v2_prefix)) {
+            my_name = std.mem.trim(u8, trimmed[sp + 1 ..], " ");
+            if (my_name.len == 0 or my_name.len > 32) return error.BadArgs;
+            trimmed = trimmed[0..sp];
+        }
+    }
+    if (std.mem.startsWith(u8, trimmed, invite_mod.v2_prefix) or std.mem.startsWith(u8, trimmed, "shopot1.")) {
         const inv = try invite_mod.decode(trimmed);
         name = inv.name();
         bundle = inv.bundle;
@@ -680,6 +879,16 @@ fn cmdAdd(app: *App, args: []const u8) !void {
         if (inv.host_len > 0) {
             addr = std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ inv.addr().?, inv.port }) catch return error.BadArgs;
         }
+        // v2: держатель кода — JOIN первым конвертом после рукопожатия
+        if (inv.v2) join_after = .{
+            .secret = inv.secret,
+            .name_len = @intCast(my_name.len),
+            .name_buf = blk: {
+                var nb: [32]u8 = @splat(0);
+                @memcpy(nb[0..my_name.len], my_name);
+                break :blk nb;
+            },
+        };
     } else {
         var it = std.mem.tokenizeAny(u8, trimmed, " ");
         name = it.next() orelse return error.BadArgs;
@@ -705,7 +914,12 @@ fn cmdAdd(app: *App, args: []const u8) !void {
     var msg: [96]u8 = undefined;
     const t = std.fmt.bufPrint(&msg, "контакт {s} = id {d}", .{ name, cid }) catch "контакт добавлен";
     fb(app, @intCast(cid - 1), t);
+    // v2: запомнить JOIN-данные — отправим первым конвертом после рукопожатия
+    if (join_after) |ji| {
+        app.join_map.put(app.alloc, cid, ji) catch {};
+    }
     // Если код содержит адрес — подключение происходит сразу, без connect/id.
+    // Без адреса — LAN-захват: linkerLoop дозвонится до анонса приглашающего.
     if (addr) |a| establishTo(app, a, cid, .initiator) catch |e| {
         var eb: [64]u8 = undefined;
         const et = std.fmt.bufPrint(&eb, "автоподключение: {s}", .{@errorName(e)}) catch "!";
@@ -736,6 +950,10 @@ fn cmdContacts(app: *App) void {
             lens[n] = t.len;
             n += 1;
         }
+    }
+    if (n == 0) {
+        fb(app, null, "нет контактов");
+        return;
     }
     for (lines_buf[0..n], lens[0..n]) |*line, l| {
         fb(app, null, line[0..l]);
@@ -772,6 +990,26 @@ fn establishTo(app: *App, addr: []const u8, cid: i64, role: session_mod.Handshak
         return e;
     };
     try app.bindSession(cid, s, sc);
+    // держатель инвайта: первым конвертом — JOIN (подаётся ДО любого текста)
+    sendJoinIfDue(app, cid, s);
+}
+
+/// Отправка JOIN по join_map (после установления сессии, без app.mu).
+fn sendJoinIfDue(app: *App, cid: i64, s: *session_mod.Session) void {
+    const ji = app.join_map.get(cid) orelse return;
+    _ = app.join_map.remove(cid);
+    const transcript = s.keys.transcript;
+    var sig: [64]u8 = undefined;
+    app.id.sign(&transcript, &sig) catch return;
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &transcript, &ji.secret);
+    const j = envelope.Join{
+        .bundle = app.id.bundle(),
+        .name = ji.name(),
+        .sig = sig,
+        .hmac = mac,
+    };
+    s.sendEnvelope(.{ .join = j }) catch {};
 }
 
 fn acceptLoop(app: *App, listener: *tcp.Listener, cid: i64) void {
@@ -1004,7 +1242,7 @@ const W = struct {
     }
 };
 
-/// Двухпанельный мессенджер (как C++-FTXUI, но на голом ANSI):
+/// Двухпанельный мессенджер (голый ANSI):
 /// слева список чатов (выбор, онлайн, возраст последнего пакета,
 /// непрочитанные), справа лента с временем, шапка контакта и поле
 /// ввода в рамке; внизу — строка клавиш. Полный кадр каждые 150 мс.
@@ -1734,11 +1972,11 @@ pub fn main(start: std.process.Init) !void {
             }
         }
 
-        // CLI-фронт-енды: UDS-апи + мост для C++-клиента MessagingApp
+        // CLI-фронт-енд: UDS-апи
         cli_srv.start(&app, home);
 
         // интерактивный терминал — полноэкранный TUI; иначе — построчный REPL;
-        // serve — безлокальный демон для CLI-клиентов (UDS/C++)
+        // serve — безлокальный демон для CLI-клиентов (UDS)
         const is_tty = blk: {
             _ = std.posix.tcgetattr(0) catch break :blk false;
             break :blk true;
