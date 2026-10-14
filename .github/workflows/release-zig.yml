@@ -40,7 +40,7 @@ jobs:
           mkdir -p "dist/$NAME"
           cp zig-out/bin/shopot-zig "dist/$NAME/"
           cp ../README.md "dist/$NAME/" 2>/dev/null || true
-          tar czf "../../$NAME.tar.gz" -C dist "$NAME"
+          tar czf "../$NAME.tar.gz" -C dist "$NAME"
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
