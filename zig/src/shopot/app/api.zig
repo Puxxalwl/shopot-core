@@ -20,7 +20,9 @@ pub const header_len = 16;
 
 /// Версия API (команда GET_VERSION): semver [major, minor, patch].
 /// Major меняется на несовместимых изменениях провода.
-pub const api_version = [3]u16{ 1, 0, 0 };
+/// 2.0.0: entities форматирования в SEND_MESSAGE/GET_HISTORY/GET_MESSAGE
+/// и событии MESSAGE_RECEIVED (хвост после body, см. CORE-API.md).
+pub const api_version = [3]u16{ 2, 0, 0 };
 
 /// Тип кадра.
 pub const Kind = enum(u8) {
@@ -123,7 +125,8 @@ pub const Status = enum(u16) {
 
 /// События ядра (u16 на проводе, имена SCREAMING_SNAKE — контракт).
 pub const Event = enum(u16) {
-    /// Входящее сообщение: [cid u32][msg_id 16][ts_ms u64][name str16][body str16].
+    /// Входящее сообщение: [cid u32][msg_id 16][ts_ms u64][name str16]
+    /// [body str16][ent_count u8] × {entity} (форматирование, CORE-API.md).
     MESSAGE_RECEIVED = 1,
     /// ACK: сообщение доставлено на устройство пира: [cid u32][msg_id 16].
     MESSAGE_DELIVERED = 2,
@@ -241,6 +244,12 @@ pub const Reader = struct {
         return self.take(n);
     }
 
+    /// str8: [len u8][байты] — компактные значения (value entities).
+    pub fn readStr8(self: *Reader) ![]const u8 {
+        const len = try self.readU8();
+        return self.take(len);
+    }
+
     /// str16: [len u16][байты].
     pub fn readStr16(self: *Reader) ![]const u8 {
         const len = try self.readU16();
@@ -297,6 +306,12 @@ pub const Writer = struct {
     }
     pub fn putBytes(self: *Writer, v: []const u8) !void {
         try self.list.appendSlice(self.alloc, v);
+    }
+    /// str8: [len u8][байты] — компактные значения (value entities).
+    pub fn putStr8(self: *Writer, v: []const u8) !void {
+        if (v.len > std.math.maxInt(u8)) return error.BadArgs;
+        try self.putU8(@intCast(v.len));
+        try self.putBytes(v);
     }
     /// str16: [len u16][байты]; len > 65535 — error.BadArgs.
     pub fn putStr16(self: *Writer, v: []const u8) !void {

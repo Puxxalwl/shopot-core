@@ -9,7 +9,8 @@ renders. The protocol is **binary**: no strings-as-protocol, no JSON, no
 human-readable text on the wire — only typed byte frames and machine-readable
 codes (methods, statuses, events).
 
-- API version: **1.0.0** (returned by `GET_VERSION`, semver).
+- API version: **2.0.0** (returned by `GET_VERSION`, semver). Major bump
+  over 1.0.0: message payloads gained a formatting-entities tail (§4.3).
 - Normative wire protocol: [PROTOCOL.md](PROTOCOL.md).
 
 ## 1. Model
@@ -141,13 +142,45 @@ Payload: ∅. Response:
 
 ### 4.3 Messages
 
+#### Formatting entities (v2)
+
+Every message payload in this section (request, response, event) carries an
+**entity tail** after the body — the same canonical encoding as the TEXT
+envelope on the wire (PROTOCOL.md §7.1):
+
+```
+[ent_count u8 ≤ 32]
+× { [kind u8][offset u16][len u16][value_len u8][value bytes] }
+```
+
+| kind | Meaning | value |
+|---|---|---|
+| 1 | bold | — |
+| 2 | italic | — |
+| 3 | underline | — |
+| 4 | strikethrough | — |
+| 5 | spoiler | — |
+| 6 | code (inline) | — |
+| 7 | code block | language tag, optional |
+| 8 | link | URL, mandatory, ≤ 255 bytes |
+
+- `offset`/`len` are **UTF-8 byte** offsets into the body. The core does not
+  validate UTF-8; slicing on character boundaries at render time is the
+  client's job.
+- Rules enforced by the core: `len ≥ 1`, `offset + len ≤ body_len`, entries
+  sorted by offset, value presence per kind; overlaps allowed
+  (bold + italic on the same span). Violations → `BAD_ARGS`
+  (semantics) or `BAD_FRAME` (truncated structure).
+- The count byte is always present; 0 formatting → a single `0x00` byte.
+
 #### `SEND_MESSAGE` (7)
-Payload: `[cid u32][body str16 ≤ 4096]`.
+Payload: `[cid u32][body str16 ≤ 4096][entity tail]`.
 Response: `[msg_id 16][flags u8 (bit0 = queued)]`.
 - Sending to an offline contact is NOT an error: `queued=1` — the message
   leaves when the contact appears (outbox; confirmation is the
   `MESSAGE_DELIVERED` event).
-- Errors: `NO_CONTACT`, `CONTACT_BLOCKED`, `BAD_ARGS` (empty body).
+- Errors: `NO_CONTACT`, `CONTACT_BLOCKED`, `BAD_ARGS` (empty body, invalid
+  entities).
 
 #### `SET_REACTION` (8) / `REMOVE_REACTION` (9)
 Payload: `[cid u32][msg_id 16][codepoint u32]`.
@@ -164,16 +197,17 @@ Response:
 ```
 [total u32]   — total records for the contact
 [count u32]
-× { [flags u8 (bit0 mine, bit1 delivered)][msg_id 16][ts_ms u64][body str16] }
+× { [flags u8 (bit0 mine, bit1 delivered)][msg_id 16][ts_ms u64][body str16][entity tail] }
 ```
 Records oldest → newest. `ts_ms` is local record time (ms, epoch). Stored in
 the encrypted log, survives restarts. No log → empty list
-(`total=0, count=0`).
+(`total=0, count=0`). The window is cut by `limit` **and** the 1 MiB payload
+budget: with entity-heavy history `count` may be smaller than `limit`.
 
 #### `GET_MESSAGE` (11)
 Payload: `[msg_id 16]`. Response:
 ```
-[cid u32][flags u8 (bit0 mine, bit1 delivered)][ts_ms u64][body str16]
+[cid u32][flags u8 (bit0 mine, bit1 delivered)][ts_ms u64][body str16][entity tail]
 [react_count u32]
 × { [flags u8 (bit0 mine)][codepoint u32][ts_ms u64] }
 ```
@@ -249,7 +283,7 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
 
 | Name | id | Payload |
 |---|---|---|
-| `MESSAGE_RECEIVED` | 1 | `[cid u32][msg_id 16][ts_ms u64][name str16][body str16]` |
+| `MESSAGE_RECEIVED` | 1 | `[cid u32][msg_id 16][ts_ms u64][name str16][body str16][entity tail]` |
 | `MESSAGE_DELIVERED` | 2 | `[cid u32][msg_id 16]` |
 | `PRESENCE` | 3 | `[cid u32][online u8 (1/0)][last_seen_ms i64]` |
 | `REACTION` | 4 | `[cid u32][msg_id 16][op u8 (1 = add, 2 = remove)][codepoint u32][ts_ms u64]` |
@@ -370,7 +404,8 @@ A writes to offline B → `queued=1` → B starts the daemon → the core delive
 Full byte layouts — PROTOCOL.md §7. The client never constructs envelopes;
 the core does. Useful for reading logs and events:
 
-TEXT (0x10) carries msg_id/ts/body; ACK (0x15) — delivery confirmation;
+TEXT (0x10) carries msg_id/ts/body + the formatting entity tail; ACK (0x15) —
+delivery confirmation;
 REACT (0x13) — op + codepoint; JOIN (0x40) — invite proof; PROFILE (0x42) —
 name + avatar_id; AVATAR/AVATAR_ACK/AVATAR_REQ (0x50/0x51/0x52) — avatars;
 FILE_META/FILE_DATA/FILE_ACK (0x60/0x61/0x62) — files;

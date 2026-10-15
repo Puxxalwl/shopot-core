@@ -14,6 +14,8 @@ pub const EngineError = error{
     Store,
     OutOfMemory,
     TooBig,
+    /// Невалидные entities форматирования (границы/сортировка/правила).
+    BadEntities,
     /// Слишком много файлов в передаче одновременно (file_tx_cap).
     TooManyFiles,
 };
@@ -66,7 +68,7 @@ pub const Reaction = struct {
 
 pub const Events = struct {
     ctx: *anyopaque = undefined,
-    onText: ?*const fn (ctx: *anyopaque, from: *const Contact, msg_id: [16]u8, ts_ms: i64, body: []const u8) void = null,
+    onText: ?*const fn (ctx: *anyopaque, from: *const Contact, msg_id: [16]u8, ts_ms: i64, body: []const u8, ents: []const envelope.TextEntity) void = null,
     onReaction: ?*const fn (ctx: *anyopaque, from: *const Contact, r: Reaction) void = null,
     onPresence: ?*const fn (ctx: *anyopaque, from: *const Contact, online: bool, last_seen_ms: i64) void = null,
     /// Профиль пира обновился (эхо PROFILE: имя и avatar_id).
@@ -95,6 +97,10 @@ pub const OutboxEntry = struct {
     ts_ms: u64,
     /// Копия тела (alloc); свободается при ACK/истечении.
     body: []u8,
+    /// Копия хвоста entities (alloc, wire-формат; пусто — форматирования
+    /// нет); value-байты лежат внутри — одной записью с конвертом при
+    /// флеше outbox. Свободается вместе с body.
+    ents_tail: []u8 = &.{},
 };
 
 /// Передача файла в полёте (отправитель). Байты хранятся в движке до
@@ -180,7 +186,10 @@ pub const Engine = struct {
         self.contacts.deinit(self.alloc);
         self.contact_ids.deinit(self.alloc);
         self.last_seen_ms.deinit();
-        for (self.outbox.items) |*e| self.alloc.free(e.body);
+        for (self.outbox.items) |*e| {
+            self.alloc.free(e.body);
+            self.alloc.free(e.ents_tail);
+        }
         self.outbox.deinit(self.alloc);
         for (self.file_tx.items) |*t| {
             std.crypto.secureZero(u8, &t.sha);
@@ -219,9 +228,18 @@ pub const Engine = struct {
 
     /// Send text to a contact. Blocked peers are rejected locally.
     /// Нет сессии — сообщение уходит в outbox (доставим при появлении).
-    pub fn sendText(self: *Engine, contact_id: i64, body: []const u8) EngineError!SendOutcome {
+    /// `ents` — форматирование (валидируется; кривое — BadEntities); их
+    /// value-срезы живут в буфере вызывающего до возврата из sendText.
+    pub fn sendText(self: *Engine, contact_id: i64, body: []const u8, ents: []const envelope.TextEntity) EngineError!SendOutcome {
         const idx = self.findIndex(contact_id) orelse return EngineError.NoSession;
         if (self.contacts.items[idx].blocked) return EngineError.Blocked;
+        // канонический хвост один раз: в конверт, в outbox и обратно в лог
+        // приложение кладёт те же байты
+        var tail_buf: [envelope.max_text_tail]u8 = undefined;
+        const tail = envelope.encodeEntitiesTail(&tail_buf, ents, body.len) catch |e| return switch (e) {
+            error.NoSpace => EngineError.NoSpace,
+            else => EngineError.BadEntities,
+        };
         var msg_id: [16]u8 = undefined;
         self.io.random(&msg_id);
         var ts_buf: [8]u8 = undefined;
@@ -231,6 +249,7 @@ pub const Engine = struct {
             .msg_id = msg_id,
             .ts_ms = ts_ms,
             .body = body,
+            .ents_tail = tail,
         } };
         if (self.sessions.get(contact_id)) |s| {
             // рэтчет-запечатанный TEXT (слой 2): msg_id/ts_ms наши — дедуп,
@@ -238,25 +257,29 @@ pub const Engine = struct {
             // и слой рэтчета не задействовался вовсе
             s.sendSealedText(env) catch {
                 // сессия умерла между проверкой и записью — в очередь
-                self.outboxAppend(contact_id, msg_id, ts_ms, body) catch {};
+                self.outboxAppend(contact_id, msg_id, ts_ms, body, tail) catch {};
                 return .{ .result = .queued, .msg_id = msg_id };
             };
             return .{ .result = .sent, .msg_id = msg_id };
         }
-        self.outboxAppend(contact_id, msg_id, ts_ms, body) catch return EngineError.OutOfMemory;
+        self.outboxAppend(contact_id, msg_id, ts_ms, body, tail) catch return EngineError.OutOfMemory;
         return .{ .result = .queued, .msg_id = msg_id };
     }
 
     /// Положить TEXT в outbox (капа outbox_cap: старое вытесняется).
-    fn outboxAppend(self: *Engine, cid: i64, msg_id: [16]u8, ts_ms: u64, body: []const u8) !void {
+    fn outboxAppend(self: *Engine, cid: i64, msg_id: [16]u8, ts_ms: u64, body: []const u8, ents_tail: []const u8) !void {
         if (body.len == 0 or body.len > envelope.max_text_body) return error.TooBig;
+        if (ents_tail.len > envelope.max_text_tail) return error.TooBig;
         if (self.outbox.items.len >= outbox_cap) {
             const old = self.outbox.orderedRemove(0);
             self.alloc.free(old.body);
+            self.alloc.free(old.ents_tail);
         }
         const copy = try self.alloc.dupe(u8, body);
-        self.outbox.append(self.alloc, .{ .cid = cid, .msg_id = msg_id, .ts_ms = ts_ms, .body = copy }) catch {
+        const tail_copy = if (ents_tail.len == 0) @as([]u8, &.{}) else try self.alloc.dupe(u8, ents_tail);
+        self.outbox.append(self.alloc, .{ .cid = cid, .msg_id = msg_id, .ts_ms = ts_ms, .body = copy, .ents_tail = tail_copy }) catch {
             self.alloc.free(copy);
+            self.alloc.free(tail_copy);
             return error.OutOfMemory;
         };
     }
@@ -441,12 +464,15 @@ pub const Engine = struct {
                 if (e.cid == contact_id and !fresh) {
                     const old = self.outbox.orderedRemove(i);
                     self.alloc.free(old.body);
+                    self.alloc.free(old.ents_tail);
                     continue;
                 }
                 i += 1;
                 continue;
             }
-            batch[n] = .{ .text = .{ .msg_id = e.msg_id, .ts_ms = e.ts_ms, .body = e.body } };
+            // хвост entities лежит в записи готовым wire-форматом — конверт
+            // уходит с форматированием без перепарса
+            batch[n] = .{ .text = .{ .msg_id = e.msg_id, .ts_ms = e.ts_ms, .body = e.body, .ents_tail = e.ents_tail } };
             n += 1;
             i += 1;
             if (n == batch.len) {
@@ -464,6 +490,7 @@ pub const Engine = struct {
             if (self.outbox.items[i].cid == cid and std.mem.eql(u8, &self.outbox.items[i].msg_id, &msg_id)) {
                 const old = self.outbox.orderedRemove(i);
                 self.alloc.free(old.body);
+                self.alloc.free(old.ents_tail);
             } else {
                 i += 1;
             }
@@ -567,7 +594,13 @@ pub const Engine = struct {
                     return;
                 }
                 self.seenPut(contact_id, t.msg_id);
-                if (self.ev.onText) |cb| cb(self.ev.ctx, c, t.msg_id, @intCast(t.ts_ms), t.body);
+                if (self.ev.onText) |cb| {
+                    // хвост уже провалидирован decode'ом конверта; разбор
+                    // в стек — value-срезы живут в буфере кадра rx-потока
+                    var ents: [envelope.max_text_entities]envelope.TextEntity = undefined;
+                    const n = envelope.parseEntities(t.ents_tail, t.body.len, &ents) catch 0;
+                    cb(self.ev.ctx, c, t.msg_id, @intCast(t.ts_ms), t.body, ents[0..n]);
+                }
                 if (self.sessions.get(contact_id)) |sess| {
                     sess.sendEnvelope(.{ .ack = .{ .msg_id = t.msg_id } }) catch {};
                 }
@@ -750,9 +783,69 @@ test "engine block and react flow" {
     defer eng.deinit();
     const idx = try eng.addContact("peer", peer.bundle());
     const cid: i64 = @intCast(idx + 1);
-    const oc = try eng.sendText(cid, "hi");
+    const oc = try eng.sendText(cid, "hi", &.{});
     try std.testing.expectEqual(Engine.SendResult.queued, oc.result);
     try eng.block(cid);
     try std.testing.expect(eng.contacts.items[idx].blocked);
     try eng.unblock(cid);
+}
+
+/// Проба onText: тело и entities копируются (срезы события живут в буфере
+/// кадра rx-потока).
+const TextProbe = struct {
+    got: bool = false,
+    body: [16]u8 = @splat(0),
+    body_len: usize = 0,
+    ents: [envelope.max_text_entities]envelope.TextEntity = @splat(.{ .kind = .bold, .offset = 0, .len = 0 }),
+    ents_len: usize = 0,
+
+    fn onText(ctx: *anyopaque, _: *const Contact, _: [16]u8, _: i64, body: []const u8, ents: []const envelope.TextEntity) void {
+        const self: *TextProbe = @ptrCast(@alignCast(ctx));
+        self.got = true;
+        const n = @min(body.len, 16);
+        @memcpy(self.body[0..n], body[0..n]);
+        self.body_len = n;
+        self.ents_len = ents.len;
+        for (ents, 0..) |e, i| self.ents[i] = e;
+    }
+};
+
+test "engine: TEXT с entities — outbox хранит хвост, onText парсит" {
+    const alloc = std.testing.allocator;
+    const id = try identity_mod.Identity.fromSeed(filled32(17));
+    const peer = try identity_mod.Identity.fromSeed(filled32(19));
+    var probe = TextProbe{};
+    var eng = Engine.init(alloc, std.testing.io, id, .{ .ctx = &probe, .onText = TextProbe.onText });
+    defer eng.deinit();
+    const idx = try eng.addContact("peer", peer.bundle());
+    const cid: i64 = @intCast(idx + 1);
+
+    // сессии нет — queued; хвост скопирован в outbox дословно
+    const ents = [_]envelope.TextEntity{
+        .{ .kind = .spoiler, .offset = 0, .len = 3 },
+        .{ .kind = .code, .offset = 4, .len = 2 },
+    };
+    var tail_buf: [envelope.max_text_tail]u8 = undefined;
+    const tail = try envelope.encodeEntitiesTail(&tail_buf, &ents, "abcdef".len);
+    const oc = try eng.sendText(cid, "abcdef", &ents);
+    try std.testing.expectEqual(Engine.SendResult.queued, oc.result);
+    try std.testing.expectEqualSlices(u8, tail, eng.outbox.items[0].ents_tail);
+
+    // приём: конверт с тем же хвостом -> onText видит типизированные entities
+    eng.dispatchEvent(cid, .{ .text = .{
+        .msg_id = @splat(1),
+        .ts_ms = 2,
+        .body = "abcdef",
+        .ents_tail = tail,
+    } });
+    try std.testing.expect(probe.got);
+    try std.testing.expectEqualStrings("abcdef", probe.body[0..probe.body_len]);
+    try std.testing.expectEqual(@as(usize, 2), probe.ents_len);
+    try std.testing.expectEqual(envelope.EntityKind.spoiler, probe.ents[0].kind);
+    try std.testing.expectEqual(@as(u16, 3), probe.ents[0].len);
+    try std.testing.expectEqual(envelope.EntityKind.code, probe.ents[1].kind);
+    try std.testing.expectEqual(@as(u16, 4), probe.ents[1].offset);
+
+    // кривые entities на входе API — BadEntities
+    try std.testing.expectError(EngineError.BadEntities, eng.sendText(cid, "abcdef", &.{.{ .kind = .bold, .offset = 5, .len = 5 }}));
 }

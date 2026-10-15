@@ -9,7 +9,8 @@
 — только типизированные байтовые кадры и машинные коды (методы, статусы,
 события).
 
-- Версия API: **1.0.0** (возвращается `GET_VERSION`, semver).
+- Версия API: **2.0.0** (возвращается `GET_VERSION`, semver). Мажорный
+  бамп с 1.0.0: payload'ы сообщений получили хвост entities (§4.3).
 - Нормативный провод-протокол: [../PROTOCOL.md](../PROTOCOL.md).
 
 ## 1. Модель
@@ -139,12 +140,43 @@ Payload: ∅. Ответ:
 
 ### 4.3 Сообщения
 
+#### Entities форматирования (v2)
+
+Каждый payload сообщений этого раздела (запрос, ответ, событие) несёт после
+тела **хвост entities** — та же каноническая кодировка, что у конверта TEXT
+на проводе (PROTOCOL.md §7.1):
+
+```
+[ent_count u8 ≤ 32]
+× { [kind u8][offset u16][len u16][value_len u8][value байты] }
+```
+
+| kind | Смысл | value |
+|---|---|---|
+| 1 | жирный | — |
+| 2 | курсив | — |
+| 3 | подчёркнутый | — |
+| 4 | зачёркнутый | — |
+| 5 | спойлер | — |
+| 6 | код (инлайн) | — |
+| 7 | блок кода | тег языка, опционален |
+| 8 | ссылка | URL, обязателен, ≤ 255 байтов |
+
+- `offset`/`len` — БАЙТЫ UTF-8 в теле. Ядро не валидирует UTF-8; резать по
+  границам символов при рендере — задача клиента.
+- Правила, проверяемые ядром: `len ≥ 1`, `offset + len ≤ body_len`,
+  записи отсортированы по offset, значение value по kind; пересечения
+  разрешены (жирный + курсив на одном куске). Нарушение → `BAD_ARGS`
+  (семантика) или `BAD_FRAME` (обрезанная структура).
+- Байт счётчика есть всегда; форматирования нет → один байт `0x00`.
+
 #### `SEND_MESSAGE` (7)
-Payload: `[cid u32][body str16 ≤ 4096]`.
+Payload: `[cid u32][body str16 ≤ 4096][хвост entities]`.
 Ответ: `[msg_id 16][flags u8 (бит0 = queued)]`.
 - Отправка офлайн-контакту НЕ ошибка: `queued=1` — уйдёт при появлении
   контакта (outbox; подтверждение — событие `MESSAGE_DELIVERED`).
-- Ошибки: `NO_CONTACT`, `CONTACT_BLOCKED`, `BAD_ARGS` (пустое тело).
+- Ошибки: `NO_CONTACT`, `CONTACT_BLOCKED`, `BAD_ARGS` (пустое тело,
+  кривые entities).
 
 #### `SET_REACTION` (8) / `REMOVE_REACTION` (9)
 Payload: `[cid u32][msg_id 16][codepoint u32]`.
@@ -161,16 +193,17 @@ Payload: `[cid u32][limit u32]` (0 → 50; максимум 200 → `TOO_BIG`).
 ```
 [total u32]   — всего записей у контакта
 [count u32]
-× { [flags u8 (бит0 mine, бит1 delivered)][msg_id 16][ts_ms u64][body str16] }
+× { [flags u8 (бит0 mine, бит1 delivered)][msg_id 16][ts_ms u64][body str16][хвост entities] }
 ```
 Записи старые → новые. `ts_ms` — локальное время записи (мс, epoch).
 Хранится в шифрованном логе, переживает рестарты. Лога нет — пустой список
-(`total=0, count=0`).
+(`total=0, count=0`). Окно режется и `limit`, и бюджетом payload 1 МиБ:
+при entity-тяжёлой истории `count` может быть меньше `limit`.
 
 #### `GET_MESSAGE` (11)
 Payload: `[msg_id 16]`. Ответ:
 ```
-[cid u32][flags u8 (бит0 mine, бит1 delivered)][ts_ms u64][body str16]
+[cid u32][flags u8 (бит0 mine, бит1 delivered)][ts_ms u64][body str16][хвост entities]
 [react_count u32]
 × { [flags u8 (бит0 mine)][codepoint u32][ts_ms u64] }
 ```
@@ -245,7 +278,7 @@ Payload: `[cid u32][path str16]` — путь в ФС пользователя �
 
 | Имя | id | Payload |
 |---|---|---|
-| `MESSAGE_RECEIVED` | 1 | `[cid u32][msg_id 16][ts_ms u64][name str16][body str16]` |
+| `MESSAGE_RECEIVED` | 1 | `[cid u32][msg_id 16][ts_ms u64][name str16][body str16][хвост entities]` |
 | `MESSAGE_DELIVERED` | 2 | `[cid u32][msg_id 16]` |
 | `PRESENCE` | 3 | `[cid u32][online u8 (1/0)][last_seen_ms i64]` |
 | `REACTION` | 4 | `[cid u32][msg_id 16][op u8 (1 = add, 2 = remove)][codepoint u32][ts_ms u64]` |
@@ -365,7 +398,8 @@ A: `MESSAGE_DELIVERED`.
 Полные байтовые раскладки — PROTOCOL.md §7. Конверты строит только ядро,
 не клиент. Полезно для чтения логов и событий:
 
-TEXT (0x10) несёт msg_id/ts/тело; ACK (0x15) — подтверждение доставки;
+TEXT (0x10) несёт msg_id/ts/тело + хвост entities форматирования; ACK (0x15) —
+подтверждение доставки;
 REACT (0x13) — op + codepoint; JOIN (0x40) — доказательство по инвайту;
 PROFILE (0x42) — имя + avatar_id; AVATAR/AVATAR_ACK/AVATAR_REQ
 (0x50/0x51/0x52) — аватары; FILE_META/FILE_DATA/FILE_ACK (0x60/0x61/0x62) —

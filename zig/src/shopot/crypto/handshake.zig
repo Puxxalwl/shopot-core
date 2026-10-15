@@ -9,7 +9,7 @@
 //!   m3 = box(init_enc_pk || sig_i)                         (112)
 //!
 //! Последовательность MixKey (одинакова у сторон):
-//!   h0 = ck0 = BLAKE2s256("shopot-hs-v3")
+//!   h0 = ck0 = BLAKE2s256("shopot-hs-v4")
 //!   h1 = H(h0||e1);  h2 = H(h1||e2);  ee = X25519(e2,e1) -> k1, ck
 //!   sig_r = Sign_r(h2);  box1 = Seal(k1, n=0, ad=h2);  h3 = H(h2||box1)
 //!   es = X25519(s_r,e1) -> k2, ck
@@ -27,7 +27,12 @@ const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
 const Blake2s256 = std.crypto.hash.blake2.Blake2s256;
 
-const domain = "shopot-hs-v3";
+/// Домен-версия протокола. v4: TEXT-конверт несёт хвост entities (формат
+/// см. proto/envelope.zig). Домен входит в цепной ключ рукопожатия: ядра
+/// разных версий НЕ сходятся вовсе (боксы m2/m3 не открываются) —
+/// fail-fast вместо молчаливой потери TEXT; несовместимое изменение = новая
+/// версия в домене (PROTOCOL.md).
+const domain = "shopot-hs-v4";
 const mix_info = "shopot-hs-mix";
 const finish_info = "shopot-hs-finish";
 

@@ -124,6 +124,9 @@ const Harness = struct {
     alloc: std.mem.Allocator,
     texts: std.ArrayListUnmanaged([]u8) = .empty,
     text_ts: std.ArrayListUnmanaged(u64) = .empty,
+    /// Хвост entities i-го TEXT, принятого через движок (первые 64 байтов).
+    ent_tails: [16][64]u8 = @splat(@splat(0)),
+    ent_tail_lens: [16]u16 = @splat(0),
     reacts: std.ArrayListUnmanaged(envelope.React) = .empty,
     pings: std.ArrayListUnmanaged(u32) = .empty,
     delivered: std.ArrayListUnmanaged([16]u8) = .empty,
@@ -308,10 +311,20 @@ const EngineCtx = struct {
 };
 
 const eng_events = struct {
-    fn onText(ctx: *anyopaque, _: *const shopot.core.engine.Contact, _: [16]u8, _: i64, body: []const u8) void {
+    fn onText(ctx: *anyopaque, _: *const shopot.core.engine.Contact, _: [16]u8, _: i64, body: []const u8, ents: []const envelope.TextEntity) void {
         const h: *Harness = @ptrCast(@alignCast(ctx));
         const copy = h.alloc.dupe(u8, body) catch return;
         h.texts.append(h.alloc, copy) catch {};
+        // хвост entities движок уже распарсил; сериализуем обратно в тот же
+        // канонический формат и копируем (срезы события короткоживущи)
+        var tail_buf: [envelope.max_text_tail]u8 = undefined;
+        const tail = envelope.encodeEntitiesTail(&tail_buf, ents, body.len) catch return;
+        const i = h.texts.items.len - 1;
+        if (i < h.ent_tails.len) {
+            const n: usize = @min(tail.len, 64);
+            @memcpy(h.ent_tails[i][0..n], tail[0..n]);
+            h.ent_tail_lens[i] = @intCast(n);
+        }
     }
     fn onReaction(ctx: *anyopaque, _: *const shopot.core.engine.Contact, r: shopot.core.engine.Reaction) void {
         const h: *Harness = @ptrCast(@alignCast(ctx));
@@ -403,16 +416,16 @@ test "block: traffic from blocked peer is dropped engine-wide" {
     eng_b.sessions.put(1, sb) catch return error.OutOfMemory;
 
     // before block: text goes through the full engine dispatch
-    _ = try eng_b.sendText(1, "hello a");
+    _ = try eng_b.sendText(1, "hello a", &.{});
     try waitTexts(&ha, "hello a");
 
     // A blocks B: engine marks flag, warns peer, tears the session down
     try eng_a.block(cid_b);
     try std.testing.expect(eng_a.contacts.items[idx_b].blocked);
-    try std.testing.expectError(shopot.core.engine.EngineError.Blocked, eng_a.sendText(cid_b, "nope"));
+    try std.testing.expectError(shopot.core.engine.EngineError.Blocked, eng_a.sendText(cid_b, "nope", &.{}));
 
     // B (unaware yet or ignoring) keeps sending: everything is dropped at A
-    _ = try eng_b.sendText(1, "should vanish");
+    _ = try eng_b.sendText(1, "should vanish", &.{});
     try eng_b.react(1, @splat(9), envelope.react_add, 5);
     std.Thread.yield() catch {};
     std.Io.sleep(io_g.stored, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
@@ -718,11 +731,11 @@ test "relay: присутствие — переподключение без и
 
         // текст ходит в обе стороны через relay-сплит
         eng_mu.lockUncancelable(io);
-        _ = eng_a.sendText(cid_b, "pres-a") catch return error.Internal;
+        _ = eng_a.sendText(cid_b, "pres-a", &.{}) catch return error.Internal;
         eng_mu.unlock(io);
         try waitTexts(&hb, "pres-a");
         eng_mu.lockUncancelable(io);
-        _ = eng_b.sendText(1, "pres-b") catch return error.Internal;
+        _ = eng_b.sendText(1, "pres-b", &.{}) catch return error.Internal;
         eng_mu.unlock(io);
         try waitTexts(&ha, "pres-b");
 
@@ -1021,8 +1034,12 @@ test "outbox: очередь офлайн, доставка при сессии,
     var ctx_a = EngineCtx{ .engine = &eng_a, .contact_id = cid_b, .harness = &ha };
     var ctx_b = EngineCtx{ .engine = &eng_b, .contact_id = 1, .harness = &hb };
 
-    // 1) офлайн: TEXT уходит в очередь, не в ошибку
-    const ocq = try eng_b.sendText(1, "offline-digest");
+    // 1) офлайн: TEXT с форматированием уходит в очередь, не в ошибку
+    const fmt = [_]envelope.TextEntity{
+        .{ .kind = .bold, .offset = 0, .len = 7 }, // «offline»
+        .{ .kind = .spoiler, .offset = 8, .len = 6 }, // «digest»
+    };
+    const ocq = try eng_b.sendText(1, "offline-digest", &fmt);
     try std.testing.expectEqual(shopot.core.engine.Engine.SendResult.queued, ocq.result);
     try std.testing.expectEqual(@as(usize, 1), eng_b.outbox.items.len);
 
@@ -1066,6 +1083,18 @@ test "outbox: очередь офлайн, доставка при сессии,
     // 3) сессия поднялась — слить очередь
     eng_b.flushOutbox(1);
     try waitTexts(&ha, "offline-digest");
+    // entities пережили очередь: тот же хвост дошёл до onText у A
+    {
+        var out: [envelope.max_text_entities]envelope.TextEntity = undefined;
+        const tail = ha.ent_tails[0][0..ha.ent_tail_lens[0]];
+        const n = try envelope.parseEntities(tail, "offline-digest".len, &out);
+        try std.testing.expectEqual(@as(usize, 2), n);
+        try std.testing.expectEqual(envelope.EntityKind.bold, out[0].kind);
+        try std.testing.expectEqual(@as(u16, 0), out[0].offset);
+        try std.testing.expectEqual(envelope.EntityKind.spoiler, out[1].kind);
+        try std.testing.expectEqual(@as(u16, 8), out[1].offset);
+        try std.testing.expectEqual(@as(u16, 6), out[1].len);
+    }
 
     // 4) ACK от A погасил запись outbox у B (доставлено)
     for (0..200) |_| {
@@ -1088,6 +1117,23 @@ test "outbox: очередь офлайн, доставка при сессии,
         if (std.mem.eql(u8, t, "dup")) n += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), n);
+
+    // 6) форматирование с value: link доходит вместе с URL (B -> A, онлайн)
+    const link_ents = [_]envelope.TextEntity{
+        .{ .kind = .link, .offset = 0, .len = 3, .value = "https://shopot.local" },
+    };
+    _ = try eng_b.sendText(1, "tot", &link_ents);
+    try waitTexts(&ha, "tot");
+    {
+        const li = ha.texts.items.len - 1;
+        var lout: [envelope.max_text_entities]envelope.TextEntity = undefined;
+        const ltail = ha.ent_tails[li][0..ha.ent_tail_lens[li]];
+        const ln = try envelope.parseEntities(ltail, "tot".len, &lout);
+        try std.testing.expectEqual(@as(usize, 1), ln);
+        try std.testing.expectEqual(envelope.EntityKind.link, lout[0].kind);
+        try std.testing.expectEqual(@as(u16, 3), lout[0].len);
+        try std.testing.expectEqualStrings("https://shopot.local", lout[0].value);
+    }
 
     sb.close();
     _ = eng_a.sessions.remove(cid_b);

@@ -1,4 +1,4 @@
-# shopot Wire Protocol v3
+# shopot Wire Protocol v4
 
 Normative byte-level specification of the shopot P2P messenger wire protocol.
 Implementation: `shopot-zig` (this repository). Russian version:
@@ -65,8 +65,11 @@ IPs are connected (§18, §15).
 
 ## 3. Handshake (XX-like, m1 → m2 → m3)
 
-- `chaining_key = BLAKE2s-256("shopot-hs-v3")`; transcript hash = BLAKE2s-256
-  over all handshake messages.
+- `chaining_key = BLAKE2s-256("shopot-hs-v4")`; transcript hash = BLAKE2s-256
+  over all handshake messages. The domain string **is** the wire protocol
+  version: v4 = entity-carrying TEXT (§7.1). Kernels of different versions
+  derive different chaining keys, so their m2/m3 boxes never open — the
+  connection fails fast instead of silently dropping TEXT frames.
 - **m1** (A → B): `e_pub_A[32] || enc_pk_A[32]` — the initiator's static
   X25519 public key travels in the clear: the responder needs it to look up
   the contact before anything is encrypted.
@@ -197,7 +200,7 @@ shopot://i/<base64url(bundle[64] || secret[16] || name_len u8 || name ≤32)>
 
 | Tag | Name | Fields (LE unless noted) |
 |---|---|---|
-| 0x10 | TEXT | `msg_id[16], ts_ms u64, body str16 ≤ 4096` |
+| 0x10 | TEXT | `msg_id[16], ts_ms u64, body str16 ≤ 4096, ents (§7.1)` |
 | 0x13 | REACT | `msg_id[16], op u8 (1 add / 2 remove), codepoint u32` |
 | 0x14 | BLOCK_NOTICE | `reason u8` |
 | 0x15 | ACK | `msg_id[16]` |
@@ -217,6 +220,37 @@ shopot://i/<base64url(bundle[64] || secret[16] || name_len u8 || name ≤32)>
 
 All envelope structs live in `proto/envelope.zig`; the codec performs zero
 allocations (encode/decode into caller buffers).
+
+### 7.1 Message formatting (entities)
+
+A TEXT envelope carries optional entity objects (Telegram-MessageEntity
+style): ranges over the body + a formatting kind + an optional value.
+
+```
+TEXT tail: [ent_count u8 ≤ 32]
+           × ent_count { [kind u8][offset u16][len u16][value_len u8][value] }
+```
+
+- The count byte is **always present** (0 entities → one `0x00` byte), so a
+  v3 frame (no tail) fails decode as `Truncated` and is dropped.
+- `offset`/`len` are **UTF-8 byte** offsets into `body` — not code points,
+  not UTF-16 units. The core does not validate UTF-8 (same as for the body
+  itself); slicing on character boundaries at render time is the client's
+  job.
+- `kind`: 1 bold, 2 italic, 3 underline, 4 strikethrough, 5 spoiler,
+  6 code (inline), 7 pre (value = language tag, optional), 8 link
+  (value = URL, mandatory). 9+ reserved; a new kind is a new protocol
+  version. Unknown kind on decode → frame dropped.
+- `value` ≤ 255 bytes; empty for every kind except `link`/`pre`.
+- Validation (encode side and decode side): `len ≥ 1`,
+  `offset + len ≤ body_len`, entries sorted by `offset`; **overlapping
+  ranges are allowed** (bold + italic over the same span).
+- Budget: ≤ 32 entities, ≤ ~12.5 KB total tail — a maximal TEXT stays a
+  single obf frame of the 16384 class, the traffic shape is unchanged.
+
+The same canonical tail bytes are reused verbatim in the `msg`/`outbox` log
+records (§13) and in the UDS API payloads (SEND_MESSAGE, GET_HISTORY,
+GET_MESSAGE, MESSAGE_RECEIVED) — one encoding across every layer.
 
 ## 8. Offline delivery (outbox)
 
@@ -325,19 +359,23 @@ storage_key    = HKDF-SHA256(Expand(HKDF-Extract("shopot-store-v3", seed), "", 3
 
 | kind | value | payload |
 |---|---|---|
-| msg | 1 | `[cid u16][flags u8 (bit0 mine, bit1 delivered)][msg_id 16][ts u64][len u16][body]` |
+| msg | 1 | `[cid u16][flags u8 (bit0 mine, bit1 delivered)][msg_id 16][ts u64][len u16][body][ents tail]` |
 | contact | 2 | contact record (bundle, name, addresses) |
 | block | 3 | blocked contact |
 | react | 4 | reaction record |
 | set | 5 | `[key u8][value]`: 1 = my `avatar_id[16]`, 2 = my name |
 | tombstone | 6 | `u32 LE` seq of the record to delete |
-| outbox | 7 | sub u8: 1 = `[cid u16][msg_id 16][ts u64][len u16][body]`, 0 = `[cid u16][msg_id 16]` (delivered, clear on restart) |
+| outbox | 7 | sub u8: 1 = `[cid u16][msg_id 16][ts u64][len u16][body][ents tail]`, 0 = `[cid u16][msg_id 16]` (delivered, clear on restart) |
 | avatar | 8 | `[avatar_id 16][len u16][data ≤ 16000]` |
 | file | 9 | `[cid u16][file_id 16][size u32][len u8][name]` |
 
 - A tombstone marks a record dead in the index; compaction rewrites live
   records into a new file with `epoch+1` and drops tombstones and dead
   records.
+- The `ents tail` (§7.1, always written by v4 cores, count byte included)
+  is read **tolerantly**: a record that ends right after `body` is a legacy
+  v3 record and decodes as "no formatting" — message history survives the
+  upgrade without migration. A structurally invalid tail skips the record.
 - Any structural anomaly or failed box authentication on read → the whole
   file is untrusted (`Corrupt`).
 - Not one byte of plaintext, names, or metadata touches the disk. The
@@ -439,9 +477,14 @@ live instance by design).
 ## 19. Versioning and compatibility
 
 - The wire protocol is versioned by the **version byte** bound into the
-  handshake transcript and the storage header (both = 3).
+  handshake transcript (domain `shopot-hs-v4`, i.e. 4) and the storage
+  header (3, see below).
 - Incompatible changes require bumping the version byte and an entry in
   [CHANGELOG.md](../CHANGELOG.md). No silent redefinition of existing fields.
+- v4 (entities in TEXT, §7.1) is incompatible with v3 on the wire: the
+  handshake domain was bumped, so mixed-version peers never establish a
+  session (fail-fast). The storage header stays 3: the `msg`/`outbox` tail
+  is additive and read tolerantly, history survives an upgrade.
 - A major change of the UDS API contract (CORE-API.md) increments the API
   major version returned by `GET_VERSION`.
 - Sealed frames (0xA1 + epoch header) and `RATCHET_KEY` are incompatible with

@@ -880,13 +880,17 @@ const ScriptConn = struct {
     }
 };
 
-/// Сборщик TEXT-событий: тела КОПИРУЮТСЯ в фиксированные буферы — срезы
-/// onEnvelope указывают в стек rxSealed и вне вызова невалидны.
+/// Сборщик TEXT-событий: тела/хвосты entities КОПИРУЮТСЯ в фиксированные
+/// буферы — срезы onEnvelope указывают в стек rxSealed и вне вызова
+/// невалидны.
 const RxCollector = struct {
     got: bool = false,
     count: u32 = 0,
     bodies: [8][16]u8 = @splat(@splat(0)),
     lens: [8]u8 = @splat(0),
+    /// Хвост entities (первые 64 байтов — тестам больше не нужно).
+    tails: [8][64]u8 = @splat(@splat(0)),
+    tail_lens: [8]u8 = @splat(0),
 
     fn onEnvelope(ctx: *anyopaque, env: envelope.Envelope) void {
         const self: *RxCollector = @ptrCast(@alignCast(ctx));
@@ -897,6 +901,9 @@ const RxCollector = struct {
                     const n: u8 = @intCast(@min(t.body.len, 16));
                     @memcpy(self.bodies[self.count][0..n], t.body[0..n]);
                     self.lens[self.count] = n;
+                    const tn: usize = @min(t.ents_tail.len, 64);
+                    @memcpy(self.tails[self.count][0..tn], t.ents_tail[0..tn]);
+                    self.tail_lens[self.count] = @intCast(tn);
                 }
                 self.count += 1;
             },
@@ -911,6 +918,11 @@ const RxCollector = struct {
     /// Тело i-го принятого TEXT (копия, ≤ 16 байтов).
     fn bodyOf(self: *const RxCollector, i: usize) []const u8 {
         return self.bodies[i][0..self.lens[i]];
+    }
+
+    /// Хвост entities i-го принятого TEXT (копия, ≤ 64 байтов).
+    fn tailOf(self: *const RxCollector, i: usize) []const u8 {
+        return self.tails[i][0..self.tail_lens[i]];
     }
 };
 
@@ -1022,4 +1034,67 @@ test "session: PCS-ротация — dhStep, кадры в полёте, нов
     // первый кадр новой эпохи погасил снапшот: старых кадров не будет
     try std.testing.expect(s.prev_recv == null);
     try std.testing.expectEqual(@as(u64, 2), s.ratchet.recv_counter);
+}
+
+test "session: TEXT с entities — sealed roundtrip через rxLoop" {
+    const chain_a: [32]u8 = @splat(0x71);
+    const chain_b: [32]u8 = @splat(0x82);
+    var peer = ratchet_mod.Ratchet.init(chain_b, chain_a);
+
+    // «привет, мир!» = 21 байт UTF-8: bold на «привет» (0..12),
+    // link на «мир!» (14..21) с URL
+    var tail_buf: [envelope.max_text_tail]u8 = undefined;
+    const ents = [_]envelope.TextEntity{
+        .{ .kind = .bold, .offset = 0, .len = 12 },
+        .{ .kind = .link, .offset = 14, .len = 7, .value = "https://shopot.local" },
+    };
+    const tail = try envelope.encodeEntitiesTail(&tail_buf, &ents, "привет, мир!".len);
+
+    var env_buf: [envelope.max_encoded_len]u8 = undefined;
+    const plain = try envelope.encode(&env_buf, .{ .text = .{
+        .msg_id = @splat(9),
+        .ts_ms = 1,
+        .body = "привет, мир!",
+        .ents_tail = tail,
+    } });
+    var msg_key: [32]u8 = undefined;
+    const counter = peer.stepSend(&msg_key);
+    var f: [envelope.max_encoded_len + 64]u8 = undefined;
+    f[0] = sealed_tag;
+    std.mem.writeInt(u16, f[1..3], peer.epoch, .little);
+    std.mem.writeInt(u64, f[3..11], counter, .little);
+    f[11] = 0; // без сжатия
+    aead.seal(f[12..], plain, msg_key, aead.nonceFor(counter), f[0..sealed_hdr_len]);
+    const frame_len: usize = sealed_hdr_len + plain.len + aead.tag_length;
+
+    var wire: [envelope.max_encoded_len + 128]u8 = undefined;
+    var w: usize = 0;
+    pushFrame(&wire, &w, f[0..frame_len]);
+
+    var script = ScriptConn{ .bytes = wire[0..w] };
+    var collector = RxCollector{};
+    var s = Session{
+        .conn = script.conn(),
+        .ratchet = ratchet_mod.Ratchet.init(chain_a, chain_b),
+        .keys = .{ .send_key = @splat(0), .recv_key = @splat(0), .transcript = @splat(0) },
+        .ev = .{ .ctx = &collector, .onEnvelope = RxCollector.onEnvelope, .onClosed = RxCollector.onClosed },
+        .alloc = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    s.rxLoop();
+
+    try std.testing.expect(collector.got);
+    try std.testing.expectEqual(@as(u32, 1), collector.count);
+    // коллектор хранит только первые 16 байтов тела
+    try std.testing.expectEqualStrings("привет, мир!"[0..16], collector.bodyOf(0));
+    // хвост дошёл дословно и разбирается в те же entities
+    try std.testing.expectEqualSlices(u8, tail, collector.tailOf(0));
+    var out: [envelope.max_text_entities]envelope.TextEntity = undefined;
+    const n = try envelope.parseEntities(collector.tailOf(0), "привет, мир!".len, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(envelope.EntityKind.bold, out[0].kind);
+    try std.testing.expectEqual(@as(u16, 12), out[0].len);
+    try std.testing.expectEqual(envelope.EntityKind.link, out[1].kind);
+    try std.testing.expectEqual(@as(u16, 14), out[1].offset);
+    try std.testing.expectEqualStrings("https://shopot.local", out[1].value);
 }

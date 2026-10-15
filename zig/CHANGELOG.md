@@ -1,5 +1,56 @@
 # Changelog — shopot-zig
 
+## [неизданное] — форматирование сообщений: entities (offset, kind, value)
+
+### Added
+- **TEXT (0x10) несёт entities форматирования** (стиль Telegram
+  MessageEntity): после body — хвост `[ent_count u8 ≤ 32]`
+  × `[kind u8][offset u16][len u16][value_len u8][value]`. Виды:
+  bold / italic / underline / strikethrough / spoiler / code / pre
+  (value = язык) / link (value = URL). offset/len — БАЙТЫ UTF-8 в body;
+  пересечения диапазонов разрешены, сортировка по offset обязательна.
+- **Одна каноническая кодировка хвоста на всех слоях**: провод TEXT,
+  записи лога kind msg/outbox, payload API (SEND_MESSAGE, GET_HISTORY,
+  GET_MESSAGE, событие MESSAGE_RECEIVED).
+- Хелперы proto: `TextEntity`, `EntityKind`, `validateEntities`,
+  `encodeEntitiesTail`, `parseEntities` (нулевые аллокации; value —
+  срезы входного буфера).
+
+### Changed
+- **Провода v4**: байт счётчика entities есть ВСЕГДА — раскладка TEXT
+  несовместима со старой. Домен рукопожатия поднят `shopot-hs-v3` →
+  `shopot-hs-v4`: ядра разных версий не сходятся вовсе (боксы m2/m3 не
+  открываются) — fail-fast вместо молчаливой потери TEXT.
+- **API 1.0.0 → 2.0.0 (Major)**: SEND_MESSAGE требует хвост (старый
+  payload без него → BAD_FRAME); ответы GET_HISTORY/GET_MESSAGE и
+  событие MESSAGE_RECEIVED несут хвост после body. Строгий разбор
+  сохранён.
+- `Engine.sendText(cid, body, ents)` + `Events.onText(..., ents)`:
+  entities валидируются движком (BadEntities), пробрасываются в app-слой.
+- `OutboxEntry` хранит хвост готовыми wire-байтами (`ents_tail`):
+  офлайн-доставка и рестарт демона сохраняют форматирование без
+  перепарса.
+- GET_HISTORY: окно режется не только `limit`, но и бюджетом payload
+  1 МиБ (entity-тяжёлая история — count может быть меньше limit).
+
+### Compatibility
+- Хранилище: заголовок остаётся version 3 — хвост в записях msg/outbox
+  аддитивен, читается толерантно; старые записи = «без форматирования»,
+  история переживает апгрейд без миграции.
+- Ядра v3 ↔ v4 не поднимают сессию (домен рукопожатия). Официальный
+  GUI-клиент обязан обновиться на API 2.0.0.
+
+### Tests
+- proto: roundtrip entities, точная раскладка хвоста, максимум 32 × 255
+  с телом 4096 (один obf-кадр 16384), ошибки parse/validate (границы,
+  сортировка, value-правила, неизвестный kind, мусор, обрезание), v3-кадр
+  без хвоста → Truncated.
+- engine: outbox хранит хвост дословно; onText получает типизированные
+  entities; кривые entities → BadEntities.
+- session: sealed roundtrip TEXT с entities через rxLoop.
+- integration E2E: офлайн-отправка с entities → очередь → флеш → приём
+  (хвост дошёл теми же байтами); link с URL онлайн.
+
 ## [неизданное] — zlib-сжатие payload sealed-кадров (ROADMAP P1)
 
 ### Changed

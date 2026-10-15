@@ -199,8 +199,10 @@ pub const App = struct {
 // Все evXxx собирают бинарный payload и рассылают его всем подключённым
 // GUI-клиентам. ВЫЗЫВАТЬ ПОД app.mu: список conns живёт под этим локом.
 
-/// MESSAGE_RECEIVED: входящее сообщение контакта.
-fn evMessageReceived(app: *App, cid: i64, msg_id: [16]u8, ts_ms: i64, name: []const u8, body: []const u8) void {
+/// MESSAGE_RECEIVED: входящее сообщение контакта. После body — хвост
+/// entities форматирования ([ent_count u8] × {entity}, канонический формат
+/// proto/envelope.zig); форматирования нет — один байт счётчика 0.
+fn evMessageReceived(app: *App, cid: i64, msg_id: [16]u8, ts_ms: i64, name: []const u8, body: []const u8, ents: []const envelope.TextEntity) void {
     var w = api.Writer.init(app.alloc);
     defer w.deinit();
     w.putU32(@intCast(cid)) catch return;
@@ -208,7 +210,20 @@ fn evMessageReceived(app: *App, cid: i64, msg_id: [16]u8, ts_ms: i64, name: []co
     w.putU64(@intCast(ts_ms)) catch return;
     w.putStr16(name) catch return;
     w.putStr16(body) catch return;
+    putEntities(&w, body.len, ents) catch return;
     api_srv.fanoutEventLocked(app, .MESSAGE_RECEIVED, w.items());
+}
+
+/// Хвост entities в payload ответа/события: те же канонические байты,
+/// что на проводе TEXT и в логе. Ошибка валидации (не должно случаться —
+/// движок уже валидировал) — счётчик 0.
+fn putEntities(w: *api.Writer, body_len: usize, ents: []const envelope.TextEntity) !void {
+    var tail_buf: [envelope.max_text_tail]u8 = undefined;
+    const tail = envelope.encodeEntitiesTail(&tail_buf, ents, body_len) catch {
+        try w.putU8(0);
+        return;
+    };
+    try w.putBytes(tail);
 }
 
 /// MESSAGE_DELIVERED: ACK — сообщение дошло до устройства пира.
@@ -462,12 +477,12 @@ fn contactIndexOf(app: *App, from: *const engine_mod.Contact) ?usize {
     return null;
 }
 
-fn onTextEv(ctx: *anyopaque, from: *const engine_mod.Contact, msg_id: [16]u8, _: i64, body: []const u8) void {
+fn onTextEv(ctx: *anyopaque, from: *const engine_mod.Contact, msg_id: [16]u8, _: i64, body: []const u8, ents: []const envelope.TextEntity) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
     const now = app.nowMs();
-    persistMsg(app, @intCast(idx + 1), false, msg_id, true, now, body);
-    evMessageReceived(app, @intCast(idx + 1), msg_id, now, from.getName(), body);
+    persistMsg(app, @intCast(idx + 1), false, msg_id, true, now, body, ents);
+    evMessageReceived(app, @intCast(idx + 1), msg_id, now, from.getName(), body, ents);
 }
 
 /// Получен аватар: кэш (память + лог) + событие AVATAR_RECEIVED.
@@ -1711,19 +1726,26 @@ fn acceptLoop(app: *App, listener: *tcp.Listener, cid: i64) void {
     }
 }
 
-/// SEND_MESSAGE: payload [cid u32][body str16 ≤4096].
+/// SEND_MESSAGE: payload [cid u32][body str16 ≤4096][ent_count u8]
+/// × {[kind u8][offset u16][len u16][value_len u8][value]}.
 /// Ответ: [msg_id 16][flags u8 (bit0 = queued)]. Отправка офлайн — НЕ ошибка.
 fn apiSendMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     var r = api.Reader.init(payload);
     const cid = r.readU32() catch return .BAD_FRAME;
     const body = r.readStr16() catch return .BAD_FRAME;
-    if (r.hasMore()) return .BAD_FRAME;
     if (body.len == 0 or body.len > envelope.max_text_body) return .BAD_ARGS;
+    // хвост entities = остаток payload (структурно обрезан — BAD_FRAME,
+    // семантика неверна — BAD_ARGS)
+    var ents: [envelope.max_text_entities]envelope.TextEntity = undefined;
+    const n = envelope.parseEntities(r.buf[r.pos..], body.len, &ents) catch |e| switch (e) {
+        error.Truncated, error.BadLen => return .BAD_FRAME,
+        else => return .BAD_ARGS,
+    };
     app.lock();
     defer app.unlock();
     if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
-    const oc = app.eng.sendText(@intCast(cid), body) catch |e| return statusOf(e);
-    persistMsg(app, @intCast(cid), true, oc.msg_id, oc.result == .sent, app.nowMs(), body);
+    const oc = app.eng.sendText(@intCast(cid), body, ents[0..n]) catch |e| return statusOf(e);
+    persistMsg(app, @intCast(cid), true, oc.msg_id, oc.result == .sent, app.nowMs(), body, ents[0..n]);
     if (oc.result == .queued) persistOutboxAdd(app);
     w.putBytes(&oc.msg_id) catch return .INTERNAL;
     w.putU8(if (oc.result == .queued) 1 else 0) catch return .INTERNAL;
@@ -1847,14 +1869,24 @@ fn persistOutboxAdd(app: *App) void {
     if (items.len == 0) return;
     const e = items[items.len - 1];
     if (e.body.len > 4096) return;
-    var buf: [3 + 16 + 8 + 2 + 4096]u8 = undefined;
+    if (e.ents_tail.len > envelope.max_text_tail) return;
+    var buf: [3 + 16 + 8 + 2 + 4096 + envelope.max_text_tail]u8 = undefined;
     std.mem.writeInt(u16, buf[1..3], @intCast(e.cid), .little);
     buf[0] = 1;
     @memcpy(buf[3 .. 3 + 16], &e.msg_id);
     std.mem.writeInt(u64, buf[19..27], e.ts_ms, .little);
     std.mem.writeInt(u16, buf[27..29], @intCast(e.body.len), .little);
     @memcpy(buf[29 .. 29 + e.body.len], e.body);
-    _ = log.append(.outbox, buf[0 .. 29 + e.body.len]) catch {};
+    var n = 29 + e.body.len;
+    // хвост entities: пусто -> счётчик 0 (новые записи всегда с хвостом)
+    if (e.ents_tail.len == 0) {
+        buf[n] = 0;
+        n += 1;
+    } else {
+        @memcpy(buf[n .. n + e.ents_tail.len], e.ents_tail);
+        n += e.ents_tail.len;
+    }
+    _ = log.append(.outbox, buf[0..n]) catch {};
 }
 
 /// Записать в лог погашение (ACK) записи outbox.
@@ -1880,12 +1912,31 @@ fn persistReact(app: *App, cid: i64, mine: bool, msg_id: [16]u8, code: u32, ts_m
     _ = log.append(.react, buf[0..31]) catch {};
 }
 
-/// Записать сообщение в историю (kind msg, шифрованный лог).
+/// Заглушка хвоста entities «форматирования нет»: один байт счётчика 0.
+const zero_tail = [_]u8{0};
+
+/// Хвост entities записи kind msg/outbox (после [.. len u16][body]).
+/// Старые записи (конец сразу после body) — легаси: возвращаем счётчик 0,
+/// история переживает апгрейд. Битый хвост — null: запись пропускается.
+fn recEntityTail(rec: []const u8, blen: usize) ?[]const u8 {
+    const body_end = 29 + blen;
+    if (rec.len == body_end) return &zero_tail;
+    if (rec.len < body_end) return null;
+    const tail = rec[body_end..];
+    _ = envelope.parseEntities(tail, blen, null) catch return null;
+    return tail;
+}
+
+/// Записать сообщение в историю (kind msg, шифрованный лог). После body —
+/// хвост entities (канонический формат; пустые ents -> счётчик 0). Чтение
+/// толерантно к старым записям без хвоста (история переживает апгрейд).
 /// ts — реальное локальное время (мс), метка в конверте остаётся приватной.
-fn persistMsg(app: *App, cid: i64, mine: bool, msg_id: [16]u8, delivered: bool, ts_ms: i64, body: []const u8) void {
+fn persistMsg(app: *App, cid: i64, mine: bool, msg_id: [16]u8, delivered: bool, ts_ms: i64, body: []const u8, ents: []const envelope.TextEntity) void {
     const log = app.log orelse return;
     if (body.len == 0 or body.len > 4096) return;
-    var buf: [3 + 16 + 8 + 2 + 4096]u8 = undefined;
+    var tail_buf: [envelope.max_text_tail]u8 = undefined;
+    const tail = envelope.encodeEntitiesTail(&tail_buf, ents, body.len) catch return;
+    var buf: [3 + 16 + 8 + 2 + 4096 + envelope.max_text_tail]u8 = undefined;
     std.mem.writeInt(u16, buf[0..2], @intCast(cid), .little);
     // бит0 = mine, бит1 = delivered
     buf[2] = @as(u8, @intFromBool(mine)) | (@as(u8, @intFromBool(delivered)) << 1);
@@ -1893,7 +1944,8 @@ fn persistMsg(app: *App, cid: i64, mine: bool, msg_id: [16]u8, delivered: bool, 
     std.mem.writeInt(u64, buf[19..27], @intCast(ts_ms), .little);
     std.mem.writeInt(u16, buf[27..29], @intCast(body.len), .little);
     @memcpy(buf[29 .. 29 + body.len], body);
-    _ = log.append(.msg, buf[0 .. 29 + body.len]) catch {};
+    @memcpy(buf[29 + body.len ..][0..tail.len], tail);
+    _ = log.append(.msg, buf[0 .. 29 + body.len + tail.len]) catch {};
 }
 
 /// Записать принятый файл в лог (kind file): переживает рестарты.
@@ -2044,7 +2096,9 @@ fn apiGetAvatarId(app: *App, payload: []const u8, w: *api.Writer) api.Status {
 
 /// GET_HISTORY: payload [cid u32][limit u32] (0 → 50, максимум 200).
 /// Ответ: [total u32][count u32] × {[flags u8 bit0 mine bit1 delivered]
-/// [msg_id 16][ts_ms u64][body str16]} — записи старые → новые.
+/// [msg_id 16][ts_ms u64][body str16][ent_count u8] × {entity}} — записи
+/// старые → новые. Окно режется и бюджетом payload (≤ 1 МиБ): count может
+/// быть меньше limit для entity-тяжёлой истории.
 /// Лога нет — пустой список (OK).
 fn apiGetHistory(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     var r = api.Reader.init(payload);
@@ -2063,7 +2117,7 @@ fn apiGetHistory(app: *App, payload: []const u8, w: *api.Writer) api.Status {
         w.putU32(0) catch return .INTERNAL;
         return .OK;
     };
-    // записи: [cid u16][flags u8][msg_id 16][ts u64][len u16][body]
+    // записи: [cid u16][flags u8][msg_id 16][ts u64][len u16][body][ents]
     const recs = log.readAll(.msg, app.alloc) catch return .INTERNAL;
     defer {
         for (recs) |rec| app.alloc.free(rec);
@@ -2073,22 +2127,28 @@ fn apiGetHistory(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     var start: usize = recs.len; // индекс первой записи окна
     {
         var count: usize = 0;
+        var budget: usize = 8; // total u32 + count u32
         var i: usize = recs.len;
         while (i > 0) {
             i -= 1;
             const rec = recs[i];
             if (rec.len < 29) continue;
             if (std.mem.readInt(u16, rec[0..2], .little) != cid) continue;
+            const blen = std.mem.readInt(u16, rec[27..29], .little);
+            if (rec.len < 29 + blen) continue;
+            const tail = recEntityTail(rec, blen) orelse continue;
             total += 1;
             count += 1;
-            if (count == limit) {
+            budget += 1 + 16 + 8 + 2 + blen + tail.len;
+            if (count == limit or budget > api.max_payload) {
                 start = i;
                 break;
             }
         }
         if (i == 0 and start == recs.len) start = 0;
     }
-    // две фазы: посчитать записи окна, потом записать (payload один кадр)
+    // две фазы: посчитать записи окна, потом записать (payload один кадр);
+    // фильтры идентичны фазе 1 — записей ровно in_window, бюджет уже учтён
     var in_window: usize = 0;
     var idx2 = start;
     while (idx2 < recs.len) : (idx2 += 1) {
@@ -2097,6 +2157,7 @@ fn apiGetHistory(app: *App, payload: []const u8, w: *api.Writer) api.Status {
         if (std.mem.readInt(u16, rec[0..2], .little) != cid) continue;
         const blen = std.mem.readInt(u16, rec[27..29], .little);
         if (rec.len < 29 + blen) continue;
+        if (recEntityTail(rec, blen) == null) continue;
         in_window += 1;
     }
     w.putU32(@intCast(total)) catch return .INTERNAL;
@@ -2111,16 +2172,19 @@ fn apiGetHistory(app: *App, payload: []const u8, w: *api.Writer) api.Status {
         const ts_ms = std.mem.readInt(u64, rec[19..27], .little);
         const blen = std.mem.readInt(u16, rec[27..29], .little);
         if (rec.len < 29 + blen) continue;
+        const tail = recEntityTail(rec, blen) orelse continue;
         w.putU8(flags) catch return .INTERNAL;
         w.putBytes(&msg_id) catch return .INTERNAL;
         w.putU64(ts_ms) catch return .INTERNAL;
         w.putStr16(rec[29 .. 29 + blen]) catch return .INTERNAL;
+        w.putBytes(tail) catch return .INTERNAL;
     }
     return .OK;
 }
 
 /// GET_MESSAGE: payload [msg_id 16]. Ответ:
 /// [cid u32][flags u8 bit0 mine bit1 delivered][ts_ms u64][body str16]
+/// [ent_count u8] × {entity}
 /// [react_count u32] × {[flags u8 bit0 mine][codepoint u32][ts_ms u64]}.
 /// Нет записи — NOT_FOUND.
 fn apiGetMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
@@ -2144,10 +2208,12 @@ fn apiGetMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     const cid = std.mem.readInt(u16, rec[0..2], .little);
     const ts_ms = std.mem.readInt(u64, rec[19..27], .little);
     const blen = std.mem.readInt(u16, rec[27..29], .little);
+    const tail = recEntityTail(rec, blen) orelse return .NOT_FOUND;
     w.putU32(cid) catch return .INTERNAL;
     w.putU8(flags) catch return .INTERNAL;
     w.putU64(ts_ms) catch return .INTERNAL;
-    w.putStr16(rec[29..@min(29 + blen, rec.len)]) catch return .INTERNAL;
+    w.putStr16(rec[29 .. 29 + blen]) catch return .INTERNAL;
+    w.putBytes(tail) catch return .INTERNAL;
     // реакции на это сообщение
     const rrecs = log.readAll(.react, app.alloc) catch return .INTERNAL;
     defer {
@@ -2232,6 +2298,7 @@ fn loadContacts(app: *App) void {
                 if (app.eng.outbox.items[i].cid == cid and std.mem.eql(u8, &app.eng.outbox.items[i].msg_id, &msg_id)) {
                     const old = app.eng.outbox.orderedRemove(i);
                     app.alloc.free(old.body);
+                    app.alloc.free(old.ents_tail);
                 } else i += 1;
             }
             continue;
@@ -2242,8 +2309,21 @@ fn loadContacts(app: *App) void {
         const blen = std.mem.readInt(u16, rec[27..29], .little);
         if (blen == 0 or blen > 4096 or rec.len < 29 + blen) continue;
         const body = app.alloc.dupe(u8, rec[29 .. 29 + blen]) catch continue;
-        app.eng.outbox.append(app.alloc, .{ .cid = cid, .msg_id = msg_id, .ts_ms = ts_ms, .body = body }) catch {
+        // хвост entities: старые записи без хвоста — форматирования нет
+        var ents_tail: []u8 = &.{};
+        if (rec.len > 29 + blen) {
+            const t = recEntityTail(rec, blen) orelse {
+                app.alloc.free(body);
+                continue;
+            };
+            ents_tail = app.alloc.dupe(u8, t) catch {
+                app.alloc.free(body);
+                continue;
+            };
+        }
+        app.eng.outbox.append(app.alloc, .{ .cid = cid, .msg_id = msg_id, .ts_ms = ts_ms, .body = body, .ents_tail = ents_tail }) catch {
             app.alloc.free(body);
+            app.alloc.free(ents_tail);
         };
     }
     // аватары: кэш id -> байты (свои и чужие)
@@ -2307,7 +2387,7 @@ fn statusOf(e: anyerror) api.Status {
         error.TooManyInvites => .TOO_MANY_INVITES,
         error.FileNotFound => .FILE_NOT_FOUND,
         error.NoRelay => .NO_RELAY,
-        error.BadArgs, error.BadHex, error.BadCode, error.BadName, error.BadAddr => .BAD_ARGS,
+        error.BadArgs, error.BadEntities, error.BadHex, error.BadCode, error.BadName, error.BadAddr => .BAD_ARGS,
         error.Busy => .BUSY,
         error.NoCall => .NO_CALL,
         else => .INTERNAL,
