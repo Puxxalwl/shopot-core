@@ -46,3 +46,8 @@ C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из master; арх�
 - Хранилище: append-only AEAD-лог, ни одного байта открытого текста
 
 См. `zig/docs/PROTOCOL.md`, SECURITY.md.
+
+## Официальный клиент
+
+- Второй разработчик проекта shopot: [EryynIT](https://github.com/EryynIT)
+- Официальный клиент shopot: [shopot](https://github.com/EryynIT/shopot)
