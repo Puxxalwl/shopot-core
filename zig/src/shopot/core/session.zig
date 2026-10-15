@@ -22,6 +22,66 @@ const identity_mod = @import("../crypto/identity.zig");
 const envelope = @import("../proto/envelope.zig");
 
 const X25519 = std.crypto.dh.X25519;
+const flate = std.compress.flate;
+
+/// Порог сжатия payload sealed-кадра: ниже не отбить zlib-оверхед
+/// (~6 байт хедер+чексумма) на кадре с 26 байтами AEAD/обф-оверхеда.
+const compress_min_len: usize = 512;
+/// Сжатие обязано выиграть хотя бы столько, чтобы кадр не вырос.
+const compress_min_gain: usize = 64;
+
+/// zlib-сжатие payload sealed-кадра. Возвращает длину сжатых данных в
+/// out_buf либо null (нечего жать / уже сжатое / не выиграли). Детерминизм
+/// не требуется — данные под AEAD, важна только обратимость.
+fn compressPayload(plain: []const u8, out_buf: []u8) ?usize {
+    if (plain.len < compress_min_len) return null;
+    if (looksCompressed(plain)) return null;
+    var w: std.Io.Writer = .fixed(out_buf);
+    // окно 64 КБ — стек отправителя; level_6 (zlib default)
+    var window: [flate.max_window_len]u8 = undefined;
+    var c = flate.Compress.init(&w, &window, .zlib, .default) catch return null;
+    c.writer.writeAll(plain) catch return null;
+    c.finish() catch return null;
+    const n = w.buffered().len;
+    if (n + compress_min_gain >= plain.len) return null;
+    return n;
+}
+
+/// Разжать zlib payload в out_buf. null — битый поток или декомпрессия
+/// больше буфера (zip-бомба: отправитель гарантирует исходный размер
+/// ≤ max_encoded_len, больше — атака/порча, кадр отбрасывается).
+fn decompressPayload(comp: []const u8, out_buf: []u8) ?usize {
+    var r: std.Io.Reader = .fixed(comp);
+    var window: [flate.max_window_len]u8 = undefined;
+    var d = flate.Decompress.init(&r, .zlib, &window);
+    const n = d.reader.readSliceShort(out_buf) catch return null;
+    if (n == out_buf.len) {
+        // буфер заполнен полностью: данных за ним быть не должно
+        var probe: [1]u8 = undefined;
+        const extra = d.reader.readSliceShort(&probe) catch return null;
+        if (extra != 0) return null;
+    }
+    if (n == 0) return null;
+    return n;
+}
+
+/// Payload уже в несжимаемом формате (PNG/JPEG/GZIP/ZIP/ZSTD) — двойное
+/// сжатие только раздует кадр. TEXT-тела сюда не попадают, guard на вырост.
+fn looksCompressed(p: []const u8) bool {
+    if (p.len >= 4) {
+        const magic4 = p[0..4];
+        if (std.mem.eql(u8, magic4, "\x89PNG")) return true; // PNG
+        if (std.mem.eql(u8, magic4, "\x28\xB5\x2F\xFD")) return true; // zstd
+        if (std.mem.eql(u8, magic4, "PK\x03\x04")) return true; // zip
+    }
+    if (p.len >= 3) {
+        if (std.mem.eql(u8, p[0..3], "\xFF\xD8\xFF")) return true; // jpeg
+    }
+    if (p.len >= 2) {
+        if (std.mem.eql(u8, p[0..2], "\x1F\x8B")) return true; // gzip
+    }
+    return false;
+}
 
 pub const SessionError = error{
     HandshakeFailed,
@@ -51,7 +111,7 @@ pub const Events = struct {
 
 const sealed_tag: u8 = 0xA1; // ratchet-sealed TEXT frame marker
 /// Заголовок sealed-кадра: [tag 0xA1][epoch u16 LE][counter u64 LE].
-const sealed_hdr_len: usize = 1 + 2 + 8;
+const sealed_hdr_len: usize = 1 + 2 + 8 + 1;
 
 /// Свежая X25519-пара стороны для СЛЕДУЮЩЕЙ эпохи ротации.
 const RotPair = struct {
@@ -340,7 +400,15 @@ pub const Session = struct {
             }
             var enc: [envelope.max_encoded_len]u8 = undefined;
             const plain = envelope.encode(&enc, env) catch return SessionError.TooBig;
-            const frame_len: usize = sealed_hdr_len + plain.len + aead.tag_length;
+            // zlib-сжатие длинного payload ДО запечатывания (ROADMAP P1):
+            // текст 2-4x, уже-сжатое и невыигрышное — без сжатия
+            var comp_buf: [envelope.max_encoded_len]u8 = undefined;
+            const payload: []const u8 = if (compressPayload(plain, &comp_buf)) |n|
+                comp_buf[0..n]
+            else
+                plain;
+            const compressed = payload.len != plain.len;
+            const frame_len: usize = sealed_hdr_len + payload.len + aead.tag_length;
             if (2 + frame_len > batch.len) return SessionError.TooBig;
             if (used > 0 and used + 2 + frame_len > batch.len) {
                 // следующий кадр не влезает: флеш накопленного
@@ -355,8 +423,11 @@ pub const Session = struct {
             dst[2] = sealed_tag;
             std.mem.writeInt(u16, dst[3..5], self.ratchet.epoch, .little);
             std.mem.writeInt(u64, dst[5..13], counter, .little);
+            // флаг сжатия в sealed-заголовке: покрывается AD — подделать
+            // флаг без ключа нельзя, разжатие идёт после AEAD-open
+            dst[13] = @intFromBool(compressed);
             const nonce = aead.nonceFor(counter);
-            aead.seal(dst[13..], plain, msg_key, nonce, dst[2 .. 2 + sealed_hdr_len]);
+            aead.seal(dst[14..], payload, msg_key, nonce, dst[2 .. 2 + sealed_hdr_len]);
             std.mem.writeInt(u16, dst[0..2], @intCast(frame_len), .little);
             used += 2 + frame_len;
         }
@@ -514,6 +585,7 @@ pub const Session = struct {
         if (frame.len < sealed_hdr_len + aead.tag_length) return null;
         const epoch = std.mem.readInt(u16, frame[1..3], .little);
         const counter = std.mem.readInt(u64, frame[3..11], .little);
+        const compressed = frame[11] != 0;
         const box = frame[sealed_hdr_len..];
         const ad = frame[0..sealed_hdr_len];
 
@@ -546,7 +618,15 @@ pub const Session = struct {
             return null;
         }
 
-        const plain_len = box.len - aead.tag_length;
+        // сжатый payload: разжать ПОСЛЕ AEAD-open (флаг в AD аутентичен),
+        // разжатое обязано влезть в plain_buf — иначе бомба/порча
+        var plain_len = box.len - aead.tag_length;
+        if (compressed) {
+            var comp_scratch: [envelope.max_encoded_len]u8 = undefined;
+            @memcpy(comp_scratch[0..plain_len], plain_buf[0..plain_len]);
+            plain_len = decompressPayload(comp_scratch[0..plain_len], plain_buf) orelse
+                return null;
+        }
         const env = envelope.decode(plain_buf[0..plain_len]) catch return null;
         if (commit_current) {
             self.ratchet.commitRecv();
@@ -590,7 +670,8 @@ test "session: битый sealed-кадр не рассинхронизируе�
     good[0] = sealed_tag;
     std.mem.writeInt(u16, good[1..3], peer_ratchet.epoch, .little);
     std.mem.writeInt(u64, good[3..11], counter, .little);
-    aead.seal(good[11..], plain, msg_key, aead.nonceFor(counter), good[0..11]);
+    good[11] = 0; // без сжатия
+    aead.seal(good[12..], plain, msg_key, aead.nonceFor(counter), good[0..sealed_hdr_len]);
     const good_frame_len: usize = sealed_hdr_len + plain.len + aead.tag_length;
 
     // битый sealed-кадр с ТОТ ЖЕ counter 0, но мусор вместо бокса:
@@ -599,8 +680,9 @@ test "session: битый sealed-кадр не рассинхронизируе�
     bad[0] = sealed_tag;
     std.mem.writeInt(u16, bad[1..3], peer_ratchet.epoch, .little);
     std.mem.writeInt(u64, bad[3..11], counter, .little);
+    bad[11] = 0; // без сжатия
     const garbage_len: usize = plain.len + aead.tag_length;
-    for (bad[11..][0..garbage_len], 0..) |*b, i| b.* = @truncate(i *% 31 +% 5);
+    for (bad[12..][0..garbage_len], 0..) |*b, i| b.* = @truncate(i *% 31 +% 5);
     const bad_frame_len: usize = sealed_hdr_len + garbage_len;
 
     // скрипт провода: [hdr][битый][hdr][валидный]
@@ -649,7 +731,8 @@ test "session: повтор sealed-кадра (counter не тот) отбрас
     box[0] = sealed_tag;
     std.mem.writeInt(u16, box[1..3], peer_ratchet.epoch, .little);
     std.mem.writeInt(u64, box[3..11], c0, .little);
-    aead.seal(box[11..], plain, msg_key, aead.nonceFor(c0), box[0..11]);
+    box[11] = 0; // без сжатия
+    aead.seal(box[12..], plain, msg_key, aead.nonceFor(c0), box[0..sealed_hdr_len]);
     const frame_len: usize = sealed_hdr_len + plain.len + aead.tag_length;
 
     // один и тот же кадр ДВАЖДЫ: второй — повтор (counter 0 при ожидаемом 1)
@@ -698,6 +781,57 @@ fn readFrame(conn: interfaces.Conn, buf: []u8) !usize {
     if (len > buf.len) return error.FrameTooBig;
     try conn.readAll(buf[0..len]);
     return len;
+}
+
+test "session: zlib-сжатие payload — roundtrip, порог, несжимаемое" {
+    // длинный текст ~3.5 КБ (порог 512 пройден, отдача 2x+)
+    var plain: [3500]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    prng.random().bytes(&plain);
+    // русский текст в UTF-8: многобайтовые кодпоинты — реальный кейс TEXT
+    const word = "привет, ";
+    for (&plain, 0..) |*b, i| b.* = word[i % word.len];
+    var out: [envelope.max_encoded_len]u8 = undefined;
+    const n = compressPayload(&plain, &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(n < plain.len / 2); // текст обязан жаться 2x+
+    // roundtrip
+    var back: [envelope.max_encoded_len]u8 = undefined;
+    const m = decompressPayload(out[0..n], &back) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(plain.len, m);
+    try std.testing.expectEqualSlices(u8, &plain, back[0..m]);
+
+    // ниже порога — не жмём
+    var small: [64]u8 = undefined;
+    @memset(&small, 'a');
+    try std.testing.expect(compressPayload(&small, &out) == null);
+
+    // уже-сжатое (PNG-магия) — не жмём
+    var png: [2048]u8 = undefined;
+    @memset(&png, 0xAB);
+    png[0..4].* = .{ 0x89, 'P', 'N', 'G' };
+    try std.testing.expect(compressPayload(&png, &out) == null);
+
+    // высокоэнтропийный мусор: может и не выиграть — тогда null (не ошибка)
+    var rnd: [4096]u8 = undefined;
+    prng.random().bytes(&rnd);
+    if (compressPayload(&rnd, &out)) |rn| {
+        // если уж сжали — обязана быть честная обратимость
+        const rm = decompressPayload(out[0..rn], &back) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualSlices(u8, &rnd, back[0..rm]);
+    }
+
+    // бомба: маленький сжатый кусок, разжимающийся больше буфера — null
+    var big: [envelope.max_encoded_len]u8 = undefined;
+    @memset(&big, 0x00);
+    var bomb_comp: [envelope.max_encoded_len + 128]u8 = undefined;
+    const bn = compressPayload(&big, &bomb_comp) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(bn < big.len / 8);
+    // буфер вдвое меньше — не влезает, обязаны отказаться
+    var small_out: [envelope.max_encoded_len / 2]u8 = undefined;
+    try std.testing.expect(decompressPayload(bomb_comp[0..bn], &small_out) == null);
+
+    // битый zlib-поток — null
+    try std.testing.expect(decompressPayload(out[0..8], &back) == null);
 }
 
 test "session module compiles" {
@@ -794,7 +928,8 @@ fn sealFrame(out: []u8, r: *ratchet_mod.Ratchet, body: []const u8) usize {
     out[0] = sealed_tag;
     std.mem.writeInt(u16, out[1..3], r.epoch, .little);
     std.mem.writeInt(u64, out[3..11], counter, .little);
-    aead.seal(out[11..], plain, msg_key, aead.nonceFor(counter), out[0..11]);
+    out[11] = 0; // без сжатия
+    aead.seal(out[12..], plain, msg_key, aead.nonceFor(counter), out[0..sealed_hdr_len]);
     return sealed_hdr_len + plain.len + aead.tag_length;
 }
 

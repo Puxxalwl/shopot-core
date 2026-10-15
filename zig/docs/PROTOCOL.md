@@ -91,11 +91,21 @@ IPs are connected (§18, §15).
 TEXT envelopes are sealed a **second** time above the transport AEAD:
 
 ```
-[0xA1][epoch u16 LE][counter u64 LE][ChaCha20-Poly1305 box]
+[0xA1][epoch u16 LE][counter u64 LE][comp u8][ChaCha20-Poly1305 box]
 ```
 
-AD = the full 11-byte header. The 0xA1 magic and the epoch byte make sealed
-frames self-describing inside the obfuscated stream.
+AD = the full 12-byte header (the compression flag is authenticated — it
+cannot be flipped without breaking the box). The 0xA1 magic and the epoch
+byte make sealed frames self-describing inside the obfuscated stream.
+
+Payload compression (ROADMAP P1, zlib): if the encoded envelope is ≥ 512
+bytes the sender tries `std.compress.flate` (zlib container, level 6) before
+sealing; `comp = 1` means the box holds the zlib stream, the receiver
+decompresses after AEAD-open. Not compressed: payloads below the threshold
+(ratio cannot pay for the ~8-byte zlib overhead), already-compressed
+content (PNG/JPEG/GZIP/ZIP/ZSTD magic), and anything that fails to shrink
+by ≥ 64 bytes. Decompression is bounded by the frame-size limit — a stream
+that inflates beyond `max_encoded_len` is dropped (zip-bomb guard).
 
 ## 5. Message ratchet (symmetric chain + DH epochs)
 

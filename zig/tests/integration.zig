@@ -536,6 +536,17 @@ test "ratchet: PCS-ротация по порогу отправки, все с�
     // после ротации обычный обмен жив
     try sa.sendText("post-rotate");
     try waitTexts(&hb, "post-rotate");
+
+    // zlib-сжатие payload: длинный текст (>512) через весь стек —
+    // compress -> seal -> obf -> pipe -> open -> decompress -> decode
+    const long_word = "сжатиеpayload ";
+    var long_buf: [3000]u8 = undefined;
+    for (&long_buf, 0..) |*b, i| b.* = long_word[i % long_word.len];
+    long_buf[long_buf.len - 1] = '!';
+    try sa.sendText(long_buf[0..]);
+    try waitTexts(&hb, long_buf[0..]);
+    try sb.sendText(long_buf[0..]);
+    try waitTexts(&ha, long_buf[0..]);
     // кадр новой эпохи дошёл и погасил снапшот у B
     try std.testing.expect(sb.prev_recv == null);
 

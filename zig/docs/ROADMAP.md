@@ -74,9 +74,12 @@ Fake-TLS hides the protocol from DPI; the relay hides the IP. What remains:
   frame per envelope instead of two); outbox/TEXT batches via
   sendSealedTexts — one frame per batch. Optional next: coalescing
   REACT/ACK/PROFILE into a shared batch writer.
-- **zlib compression** of payloads > 512 bytes before AEAD
-  (std.compress.flate): text compresses 2–4×, random data does not —
-  header flag. Do not compress PNG/JPG avatars/files (magic-byte detect).
+- ✅ **zlib compression** of payloads ≥ 512 bytes before AEAD
+  (std.compress.flate, zlib container, level 6): the sealed header grew a
+  `comp` flag byte (12-byte header, covered by AD); text compresses 2–4×,
+  already-compressed content is detected by magic bytes (PNG/JPEG/GZIP/
+  ZIP/ZSTD) and skipped, sub-64-byte gains are skipped, decompression is
+  bounded by the frame limit (zip-bomb guard).
 - FBA on hot paths envIn/dispatch (AGENTS.md §3): currently a couple of
   allocations per envelope. Measure first, then fix pointwise.
 
