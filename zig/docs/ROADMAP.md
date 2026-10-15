@@ -1,93 +1,95 @@
-# ROADMAP — технический план shopot-core
+# ROADMAP — shopot-core technical plan
 
-Приоритеты для агентов/клиентов. Всё — std-only, без ОС-пакетов и внешних
-сервисов. Порядок = рекомендуемый порядок реализации.
+Priorities for agents and client authors. Everything is std-only: no OS
+packages, no external services. Order = recommended implementation order.
+Russian version: [ROADMAP.ru.md](ROADMAP.ru.md).
 
-## P0 — ✅ ГОТОВО (сделано)
+## P0 — ✅ DONE
 
-- ~~Релей~~: `shopot relay` + `invite <имя> relay <addr>` — marker-спаривание
-  HMAC(invite_secret), байтовый сплит, само-переподключение A-стороны
+- ~~Relay~~: `shopot relay` + `invite <name> relay <addr>` — HMAC
+  marker-pairing (invite secret), byte split, A-side self-reconnect
   (e2e: E2E-RELAY-PASS).
-- ~~Fake-TLS~~: маскировка провода под TLS 1.3.
-- ~~Джиттер-буфер звонка~~: очередь 16 слотов, плейаут 20 мс тиком.
-- ~~Звонки 16 кГц + ADPCM + DTX~~: 72 кбит/с.
-- ~~Файлы чанками~~: FILE_META/FILE_DATA, SHA-сверка, дедуп.
+- ~~Fake-TLS~~: wire disguised as TLS 1.3.
+- ~~Call jitter buffer~~: 16-slot queue, 20 ms playback tick.
+- ~~Calls 16 kHz + ADPCM + DTX~~: 72 kbit/s.
+- ~~Chunked files~~: FILE_META/FILE_DATA, SHA verification, dedup.
 
-Оставшееся из P0: постоянное релей-присутствие контакта (после JOIN
-реконнект через релей требует нового инвайта).
+Remaining from P0: persistent relay presence of a contact (reconnecting
+through a relay after JOIN currently requires a new invite).
 
-## P0+ — ✅ ГОТОВО: крипта, PCS-ротация рэтчета
+## P0+ — ✅ DONE: ratchet PCS rotation
 
-- ~~DH-шаг рэтчета в сессии~~ ✅: конверт RATCHET_KEY (0x44) обменивается
-  свежими X25519-пабликами, обе стороны делают dhStep каждые rotate_every
-  (256) сообщений; sealed-кадры несут эпоху ([0xA1][epoch u16][counter
-  u64][box]), кадры «в полёте» прошлой эпохи расшифровываются по снапшоту
-  prev_recv, первый кадр новой эпохи гасит снапшот. Полное skipped-keys
-  окно как в spec §2.6 не нужно: порядок потока (обф/TCP) гарантирует
-  строго последовательные кадры, дедуп по счётчику. E2E: 48 сообщений при
-  пороге 4, ни одно не теряется, эпохи сторон равны.
+- ~~In-session DH step~~ ✅: `RATCHET_KEY` (0x44) exchanges fresh X25519
+  public keys; both sides run `dhStep` every `rotate_every = 256` messages;
+  sealed frames carry the epoch (`[0xA1][epoch u16][counter u64][box]`);
+  in-flight frames of the previous epoch decrypt via the `prev_recv`
+  snapshot, killed by the first new-epoch frame. A full skipped-keys window
+  per spec §2.6 is unnecessary: stream ordering (obf/TCP) guarantees strictly
+  sequential frames, dedup by counter. E2E: 48 messages at threshold 4, no
+  losses, epochs equal on both sides.
 
-## P0+ — следующее за релеем
+## P0+ — next after the relay
 
-Fake-TLS прячет ПРОТОКОЛ от DPI, релей прячет IP. Что осталось:
+Fake-TLS hides the protocol from DPI; the relay hides the IP. What remains:
 
-- Релей-присутствие: контакт хранит relay-адрес и держит регистрацию
-  (marker = HMAC(долговременный контакт-секрет)), реконнект без нового
-  инвайта. Инвайт-секрет сейчас одноразовый → нужен contact-level secret.
-- Мульти-релей: инвайт с несколькими адресами (failover).
+- **Relay presence**: the contact stores the relay address and keeps its
+  registration (marker = HMAC over a long-lived contact-level secret),
+  reconnecting without a new invite. The invite secret is currently
+  one-time — a contact-level secret is needed.
+- **Multi-relay**: an invite with several addresses (failover).
 
-## P0 — звонки: качество
+## P0 — calls: quality
 
-- **Джиттер-буфер** (адаптивный, 2-5 кадров): сейчас кадр играет сразу,
-  сетевой разброс → щелчки. Буфер в onCallAudioEv + таймер слива.
-- **Resume аудио**: DTX уже шлёт keepalive; добавить comfort-noise
-  (генерация лёгкого шума при тишине) — аplay не «захлёбывается».
-- **Opus нельзя** (внешний кодек) — альтернатива: 2-уровневый ADPCM
-  (высокие частоты кодируются вторым блоком) или SBC-подобный суб-кодек,
-  ~14 кбит/с. Приоритет ниже: 72 кбит/с уже ок для голоса.
-- Громкость/AGC — на стороне клиента (GUI), ядро не лезет.
+- **Jitter buffer** (adaptive, 2–5 frames): frames currently play
+  immediately; network jitter → clicks. Buffer in onCallAudioEv + a drain
+  timer.
+- **Audio resume**: DTX already sends keepalive; add comfort noise (light
+  noise generation during silence).
+- **Opus is out** (external codec) — alternative: two-level ADPCM (highs
+  encoded by a second block) or an SBC-like sub-codec, ~14 kbit/s. Lower
+  priority: 72 kbit/s is already fine for voice.
+- Volume/AGC — client-side (GUI); the core does not touch it.
 
-## P1 — передача файлов: докачка
+## P1 — file transfer: resume
 
-- ✅ **FILE_ACK** `{file_id, got_u32}`: приём подтверждает каждый 8-й чанк
-  (+ финальный и позиционный на каждый FILE_META), отправитель ведёт окно
-  64 чанка (~1 МБ), докачивает с последнего ACK при разрыве сессии —
-  передача возобновляется при reconnect автоматически (engine.file_tx,
-  resumeFileTx + FILE_SENT событие UDS). E2E-тест «докачка после разрыва»
-  в tests/integration.zig.
-- Список файлов UDS: `files <cid>` → `f <id_hex> <size> <имя>` (лог
-  kind FILE уже пишется).
-- Выдача содержимого: `getfile <id_hex> <путь>` — копия из кэша.
-- Чанк >16000 (до 64000) одним envelope: меньше кадров на большие файлы
-  (obf сам режет на 16356-байтные кадра) — замерить выгоду.
+- ✅ **FILE_ACK** `{file_id, got u32}`: the receiver acknowledges every 8th
+  chunk (+ the final one, and a positional reply to every FILE_META); the
+  sender keeps a 64-chunk window (~1 MB) and resumes from the last ACK on
+  session break — the transfer auto-resumes on reconnect (engine.file_tx,
+  resumeFileTx + FILE_SENT UDS event). E2E "resume after break" in
+  tests/integration.zig.
+- File list over UDS: `files <cid>` → `f <id_hex> <size> <name>` (FILE log
+  records are already written).
+- Content retrieval: `getfile <id_hex> <path>` — a copy from the cache.
+- Chunks > 16000 (up to 64000) per envelope: fewer frames for large files
+  (obf still splits into 16356-byte frames) — measure the win first.
 
-## P1 — производительность
+## P1 — performance
 
-- ~~Коалесценция мелких конвертов~~ ✅: заголовок+payload одним writeAll
-  (один obf-кадр на конверт вместо двух), outbox/TEXT-пачки через
-  sendSealedTexts — один кадр на пачку. Дальше по желанию: коалесценция
-  REACT/ACK/PROFILE в общий пачечный писатель.
-- **zlib-сжатие** payload > 512 байт перед AEAD (std.compress.flate):
-  текст жмётся 2-4x, случайные данные не жмутся → header-флаг. Аватары/
-  файлы PNG/JPG не жать (детект по магическим байтам).
-- FBA на горячих путях envIn/dispatch (AGENTS.md §3): сейчас пара аллокаций
-  на конверт. Замерить, потом точечно.
+- ~~Small-envelope coalescing~~ ✅: header+payload in one writeAll (one obf
+  frame per envelope instead of two); outbox/TEXT batches via
+  sendSealedTexts — one frame per batch. Optional next: coalescing
+  REACT/ACK/PROFILE into a shared batch writer.
+- **zlib compression** of payloads > 512 bytes before AEAD
+  (std.compress.flate): text compresses 2–4×, random data does not —
+  header flag. Do not compress PNG/JPG avatars/files (magic-byte detect).
+- FBA on hot paths envIn/dispatch (AGENTS.md §3): currently a couple of
+  allocations per envelope. Measure first, then fix pointwise.
 
-## P2 — удобство API
+## P2 — API conveniences
 
-- `search <запрос>` — поиск по истории (лог MSG уже расшифровывается
+- `search <query>` — history search (MSG log is already decrypted by
   readAll(.msg)).
-- Групповые чаты = N двусторонних сессий + fanout ядром (без новых
-  конвертов, только логика рассылки). Сначала спросить: нужно ли.
-- `typing` индикатор: конверт 0x62 (пустой), UDS-событие
-  `typing <cid>` + гашение через 3 с.
-- Экспорт истории: `export <cid> <путь>` — текстовый дамп из лога.
+- Group chats = N pairwise sessions + fan-out by the engine (no new
+  envelopes, delivery logic only). Ask first whether it is needed.
+- `typing` indicator: empty envelope (tag TBD — 0x62 is taken by FILE_ACK),
+  UDS event `typing <cid>` + a 3 s timeout.
+- History export: `export <cid> <path>` — text dump from the log.
 
-## Анти-план (НЕ делать)
+## Anti-plan (do NOT build)
 
-- ❌ Внешние зависимости (opus/libsodium/zlib-ng) — только std.
-- ❌ JSON на UDS — line-протокол не меняем.
-- ❌ «Облачная» синхронизация — serverless архитектура, ключи только
-  у пользователей.
-- ❌ Мульти-device: один identity = один живый инстанс (сейчас так;
-  multi-device требует ratchet-форварда — отдельный большой проект).
+- ❌ External dependencies (opus/libsodium/zlib-ng) — std only.
+- ❌ JSON over UDS — the binary frame protocol stays.
+- ❌ "Cloud" sync — serverless architecture; keys live with the users only.
+- ❌ Multi-device: one identity = one live instance (as of now; multi-device
+  requires ratchet forwarding — a separate large project).
