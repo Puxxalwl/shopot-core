@@ -14,6 +14,17 @@ C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из master; арх�
 
 Бинарник: `zig/zig-out/bin/shopot-zig`.
 
+## Релей (скрытие IP)
+
+```bash
+# на любом сервере (VPS):
+./shopot relay 0.0.0.0:9000
+
+# у себя:
+> invite bob relay vps.example.com:9000
+# → код уходит bob-у; bob делает add — и видит только адрес релея
+```
+
 ## Использование
 
     shopot-zig init          # личность: ~/.shopot/zig-seed (0600)

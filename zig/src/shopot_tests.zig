@@ -17,6 +17,7 @@ test {
     _ = @import("shopot/net/framing.zig");
     _ = @import("shopot/net/obfuscate.zig");
     _ = @import("shopot/net/faketls.zig");
+    _ = @import("shopot/net/relay.zig");
     _ = @import("shopot/net/heartbeat.zig");
     _ = @import("shopot/net/tcp.zig");
     _ = @import("shopot/app/adpcm.zig");

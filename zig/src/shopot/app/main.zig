@@ -103,6 +103,20 @@ const CallState = struct {
     pcm: ?audio_mod.PcmPort = null,
     audio_thread: ?std.Thread = null,
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // ---- джиттер-буфер приёма (плейаут-очередь) ----
+    jbuf: [16]JSlot = @splat(.{}),
+    /// следующий seq к воспроизведению (инициализируется первым кадром).
+    jplay_seq: u32 = 0,
+    /// true — jplay_seq выставлен первым принятым кадром.
+    jinit: bool = false,
+    /// мс прихода первого кадра (для стартовой выдержки 60 мс).
+    jfirst_ms: i64 = 0,
+};
+
+/// Слот джиттер-буфера: один декодированный кадр PCM.
+const JSlot = struct {
+    have: bool = false,
+    pcm: [audio_mod.frame_bytes]u8 = @splat(0),
 };
 
 // ------------------------------------------------------------------ app
@@ -670,7 +684,17 @@ fn onCallAudioEv(ctx: *anyopaque, from: *const engine_mod.Contact, seq: u32, dat
         },
         else => return, // неизвестный кодек: кадр отброшен
     }
-    if (c.pcm) |*pcm| pcm.writeFrame(play);
+    // джиттер-буфер: кадр в очередь, воспроизведение — по тику micLoop
+    // (равномерные 20 мс); без микрофона — прямая запись (фолбэк)
+    if (c.pcm == null) return;
+    const slot = &c.jbuf[seq % 16];
+    @memcpy(&slot.pcm, play);
+    slot.have = true;
+    if (!c.jinit) {
+        c.jinit = true;
+        c.jplay_seq = seq;
+        c.jfirst_ms = app.nowMs();
+    }
 }
 
 /// Найти cid по bundle (порядок стабильный: contacts[i] — id i+1).
@@ -747,6 +771,42 @@ fn micLoop(app: *App) void {
         acc_len = 0;
         c.seq = frame_seq + 1;
         _ = app.eng.callAudio(c.cid, frame_seq, wbuf[0 .. 1 + sealed]) catch {};
+        jbufTick(app, c);
+    }
+}
+
+/// Один тик плейаута джиттер-буфера (вызывается из micLoop каждые 20 мс
+/// под app.mu). Правила:
+///   - ждём накопления 3 кадров ИЛИ стартовой выдержки 60 мс (первый кадр);
+///   - перегруз 8+ кадров = слив лишних (задержка не растёт);
+///   - дыра дольше 200 мс = пропуск seq (маскирование потери).
+fn jbufTick(app: *App, c: *CallState) void {
+    if (c.pcm == null or !c.jinit) return;
+    var filled: usize = 0;
+    for (&c.jbuf) |*sl| {
+        if (sl.have) filled += 1;
+    }
+    const now = app.nowMs();
+    const start_ok = filled >= 3 or (now - c.jfirst_ms) >= 60;
+    if (!start_ok) return;
+    if (filled >= 8) {
+        for (&c.jbuf) |*sl| {
+            if (sl.have) {
+                c.pcm.?.writeFrame(&sl.pcm);
+                sl.have = false;
+            }
+        }
+        return;
+    }
+    const slot = &c.jbuf[c.jplay_seq % 16];
+    if (slot.have) {
+        c.pcm.?.writeFrame(&slot.pcm);
+        slot.have = false;
+        c.jplay_seq +%= 1;
+        c.jfirst_ms = now; // отсчёт дыры — от последнего сыгранного
+    } else if (now - c.jfirst_ms > 200) {
+        c.jplay_seq +%= 1;
+        c.jfirst_ms = now;
     }
 }
 
@@ -1021,116 +1081,122 @@ fn autoAcceptLoop(app: *App, listener: *tcp.Listener) void {
                 continue;
             };
         }
-        // весь провод завёрнут в fake-TLS: обёртку ставим ДО чтения m1,
-        // кадр m1 [len u16][64] приходит внутри записей application_data
-        const raw = faketlsServer(app, tc) catch {
-            tc.deinit();
-            continue;
-        };
-        var hdr: [2]u8 = undefined;
-        raw.readAll(&hdr) catch {
-            tc.deinit();
-            continue;
-        };
-        const m1_len = std.mem.readInt(u16, &hdr, .little);
-        if (m1_len != 64) {
-            tc.deinit();
-            continue;
-        }
-        var m1: [64]u8 = undefined;
-        raw.readAll(&m1) catch {
-            tc.deinit();
-            continue;
-        };
-        // какой это контакт — узнаем из enc_pk в m1
-        var found_cid: i64 = -1;
-        {
-            app.lock();
-            defer app.unlock();
-            for (app.eng.contacts.items, 0..) |c, i| {
-                if (std.mem.eql(u8, c.bundle[0..32], m1[32..64])) {
-                    found_cid = @intCast(i + 1);
-                    break;
-                }
-            }
-        }
-        if (found_cid < 0) {
-            // держатель инвайт-кода: поднимаем pending-сессию без опознания
-            app.lock();
-            const has_invite = blk: {
-                for (&app.invites) |*reg| {
-                    if (!reg.used and reg.created_ms != 0) break :blk true;
-                }
-                break :blk false;
-            };
-            app.unlock();
-            if (has_invite) {
-                var eph2: [32]u8 = undefined;
-                app.io.random(&eph2);
-                const sc = app.alloc.create(SessCtx) catch {
-                    tc.deinit();
-                    continue;
-                };
-                sc.* = .{ .app = app, .cid = -1, .s = null };
-                const sp = session_mod.Session.establishPending(
-                    app.alloc,
-                    raw,
-                    &m1,
-                    app.id,
-                    eph2,
-                    app,
-                    wrapConn,
-                    .{ .ctx = sc, .onEnvelope = envIn, .onClosed = onClosed },
-                    app.io,
-                ) catch {
-                    app.alloc.destroy(sc);
-                    tc.deinit();
-                    continue;
-                };
-                sc.s = sp;
-                // окно 3 с: нет валидного JOIN — закрыть
-                const tt = std.Thread.spawn(.{}, joinTimeoutWatch, .{sc}) catch {
-                    sp.close();
-                    app.alloc.destroy(sc);
-                    tc.deinit();
-                    continue;
-                };
-                tt.detach();
-            } else {
-                tc.deinit();
-            }
-            continue;
-        }
-        var eph: [32]u8 = undefined;
-        app.io.random(&eph);
-        const sc = app.alloc.create(SessCtx) catch {
-            tc.deinit();
-            continue;
-        };
-        sc.* = .{ .app = app, .cid = found_cid };
-        const s = session_mod.Session.establishIdentified(
-            app.alloc,
-            raw,
-            &m1,
-            app.id,
-            eph,
-            identifyCb,
-            app,
-            app,
-            wrapConn,
-            .{ .ctx = sc, .onEnvelope = envIn, .onClosed = onClosed },
-            app.io,
-        ) catch {
-            app.alloc.destroy(sc);
-            tc.deinit();
-            continue;
-        } orelse {
-            app.alloc.destroy(sc);
-            tc.deinit();
-            continue;
-        };
-        app.bindSession(found_cid, s, sc) catch {};
+        handleAcceptedConn(app, tc);
     }
+}
+
+/// Обработка входящего коннекта (TCP-accept ИЛИ спаренный релей-коннект):
+/// fake-TLS обёртка -> m1 -> опознание контакта / pending-join по инвайту.
+fn handleAcceptedConn(app: *App, tc: *tcp.TcpConn) void {
+    // весь провод завёрнут в fake-TLS: обёртку ставим ДО чтения m1,
+    // кадр m1 [len u16][64] приходит внутри записей application_data
+    const raw = faketlsServer(app, tc) catch {
+        tc.deinit();
+        return;
+    };
+    var hdr: [2]u8 = undefined;
+    raw.readAll(&hdr) catch {
+        tc.deinit();
+        return;
+    };
+    const m1_len = std.mem.readInt(u16, &hdr, .little);
+    if (m1_len != 64) {
+        tc.deinit();
+        return;
+    }
+    var m1: [64]u8 = undefined;
+    raw.readAll(&m1) catch {
+        tc.deinit();
+        return;
+    };
+    // какой это контакт — узнаем из enc_pk в m1
+    var found_cid: i64 = -1;
+    {
+        app.lock();
+        defer app.unlock();
+        for (app.eng.contacts.items, 0..) |c, i| {
+            if (std.mem.eql(u8, c.bundle[0..32], m1[32..64])) {
+                found_cid = @intCast(i + 1);
+                break;
+            }
+        }
+    }
+    if (found_cid < 0) {
+        // держатель инвайт-кода: поднимаем pending-сессию без опознания
+        app.lock();
+        const has_invite = blk: {
+            for (&app.invites) |*reg| {
+                if (!reg.used and reg.created_ms != 0) break :blk true;
+            }
+            break :blk false;
+        };
+        app.unlock();
+        if (has_invite) {
+            var eph2: [32]u8 = undefined;
+            app.io.random(&eph2);
+            const sc = app.alloc.create(SessCtx) catch {
+                tc.deinit();
+                return;
+            };
+            sc.* = .{ .app = app, .cid = -1, .s = null };
+            const sp = session_mod.Session.establishPending(
+                app.alloc,
+                raw,
+                &m1,
+                app.id,
+                eph2,
+                app,
+                wrapConn,
+                .{ .ctx = sc, .onEnvelope = envIn, .onClosed = onClosed },
+                app.io,
+            ) catch {
+                app.alloc.destroy(sc);
+                tc.deinit();
+                return;
+            };
+            sc.s = sp;
+            // окно 3 с: нет валидного JOIN — закрыть
+            const tt = std.Thread.spawn(.{}, joinTimeoutWatch, .{sc}) catch {
+                sp.close();
+                app.alloc.destroy(sc);
+                tc.deinit();
+                return;
+            };
+            tt.detach();
+        } else {
+            tc.deinit();
+        }
+        return;
+    }
+    var eph: [32]u8 = undefined;
+    app.io.random(&eph);
+    const sc = app.alloc.create(SessCtx) catch {
+        tc.deinit();
+        return;
+    };
+    sc.* = .{ .app = app, .cid = found_cid };
+    const s = session_mod.Session.establishIdentified(
+        app.alloc,
+        raw,
+        &m1,
+        app.id,
+        eph,
+        identifyCb,
+        app,
+        app,
+        wrapConn,
+        .{ .ctx = sc, .onEnvelope = envIn, .onClosed = onClosed },
+        app.io,
+    ) catch {
+        app.alloc.destroy(sc);
+        tc.deinit();
+        return;
+    } orelse {
+        app.alloc.destroy(sc);
+        tc.deinit();
+        return;
+    };
+    app.bindSession(found_cid, s, sc) catch {};
 }
 
 fn readRawAll(tc: *tcp.TcpConn, out: []u8) !void {
@@ -1143,10 +1209,61 @@ fn readRawAll(tc: *tcp.TcpConn, out: []u8) !void {
 }
 
 // ------------------------------------------------------------- commands
+
+/// Поток A-стороны релея: держит регистрацию marker-ом, пока инвайт жив.
+/// Спаривание -> handleAcceptedConn (JOIN поднимет контакт). Обрыв ->
+/// переподключение (пир может дозваниваться долго).
+fn relayLinkerLoop(app: *App, secret: [16]u8, addr: []const u8) void {
+    const addr_copy = app.alloc.dupe(u8, addr) catch return;
+    defer app.alloc.free(addr_copy);
+    const sleep2: std.os.linux.timespec = .{ .sec = 2, .nsec = 0 };
+    while (app.running) {
+        // инвайт ещё жив? (не redeemed)
+        {
+            app.lock();
+            defer app.unlock();
+            var alive = false;
+            for (&app.invites) |*reg| {
+                if (std.mem.eql(u8, &reg.secret, &secret) and !reg.used and reg.created_ms != 0) {
+                    alive = true;
+                    break;
+                }
+            }
+            if (!alive) return;
+        }
+        const tc = shopot.net.relay.dial(app.alloc, addr_copy, secret) catch {
+            _ = std.os.linux.nanosleep(&sleep2, null);
+            continue;
+        };
+        {
+            app.lock();
+            defer app.unlock();
+            app.raw_conns.append(app.alloc, tc) catch {
+                tc.deinit();
+                _ = std.os.linux.nanosleep(&sleep2, null);
+                continue;
+            };
+        }
+        // спарено: входящий пир (m1+JOIN) — как TCP-accept
+        handleAcceptedConn(app, tc);
+        // соединение отработало/оборвалось: инвайт ещё жив -> повтор
+    }
+}
+
 fn cmdInvite(app: *App, args: []const u8) !void {
     var it = std.mem.tokenizeAny(u8, args, " ");
     const name = it.next() orelse "shopot";
-    const addr = it.next();
+    var addr = it.next();
+    // relay-форма: invite <имя> relay <host:port> — держатель держит
+    // регистрацию на релее, подключающийся не видит наш IP
+    var is_relay = false;
+    if (addr) |a| {
+        if (std.mem.eql(u8, a, "relay")) {
+            addr = it.next();
+            if (addr == null) return error.BadArgs;
+            is_relay = true;
+        }
+    }
     // односторонний v2-код: держатель добавляется ONE add-ом
     var secret: [invite_mod.secret_len]u8 = undefined;
     app.io.random(&secret);
@@ -1164,9 +1281,22 @@ fn cmdInvite(app: *App, args: []const u8) !void {
         app.invites[i] = .{ .secret = secret, .created_ms = app.nowMs(), .used = false };
     }
     var out: [256]u8 = undefined;
-    const code = try invite_mod.encode2(&out, app.id.bundle(), secret, name, addr);
+    var rbuf: [80]u8 = undefined;
+    const code_addr: ?[]const u8 = if (is_relay) blk: {
+        if (addr == null) return error.BadArgs;
+        const r = std.fmt.bufPrint(&rbuf, "r/{s}", .{addr.?}) catch return error.BadArgs;
+        break :blk r;
+    } else addr;
+    const code = try invite_mod.encode2(&out, app.id.bundle(), secret, name, code_addr);
     fb(app, null, code);
     fb(app, null, "односторонний код: отдай его — держатель сделает add, больше ничего не нужно");
+    if (is_relay) {
+        if (addr) |a| {
+            if (std.Thread.spawn(.{}, relayLinkerLoop, .{ app, secret, a })) |t| {
+                t.detach();
+            } else |_| {}
+        }
+    }
 }
 
 fn cmdAdd(app: *App, args: []const u8) !void {
@@ -1178,6 +1308,8 @@ fn cmdAdd(app: *App, args: []const u8) !void {
     // моё имя для JOIN (видит приглашающий): хвост после кода
     var my_name: []const u8 = "друг";
     var join_after: ?JoinInfo = null;
+    // v2+relay: адрес в коде — релей, диал через marker-спаривание
+    var relay_secret: ?[16]u8 = null;
     if (std.mem.indexOfScalar(u8, trimmed, ' ')) |sp| {
         if (std.mem.startsWith(u8, trimmed, invite_mod.v2_prefix)) {
             my_name = std.mem.trim(u8, trimmed[sp + 1 ..], " ");
@@ -1194,6 +1326,9 @@ fn cmdAdd(app: *App, args: []const u8) !void {
             addr = std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ inv.addr().?, inv.port }) catch return error.BadArgs;
         }
         // v2: держатель кода — JOIN первым конвертом после рукопожатия
+        if (inv.v2) {
+            if (inv.relay) relay_secret = inv.secret;
+        }
         if (inv.v2) join_after = .{
             .secret = inv.secret,
             .name_len = @intCast(my_name.len),
@@ -1231,11 +1366,21 @@ fn cmdAdd(app: *App, args: []const u8) !void {
     }
     // Если код содержит адрес — подключение происходит сразу, без connect/id.
     // Без адреса — LAN-захват: linkerLoop дозвонится до анонса приглашающего.
-    if (addr) |a| establishTo(app, a, cid, .initiator) catch |e| {
-        var eb: [64]u8 = undefined;
-        const et = std.fmt.bufPrint(&eb, "автоподключение: {s}", .{@errorName(e)}) catch "!";
-        fb(app, @intCast(cid - 1), et);
-    };
+    if (addr) |a| {
+        if (relay_secret) |sec| {
+            establishToRelay(app, a, cid, .initiator, sec) catch |e| {
+                var eb: [64]u8 = undefined;
+                const et = std.fmt.bufPrint(&eb, "автоподключение: {s}", .{@errorName(e)}) catch "!";
+                fb(app, @intCast(cid - 1), et);
+            };
+        } else {
+            establishTo(app, a, cid, .initiator) catch |e| {
+                var eb: [64]u8 = undefined;
+                const et = std.fmt.bufPrint(&eb, "автоподключение: {s}", .{@errorName(e)}) catch "!";
+                fb(app, @intCast(cid - 1), et);
+            };
+        }
+    }
 }
 
 /// id: свой bundle и отпечаток (сверка голосом/QR между пользователями).
@@ -1343,10 +1488,19 @@ fn faketlsServer(app: *App, tc: *tcp.TcpConn) !interfaces.Conn {
 }
 
 fn establishTo(app: *App, addr: []const u8, cid: i64, role: session_mod.HandshakeRole) !void {
+    return establishToRelay(app, addr, cid, role, null);
+}
+
+/// establishTo с опциональным релеем: secret != null — адрес это релей,
+/// подключение через marker-спаривание (пир не видит наш IP).
+fn establishToRelay(app: *App, addr: []const u8, cid: i64, role: session_mod.HandshakeRole, relay_secret: ?[16]u8) !void {
     const idx: usize = @intCast(cid - 1);
     if (idx >= app.eng.contacts.items.len) return error.NoContact;
     const bundle = app.eng.contacts.items[idx].bundle;
-    const tc = try tcp.dial(app.alloc, addr);
+    const tc = if (relay_secret) |sec|
+        shopot.net.relay.dial(app.alloc, addr, sec) catch return error.NoRelay
+    else
+        try tcp.dial(app.alloc, addr);
     {
         app.lock();
         defer app.unlock();
@@ -2113,6 +2267,11 @@ pub fn execCmd(app: *App, trimmed: []const u8) bool {
     }
     return true;
 }
+fn badUsage() error{BadUsage} {
+    std.debug.print("{s}\n", .{usage});
+    return error.BadUsage;
+}
+
 pub fn main(start: std.process.Init) !void {
     const io = start.io;
     const home: []const u8 = start.environ_map.get("HOME") orelse "";
@@ -2123,6 +2282,21 @@ pub fn main(start: std.process.Init) !void {
         return;
     }
     const cmd: []const u8 = std.mem.span(argv[1]);
+
+    // relay <host:port>: байтовый сплит без состояния shopot (скрытие IP).
+    // Запускается на любом сервере: shopot relay 0.0.0.0:9000
+    if (std.mem.eql(u8, cmd, "relay")) {
+        const addr = if (argv.len >= 3) std.mem.span(argv[2]) else return badUsage();
+        var listener = tcp.listen(addr) catch {
+            std.debug.print("relay: не удалось слушать {s}\n", .{addr});
+            return;
+        };
+        std.debug.print("relay: слушаю {s}, спариваю по marker-у инвайта\n", .{addr});
+        var dbg_state = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+        const alloc = dbg_state.allocator();
+        shopot.net.relay.serve(alloc, &listener);
+        return;
+    }
 
     if (std.mem.eql(u8, cmd, "init")) {
         var seed: [32]u8 = undefined;

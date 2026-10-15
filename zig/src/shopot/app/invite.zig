@@ -32,6 +32,9 @@ pub const Invite = struct {
     secret: [secret_len]u8 = @splat(0),
     /// true — код v2: redeem через JOIN-конверт (односторонний add).
     v2: bool = false,
+    /// true — адрес в коде указывает на РЕЛЕЙ (@r/host:port): подключение
+    /// через marker-спаривание, пир не видит наш IP.
+    relay: bool = false,
 
     pub fn name(self: *const Invite) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -156,6 +159,10 @@ pub fn decode(code: []const u8) Error!Invite {
         if (65 + @as(usize, nl) != n) return Error.BadCode;
         inv.name_len = nl;
         @memcpy(inv.name_buf[0..nl], raw[65 .. 65 + nl]);
+    }
+    if (std.mem.startsWith(u8, host_part, "r/")) {
+        inv.relay = true;
+        host_part = host_part[2..];
     }
     if (host_part.len > 0) {
         const colon = std.mem.lastIndexOfScalar(u8, host_part, ':') orelse return Error.BadAddr;

@@ -19,6 +19,7 @@ pub const proto = struct {
 pub const net = struct {
     pub const framing = @import("shopot/net/framing.zig");
     pub const faketls = @import("shopot/net/faketls.zig");
+    pub const relay = @import("shopot/net/relay.zig");
     pub const obfuscate = @import("shopot/net/obfuscate.zig");
     pub const heartbeat = @import("shopot/net/heartbeat.zig");
     pub const tcp = @import("shopot/net/tcp.zig");
