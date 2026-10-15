@@ -179,12 +179,14 @@ pub const App = struct {
         if (self.hb.getPtr(cid)) |st| st.onInbound(now);
         // сессия поднята — слить outbox (доставка офлайн-хвоста)
         self.eng.flushOutbox(cid);
+        // ...и докачать файлы в полёте (с последнего подтверждённого чанка)
+        self.eng.resumeFileTx(cid);
         // PROFILE-эхо: имя + avatar_id пир-у при каждом установлении
         self.eng.sendProfile(cid) catch {};
     }
 
     fn events(self: *App) engine_mod.Events {
-        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onProfile = onProfileEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv, .onAvatar = onAvatarEv, .onAvatarReq = onAvatarReqEv, .onFileMeta = onFileMetaEv, .onFileData = onFileDataEv };
+        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onProfile = onProfileEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv, .onAvatar = onAvatarEv, .onAvatarReq = onAvatarReqEv, .onFileMeta = onFileMetaEv, .onFileData = onFileDataEv, .onFileSent = onFileSentEv };
     }
 };
 
@@ -253,6 +255,18 @@ fn evAvatarReceived(app: *App, cid: i64, avatar_id: [16]u8, data: []const u8) vo
     w.putBytes(&avatar_id) catch return;
     w.putStr16(data) catch return;
     api_srv.fanoutEventLocked(app, .AVATAR_RECEIVED, w.items());
+}
+
+/// FILE_SENT: исходящий файл передан целиком — все чанки подтверждены
+/// FILE_ACK-ами получателя.
+fn evFileSent(app: *App, cid: i64, file_id: [16]u8, size: u32, name: []const u8) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putBytes(&file_id) catch return;
+    w.putU32(size) catch return;
+    w.putStr16(name) catch return;
+    api_srv.fanoutEventLocked(app, .FILE_SENT, w.items());
 }
 
 /// FILE_RECEIVED: файл принят целиком (байты в ~/.shopot/files).
@@ -455,31 +469,53 @@ fn onAvatarEv(ctx: *anyopaque, from: *const engine_mod.Contact, avatar_id: [16]u
     evAvatarReceived(app, @intCast(idx + 1), avatar_id, data);
 }
 
-/// FILE_META: начать приём файла (состояние под app.mu).
+/// FILE_META: начать приём файла (состояние под app.mu) и ответить
+/// ПОЗИЦИОННЫМ FILE_ACK — отправитель докачивает с нашей позиции:
+/// rx уже в полёте → expected_seq; файл сохранён ранее → total (готово);
+/// свежий приём → 0.
 fn onFileMetaEv(ctx: *anyopaque, from: *const engine_mod.Contact, meta: envelope.FileMeta) void {
-    _ = from;
     const app: *App = @ptrCast(@alignCast(ctx));
-    if (app.rx_files.contains(meta.file_id)) return; // уже в полёте
-    if (fileAlreadyStored(app, meta.file_id)) return; // уже приняли ранее
-    const rx = app.alloc.create(RxFile) catch return;
-    rx.* = .{ .size = meta.size, .sha = meta.sha };
-    const n = @min(meta.name.len, envelope.max_file_name);
-    @memcpy(rx.name_buf[0..n], meta.name[0..n]);
-    rx.name_len = n;
-    app.rx_files.put(app.alloc, meta.file_id, rx) catch {
-        app.alloc.destroy(rx);
-        return;
-    };
+    const total: u32 = @intCast(@divTrunc(
+        @as(u64, meta.size) + envelope.max_file_chunk - 1,
+        envelope.max_file_chunk,
+    ));
+    var got: u32 = 0;
+    if (app.rx_files.get(meta.file_id)) |rx| {
+        got = rx.expected_seq; // докачка: пир продолжает с нашей позиции
+    } else if (fileAlreadyStored(app, meta.file_id)) {
+        got = total; // приняли ранее — отправителю можно завершать
+    } else {
+        const rx = app.alloc.create(RxFile) catch return;
+        rx.* = .{ .size = meta.size, .sha = meta.sha };
+        const n = @min(meta.name.len, envelope.max_file_name);
+        @memcpy(rx.name_buf[0..n], meta.name[0..n]);
+        rx.name_len = n;
+        app.rx_files.put(app.alloc, meta.file_id, rx) catch {
+            app.alloc.destroy(rx);
+            return;
+        };
+    }
+    const cid = contactIdByBundle(app, from.bundle) orelse return;
+    app.eng.sendFileAck(cid, meta.file_id, got) catch {};
 }
+
+/// Период подтверждений приёмника (чанков между FILE_ACK) — окно
+/// отправителя на той стороне (core/engine.zig, file_tx_window).
+const rx_ack_every: u32 = 8;
 
 /// Чанк FILE_DATA: копим; по последнему чанку — сверка SHA и сохранение.
 /// ВЫЗЫВАЕТСЯ ПОД app.mu (из envIn).
 fn onFileDataEv(ctx: *anyopaque, from: *const engine_mod.Contact, data: envelope.FileData) void {
     const app: *App = @ptrCast(@alignCast(ctx));
+    const cid = contactIdByBundle(app, from.bundle) orelse return;
     const rx = app.rx_files.get(data.file_id) orelse return;
     if (data.seq != rx.expected_seq) return; // дубликат/дыра: ждём свой
     rx.expected_seq += 1;
     rx.buf.appendSlice(app.alloc, data.data) catch return;
+    // периодический FILE_ACK: отправитель держит окно и позицию докачки
+    if (rx.expected_seq % rx_ack_every == 0) {
+        app.eng.sendFileAck(cid, data.file_id, rx.expected_seq) catch {};
+    }
     if (rx.buf.items.len < rx.size) return;
     if (rx.buf.items.len != rx.size) { // перелив = поломка передачи
         dropRxFile(app, data.file_id);
@@ -489,12 +525,10 @@ fn onFileDataEv(ctx: *anyopaque, from: *const engine_mod.Contact, data: envelope
     std.crypto.hash.sha2.Sha256.hash(rx.buf.items, &digest, .{});
     if (!std.mem.eql(u8, &digest, &rx.sha)) { // битые байты
         dropRxFile(app, data.file_id);
+        // сообщаем позицию 0: отправитель видит откат и шлёт заново
+        app.eng.sendFileAck(cid, data.file_id, 0) catch {};
         return;
     }
-    const cid = contactIdByBundle(app, from.bundle) orelse {
-        dropRxFile(app, data.file_id);
-        return;
-    };
     if (!saveRxFile(app, data.file_id, rx.buf.items)) {
         dropRxFile(app, data.file_id);
         return;
@@ -502,7 +536,18 @@ fn onFileDataEv(ctx: *anyopaque, from: *const engine_mod.Contact, data: envelope
     // лог kind FILE — перезапрос после рестарта не нужен
     persistFileMeta(app, @intCast(cid), data.file_id, rx.size, rx.name());
     evFileReceived(app, cid, data.file_id, rx.size, rx.name());
+    // финальный ACK: все чанки подтверждены — отправитель закрывает передачу
+    app.eng.sendFileAck(cid, data.file_id, rx.expected_seq) catch {};
     dropRxFile(app, data.file_id);
+}
+
+/// FILE_SENT от движка: исходящий файл передан целиком — все чанки
+/// подтверждены FILE_ACK-ами получателя (состояние передачи ведёт движок,
+/// app только рассылает событие GUI). ВЫЗЫВАЕТСЯ ПОД app.mu (из envIn).
+fn onFileSentEv(ctx: *anyopaque, from: *const engine_mod.Contact, file_id: [16]u8, size: u32, name: []const u8) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const cid = contactIdByBundle(app, from.bundle) orelse return;
+    evFileSent(app, cid, file_id, size, name);
 }
 
 fn dropRxFile(app: *App, file_id: [16]u8) void {
@@ -1784,6 +1829,9 @@ fn apiSetAvatar(app: *App, payload: []const u8, w: *api.Writer) api.Status {
 /// SEND_FILE: payload [cid u32][path str16] — путь в ФС пользователя демона.
 /// Ответ: [file_id 16][size u32][chunks u32].
 /// Требует живой сессии (файлы не ставятся в outbox); file_id = SHA-256[0..16].
+/// Передача окном tx_window_chunks с подтверждениями FILE_ACK: разрыв
+/// сессии не теряет прогресс — докачка автоматически при реконнекте
+/// (resumeTxFilesLocked в bindSession).
 fn apiSendFile(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     var r = api.Reader.init(payload);
     const cid = r.readU32() catch return .BAD_FRAME;
@@ -1806,23 +1854,21 @@ fn apiSendFile(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     const file_id = digest[0..16].*;
+    const total: u32 = @intCast(@divTrunc(n + envelope.max_file_chunk - 1, envelope.max_file_chunk));
     {
         app.lock();
         defer app.unlock();
         if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
-        app.eng.sendFileMeta(@intCast(cid), file_id, base, @intCast(n), digest) catch |e| return statusOf(e);
-        var seq: u32 = 0;
-        var off: usize = 0;
-        while (off < bytes.len) {
-            const chunk_len = @min(bytes.len - off, envelope.max_file_chunk);
-            app.eng.sendFileChunk(@intCast(cid), file_id, seq, bytes[off .. off + chunk_len]) catch |e| return statusOf(e);
-            off += chunk_len;
-            seq += 1;
-        }
+        // движок владеет передачей (окно, докачка FILE_ACK, память до
+        // подтверждения); без сессии файл стоит в очереди как TEXT-outbox
+        const outcome = app.eng.sendFile(@intCast(cid), file_id, base, bytes, digest) catch |e| {
+            return statusOf(e);
+        };
+        _ = outcome;
     }
     w.putBytes(&file_id) catch return .INTERNAL;
     w.putU32(@intCast(n)) catch return .INTERNAL;
-    w.putU32(@intCast(@divTrunc(n + envelope.max_file_chunk - 1, envelope.max_file_chunk))) catch return .INTERNAL;
+    w.putU32(total) catch return .INTERNAL;
     return .OK;
 }
 

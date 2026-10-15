@@ -21,6 +21,7 @@
 //!   AVATAR        0x50: avatar_id: [16]u8, data: u16 + байты (≤ 16000)
 //!   AVATAR_ACK   0x51: avatar_id: [16]u8
 //!   AVATAR_REQ   0x52: avatar_id: [16]u8
+//!   FILE_ACK     0x62: file_id: [16]u8, got: u32 (докачка)
 
 const std = @import("std");
 const codec = @import("codec.zig");
@@ -60,6 +61,8 @@ pub const Tag = enum(u8) {
     avatar_req = 0x52,
     file_meta = 0x60,
     file_data = 0x61,
+    /// FILE_ACK: сколько чанков файла уже принято (докачка с этой позиции).
+    file_ack = 0x62,
 };
 
 /// Максимум длины имени в JOIN.
@@ -224,6 +227,16 @@ pub const RatchetKey = struct {
     dh_pub: [32]u8,
 };
 
+/// FILE_ACK (0x62): подтверждение приёма докачки. Приёмник шлёт его в
+/// ответ на FILE_META (позиция: 0 / ожидаемый seq / всего чанков, если файл
+/// уже сохранён) и далее каждые N чанков; отправитель возобновляет передачу
+/// с последнего подтверждения (got = следующий ожидаемый seq).
+pub const FileAck = struct {
+    file_id: [16]u8,
+    /// Чанков принято (следующий ожидаемый seq).
+    got: u32,
+};
+
 /// JOIN (0x40): держатель инвайт-кода доказывает право на подключение.
 /// Отправляется первым конвертом сразу после рукопожатия.
 pub const Join = struct {
@@ -271,6 +284,8 @@ pub const Envelope = union(enum) {
     avatar_req: AvatarReq,
     file_meta: FileMeta,
     file_data: FileData,
+    /// FILE_ACK (0x62).
+    file_ack: FileAck,
 };
 
 /// Ошибки кодирования: мал буфер или payload превышает максимум протокола.
@@ -291,6 +306,7 @@ pub fn encodedLen(e: Envelope) usize {
         .avatar => |m| 1 + id_len + 2 + m.data.len,
         .file_meta => |m| 1 + id_len + 1 + m.name.len + 4 + 32,
         .file_data => |m| 1 + id_len + 4 + 2 + m.data.len,
+        .file_ack => 1 + id_len + 4,
         .avatar_ack, .avatar_req => 1 + id_len,
     };
 }
@@ -393,6 +409,11 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
             try w.putFixed(&m.file_id);
             try w.putInt(u32, m.seq);
             try w.putBytes(m.data);
+        },
+        .file_ack => |m| {
+            try w.put(@backingInt(Tag.file_ack));
+            try w.putFixed(&m.file_id);
+            try w.putInt(u32, m.got);
         },
     }
     return w.buf[0..w.pos];
@@ -509,6 +530,11 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
             const data = try r.getBytes();
             if (data.len > max_file_chunk) return error.BadLen;
             break :blk .{ .file_data = .{ .file_id = file_id, .seq = seq, .data = data } };
+        },
+        @backingInt(Tag.file_ack) => blk: {
+            const file_id = try readId(&r);
+            const got = try r.getInt(u32);
+            break :blk .{ .file_ack = .{ .file_id = file_id, .got = got } };
         },
         else => return error.UnknownTag,
     };
@@ -805,6 +831,25 @@ test "envelope: ACK roundtrip" {
     try testing.expectEqual(1 + 16, bytes.len);
     const back = try decode(bytes);
     try testing.expectEqualSlices(u8, &filled(16, 0xC1), &back.ack.msg_id);
+}
+
+test "envelope: FILE_ACK roundtrip" {
+    var buf: [max_encoded_len]u8 = undefined;
+    const e = Envelope{ .file_ack = .{ .file_id = @splat(0x6C), .got = 0xAABBCCDD } };
+    const bytes = try encode(&buf, e);
+    try testing.expectEqual(@as(usize, 1 + id_len + 4), bytes.len);
+    try testing.expectEqual(@as(u8, 0x62), bytes[0]);
+    // got u32 LE сразу после file_id
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xDD, 0xCC, 0xBB, 0xAA }, bytes[17..21]);
+
+    const back = try decode(bytes);
+    try testing.expectEqualSlices(u8, &@as([id_len]u8, @splat(0x6C)), &back.file_ack.file_id);
+    try testing.expectEqual(@as(u32, 0xAABBCCDD), back.file_ack.got);
+    try testing.expectError(error.Truncated, decode(bytes[0 .. bytes.len - 1]));
+    var with_tail: [32]u8 = undefined;
+    @memcpy(with_tail[0..bytes.len], bytes);
+    with_tail[bytes.len] = 0;
+    try testing.expectError(error.BadLen, decode(with_tail[0 .. bytes.len + 1]));
 }
 
 test "envelope: FILE_META/FILE_DATA roundtrip" {

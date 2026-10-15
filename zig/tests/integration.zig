@@ -98,6 +98,15 @@ const PipeConn = struct {
     };
 };
 
+/// Освободить данные, оставшиеся в очереди трубы при закрытии сессий
+/// (кадры в полёте честно теряются — как в реальной сети).
+fn drainPipe(p: *Pipe) void {
+    p.mu.lockUncancelable(io_g.stored);
+    for (p.inbox.items) |e| io_g.alloc.free(e.data);
+    p.inbox.clearRetainingCapacity();
+    p.mu.unlock(io_g.stored);
+}
+
 fn pipePair(alloc: std.mem.Allocator) ![2]PipeConn {
     const pa = try alloc.create(Pipe);
     const pb = try alloc.create(Pipe);
@@ -139,7 +148,7 @@ fn wrapConn(_: *anyopaque, raw: interfaces.Conn, keys: handshake.SessionKeys, al
     shopot.crypto.kdf.expand(keys.transcript, "shopot-obf-v3", &key);
     const oc = try alloc.create(obfuscate.ObfConn);
     oc.* = try obfuscate.ObfConn.init(alloc, std.testing.io, raw, &key);
-    if (obf_idx < 2) {
+    if (obf_idx < obf_tracker.len) {
         obf_tracker[obf_idx] = oc;
         obf_idx += 1;
     }
@@ -225,8 +234,14 @@ test "two sessions: handshake, sealed text, reaction, presence" {
 }
 
 var wrap_slot: u8 = 0;
-var obf_tracker: [2]?*obfuscate.ObfConn = .{ null, null };
+var obf_tracker: [4]?*obfuscate.ObfConn = @splat(null);
 var obf_idx: usize = 0;
+/// Сериализация доступа к движкам в E2E (в проде эту роль играет app.mu:
+/// envIn и API-обработчики под одним локом). rx-потоки заходят через
+/// engineDispatch, главный поток — берёт лок явно. Порядок eng_mu ->
+/// session.send_mu, обратного пути нет (onEnvelope вызывается вне
+/// send_mu), дедлока не будет.
+var eng_mu: std.Io.Mutex = .init;
 
 fn establishB(
     alloc: std.mem.Allocator,
@@ -308,7 +323,9 @@ const eng_events = struct {
 
 fn engineDispatch(ctx: *anyopaque, env: envelope.Envelope) void {
     const self: *EngineCtx = @ptrCast(@alignCast(ctx));
+    eng_mu.lockUncancelable(io_g.stored);
     self.engine.dispatch(self.contact_id, env);
+    eng_mu.unlock(io_g.stored);
 }
 
 test "block: traffic from blocked peer is dropped engine-wide" {
@@ -318,7 +335,7 @@ test "block: traffic from blocked peer is dropped engine-wide" {
     io_g.alloc = alloc;
 
     obf_idx = 0;
-    obf_tracker = .{ null, null };
+    obf_tracker = @splat(null);
     const id_a = try identity.Identity.fromSeed(filled(11));
     const id_b = try identity.Identity.fromSeed(filled(13));
     const pair = try pipePair(alloc);
@@ -442,7 +459,7 @@ test "ratchet: PCS-ротация по порогу отправки, все с�
     io_g.stored = io;
     io_g.alloc = alloc;
     obf_idx = 0;
-    obf_tracker = .{ null, null };
+    obf_tracker = @splat(null);
     const id_a = try identity.Identity.fromSeed(filled(21));
     const id_b = try identity.Identity.fromSeed(filled(23));
 
@@ -498,9 +515,18 @@ test "ratchet: PCS-ротация по порогу отправки, все с�
         try waitTexts(&ha, body);
     }
 
-    // ротация реально случилась и стороны синхронны по эпохе
+    // ротация реально случилась; завершение последнего обмена асинхронно
+    // (ответный паблик в полёте) — ждём синхронности эпох с таймаутом
     try std.testing.expect(sa.ratchet.epoch > 1);
-    try std.testing.expectEqual(sa.ratchet.epoch, sb.ratchet.epoch);
+    var synced = false;
+    for (0..200) |_| {
+        if (sa.ratchet.epoch == sb.ratchet.epoch) {
+            synced = true;
+            break;
+        }
+        std.Io.sleep(io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try std.testing.expect(synced);
     // снапшот prev_recv гасится первым кадром новой эпохи; у получателя
     // последнего RATCHET_KEY он может остаться до следующего кадра —
     // это не ошибка, протокол держит его сколько угодно долго
@@ -537,6 +563,226 @@ test "ratchet: PCS-ротация по порогу отправки, все с�
     hb.pings.deinit(alloc);
 }
 
+// ------------------------------------------------- file transfer (E2E)
+
+/// Контекст приёма/отправки файла для E2E: приёмник копит чанки и шлёт
+/// FILE_ACK каждые 4 (и финальный), отправитель ждёт FILE_SENT.
+/// accept=false — имитация «пир не принял ни одного чанка до разрыва».
+const FileCtx = struct {
+    eng: *shopot.core.engine.Engine, // приёмник: отвечает FILE_ACK
+    cid: i64, // cid отправителя в реестре ПРИЁМНИКА
+    alloc: std.mem.Allocator,
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    expected_seq: u32 = 0,
+    size: u32 = 0,
+    done: bool = false, // приёмник собрал всё
+    sent: bool = false, // отправитель получил FILE_SENT
+    accept: bool = true, // phase 1: false — чанки молча роняем
+
+    fn onMeta(ctx: *anyopaque, _: *const shopot.core.engine.Contact, meta: envelope.FileMeta) void {
+        const self: *FileCtx = @ptrCast(@alignCast(ctx));
+        self.size = meta.size;
+        // позиционный ответ на META: сколько УЖЕ принято
+        const got: u32 = if (self.buf.items.len >= meta.size)
+            @intCast(@divTrunc(@as(u64, meta.size) + envelope.max_file_chunk - 1, envelope.max_file_chunk))
+        else
+            self.expected_seq;
+        self.eng.sendFileAck(self.cid, meta.file_id, got) catch {};
+    }
+
+    fn onData(ctx: *anyopaque, _: *const shopot.core.engine.Contact, data: envelope.FileData) void {
+        const self: *FileCtx = @ptrCast(@alignCast(ctx));
+        if (!self.accept) return; // «пир был оффлайн»: кадры потеряны
+        if (data.seq != self.expected_seq) return; // дубликат окна
+        self.expected_seq += 1;
+        self.buf.appendSlice(self.alloc, data.data) catch return;
+        if (self.expected_seq % 4 == 0 or self.buf.items.len >= self.size) {
+            self.eng.sendFileAck(self.cid, data.file_id, self.expected_seq) catch {};
+        }
+        if (self.buf.items.len == self.size) self.done = true;
+    }
+
+    fn onSent(ctx: *anyopaque, _: *const shopot.core.engine.Contact, _: [16]u8, _: u32, _: []const u8) void {
+        const self: *FileCtx = @ptrCast(@alignCast(ctx));
+        self.sent = true;
+    }
+};
+
+test "files: FILE_ACK-докачка после разрыва сессии, FILE_SENT" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    io_g.stored = io;
+    io_g.alloc = alloc;
+    obf_idx = 0;
+    obf_tracker = @splat(null);
+
+    const id_a = try identity.Identity.fromSeed(filled(31));
+    const id_b = try identity.Identity.fromSeed(filled(33));
+    const pair = try pipePair(alloc);
+    var ca = pair[0];
+    var cb = pair[1];
+
+    var fctx = FileCtx{ .eng = undefined, .cid = 1, .alloc = alloc, .accept = false };
+    var ha = Harness{ .alloc = alloc }; // не используется, поле EngineCtx
+
+    var eng_a = shopot.core.engine.Engine.init(alloc, io, id_a, .{
+        .ctx = &fctx,
+        .onFileSent = FileCtx.onSent,
+    });
+    var eng_b = shopot.core.engine.Engine.init(alloc, io, id_b, .{
+        .ctx = &fctx,
+        .onFileMeta = FileCtx.onMeta,
+        .onFileData = FileCtx.onData,
+    });
+    fctx.eng = &eng_b; // приёмник отвечает ACK-ами через свою сессию
+
+    const idx_b = try eng_a.addContact("b", id_b.bundle());
+    _ = try eng_b.addContact("a", id_a.bundle());
+    const cid_b: i64 = @intCast(idx_b + 1);
+
+    var ctx_a = EngineCtx{ .engine = &eng_a, .contact_id = cid_b, .harness = &ha };
+    var ctx_b = EngineCtx{ .engine = &eng_b, .contact_id = 1, .harness = &ha };
+
+    var sb_opt: ?*session_mod.Session = null;
+    const th_b = try std.Thread.spawn(.{}, establishEngineB, .{ alloc, cb.conn(), &id_b, id_a.bundle(), &ctx_b, &sb_opt });
+    const sa = try session_mod.Session.establish(
+        alloc,
+        ca.conn(),
+        .initiator,
+        &id_a,
+        id_b.bundle(),
+        filled(2),
+        @ptrCast(&wrap_slot),
+        wrapConn,
+        .{ .ctx = &ctx_a, .onEnvelope = engineDispatch, .onClosed = Harness.onClosed },
+        io,
+    );
+    th_b.join();
+    const sb = sb_opt orelse return error.ResponderFailed;
+    eng_a.sessions.put(cid_b, sa) catch return error.OutOfMemory;
+    eng_b.sessions.put(1, sb) catch return error.OutOfMemory;
+
+    // 150000 байт = 10 чанков; приёмник «мертв» (accept=false) — окно
+    // выкачивается без единого ACK и передача встаёт
+    const bytes: [150_000]u8 = @splat(0x5C);
+    var sha: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &sha, .{});
+    const file_id = sha[0..16].*;
+    eng_mu.lockUncancelable(io);
+    const oc = try eng_a.sendFile(cid_b, file_id, "blob.bin", &bytes, sha);
+    eng_mu.unlock(io);
+    try std.testing.expectEqual(shopot.core.engine.Engine.SendResult.sent, oc.result);
+    // жрём кадры приёмником (роняем) — передача НЕ завершается
+    std.Io.sleep(io, .{ .nanoseconds = 300 * std.time.ns_per_ms }, .awake) catch {};
+    try std.testing.expect(!fctx.sent);
+
+    // разрыв сессии и реконнект на НОВОЙ паре труб
+    sa.close();
+    sb.close();
+    const pair2 = try pipePair(alloc);
+    var ca2 = pair2[0];
+    var cb2 = pair2[1];
+    var sb2_opt: ?*session_mod.Session = null;
+    const th_b2 = try std.Thread.spawn(.{}, establishEngineB, .{ alloc, cb2.conn(), &id_b, id_a.bundle(), &ctx_b, &sb2_opt });
+    const sa2 = try session_mod.Session.establish(
+        alloc,
+        ca2.conn(),
+        .initiator,
+        &id_a,
+        id_b.bundle(),
+        filled(3),
+        @ptrCast(&wrap_slot),
+        wrapConn,
+        .{ .ctx = &ctx_a, .onEnvelope = engineDispatch, .onClosed = Harness.onClosed },
+        io,
+    );
+    th_b2.join();
+    const sb2 = sb2_opt orelse return error.ResponderFailed;
+    eng_a.sessions.put(cid_b, sa2) catch return error.OutOfMemory;
+    eng_b.sessions.put(1, sb2) catch return error.OutOfMemory;
+
+    // сессия поднялась: движок возобновляет с last_ack (0 — подтверждений
+    // не было), приёмник «ожил» и теперь принимает + ACK-ает
+    fctx.accept = true;
+    eng_mu.lockUncancelable(io);
+    eng_a.resumeFileTx(cid_b);
+    eng_mu.unlock(io);
+
+    var ok = false;
+    for (0..500) |_| {
+        if (fctx.sent and fctx.done) {
+            ok = true;
+            break;
+        }
+        std.Io.sleep(io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try std.testing.expect(ok);
+    try std.testing.expectEqual(@as(usize, bytes.len), fctx.buf.items.len);
+    try std.testing.expectEqualSlices(u8, &bytes, fctx.buf.items);
+
+    // после завершения запись передачи погашена
+    eng_mu.lockUncancelable(io);
+    const txn = eng_a.file_tx.items.len;
+    eng_mu.unlock(io);
+    try std.testing.expectEqual(@as(usize, 0), txn);
+
+    sa2.close();
+    sb2.close();
+    alloc.destroy(sa);
+    alloc.destroy(sb);
+    alloc.destroy(sa2);
+    alloc.destroy(sb2);
+    for (obf_tracker) |oc2| {
+        if (oc2) |o| {
+            o.deinit();
+            alloc.destroy(o);
+        }
+    }
+    // сессии уже закрыты и освобождены: из карт движка — ДО deinit
+    // (deinit закрывает всё, что осталось в карте)
+    _ = eng_a.sessions.remove(cid_b);
+    _ = eng_b.sessions.remove(1);
+    eng_a.deinit();
+    eng_b.deinit();
+    fctx.buf.deinit(alloc);
+    drainPipe(ca.me);
+    drainPipe(cb.me);
+    drainPipe(ca2.me);
+    drainPipe(cb2.me);
+    ca.me.inbox.deinit(alloc);
+    cb.me.inbox.deinit(alloc);
+    ca2.me.inbox.deinit(alloc);
+    cb2.me.inbox.deinit(alloc);
+    alloc.destroy(ca.me);
+    alloc.destroy(cb.me);
+    alloc.destroy(ca2.me);
+    alloc.destroy(cb2.me);
+}
+
+/// establishB-вариант с EngineCtx (file/outbox E2E): респондер на своём
+/// потоке, конверты идут в engineDispatch движка.
+fn establishEngineB(
+    alloc: std.mem.Allocator,
+    conn: interfaces.Conn,
+    id_b: *const identity.Identity,
+    peer_bundle: [64]u8,
+    ctx: *EngineCtx,
+    out: *?*session_mod.Session,
+) void {
+    out.* = session_mod.Session.establish(
+        alloc,
+        conn,
+        .responder,
+        id_b,
+        peer_bundle,
+        filled(2),
+        @ptrCast(&wrap_slot),
+        wrapConn,
+        .{ .ctx = ctx, .onEnvelope = engineDispatch, .onClosed = Harness.onClosed },
+        io_g.stored,
+    ) catch null;
+}
+
 test "outbox: очередь офлайн, доставка при сессии, ACK, дедуп" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -544,7 +790,7 @@ test "outbox: очередь офлайн, доставка при сессии,
     io_g.alloc = alloc;
 
     obf_idx = 0;
-    obf_tracker = .{ null, null };
+    obf_tracker = @splat(null);
     const id_a = try identity.Identity.fromSeed(filled(21));
     const id_b = try identity.Identity.fromSeed(filled(23));
     const pair = try pipePair(alloc);

@@ -143,6 +143,9 @@ pub const Event = enum(u16) {
     CONTACT_PROFILE = 9,
     /// Пир заблокировал нас: [cid u32].
     BLOCKED_BY_PEER = 10,
+    /// Файл передан целиком (все чанки подтверждены FILE_ACK):
+    /// [cid u32][file_id 16][size u32][name str16].
+    FILE_SENT = 11,
 };
 
 /// Состояние звонка для события CALL_STATE.
