@@ -33,8 +33,9 @@ Layer and data-flow reference for the `shopot-zig` core. Russian version:
 ```
 sendText
   → engine: outbox or live session
-  → envelope.encode (stack buffer)
-  → [ratchet seal: 0xA1 | epoch | counter | AEAD box]
+  → envelope.encode (stack buffer, formatting entities tail)
+  → [optional zlib: payload ≥ 512 bytes → std.compress.flate]
+  → [ratchet seal: 0xA1 | epoch | counter | comp | AEAD box]
   → session: writeAll of header+payload (one obf frame per envelope,
     batches for outbox flushes)
   → obfuscation: pad to size class + ChaCha20-Poly1305 frame box
@@ -43,8 +44,8 @@ sendText
 ```
 
 Receive is the mirror: `Conn.readAll` → de-frame (AAD check, seq check) →
-de-obfuscate → envelope decode → `Engine.dispatch` under the engine lock →
-callbacks into the app layer.
+de-obfuscate → AEAD-open + optional inflate → envelope decode →
+`Engine.dispatch` under the engine lock → callbacks into the app layer.
 
 ## 4. Threading model
 
@@ -54,6 +55,10 @@ callbacks into the app layer.
   under the app lock; events fan out to all connections.
 - Presence has no thread of its own: it is a pure state machine; time is
   injected via `Clock`, transport actions are returned to the caller.
+- Relay presence runs its own loop: while a relay-backed contact is alive,
+  unblocked and has no live session, it keeps the relay slot registered
+  with the contact-level marker; pairing hands a fresh session to the
+  engine. Start points: relay-invite JOIN, contact-log load, unblock.
 - Call audio runs its own loop (FIFO in/out, 20 ms tick).
 
 ## 5. Error and memory model

@@ -129,6 +129,9 @@ Adapted from the kernel submission checklist; check every line:
 - [ ] API surface touched → CORE-API.md updated, CHANGELOG entry added.
 - [ ] One concern per PR; commit series follows §4.
 - [ ] Threat-model impact described for crypto/storage/signaling changes.
+- [ ] Docs updated in **both languages** (EN + RU mirror), facts verified
+      against source; wire/API change → CHANGELOG entry. See
+      [docs/DOCSTYLE.md](docs/DOCSTYLE.md).
 - [ ] No regressions: the E2E scenarios in `tests/integration.zig` still
       pass unchanged.
 
@@ -149,7 +152,15 @@ Do not open public issues for vulnerabilities. Follow
 [SECURITY.md](SECURITY.md) (private GitHub security report; 72 h
 acknowledgment target).
 
-## 8. License
+## 8. Documentation rules
+
+Documentation follows [docs/DOCSTYLE.md](docs/DOCSTYLE.md) (binding):
+EN normative at the canonical path, RU mirror in `ru/` in the same commit,
+facts verified against source, contracts in tables, one canonical limits
+table per API doc, wire/API changes update PROTOCOL/CORE-API + CHANGELOG in
+the same commit. "Docs later" is a reject.
+
+## 9. License
 
 MIT. By contributing you license your work under MIT; the `Signed-off-by`
 line (DCO) is the record of that consent.

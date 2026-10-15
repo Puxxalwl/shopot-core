@@ -14,9 +14,9 @@ archive lives under the tag `cpp-archive`.
 | Area | What the core does |
 |---|---|
 | Identity | X25519 + Ed25519 keypairs derived from one 32-byte seed (`~/.shopot/zig-seed`, 0600) |
-| Transport | Direct TCP (ports 7777–7786) or self-hosted relay; LAN discovery over UDP multicast; wire disguised as TLS 1.3 |
+| Transport | Direct TCP (ports 7777–7786) or self-hosted relay; persistent relay presence (reconnects without a new invite); LAN discovery over UDP multicast; wire disguised as TLS 1.3 |
 | Encryption | XX-like handshake, AEAD transport, double ratchet with post-compromise security (epoch rotation every 256 messages) |
-| Messaging | Offline delivery (encrypted outbox, ACKs, dedup), reactions, 16 kHz E2EE voice calls (ADPCM, DTX), resumable file transfer |
+| Messaging | Telegram-style formatting entities (bold/italic/spoiler/code/link), offline delivery (encrypted outbox, ACKs, dedup), reactions, 16 kHz E2EE voice calls (ADPCM, DTX), resumable file transfer |
 | Storage | Append-only AEAD log — zero plaintext bytes on disk |
 | Interface | Binary framed UDS API (`~/.shopot/api.sock`) — the only interface; GUI clients render, the core does everything else |
 
@@ -42,7 +42,7 @@ shopot-zig serve         # daemon: core + UDS API (~/.shopot/api.sock)
 There is no CLI/TUI: the only client interface is the GUI, which talks to
 the core over UDS using the binary framed protocol (typed responses,
 machine error codes, events). Specification for client authors:
-[`zig/docs/CORE-API.md`](zig/docs/CORE-API.md) (API 1.0.0).
+[`zig/docs/CORE-API.md`](zig/docs/CORE-API.md) (API 2.0.0).
 
 Adding a friend is one action: `CREATE_INVITE` produces a one-way code
 (`shopot://i/...`); the holder performs a single `ACCEPT_INVITE`. The
@@ -65,6 +65,8 @@ discovery, autodial, offline outbox, delivery ACKs).
 - XX-like handshake (X25519 + Ed25519, transcript signatures, remote-static
   verification)
 - Double encryption of messages: ratchet chains on top of an AEAD stream
+- Payloads ≥ 512 bytes are zlib-compressed inside the sealed layer
+  (compression flag authenticated with the frame)
 - Calls: 20 ms frames, per-frame key = HKDF(call_secret, seq), own AEAD
   transport
 - Storage: append-only AEAD log, not a single plaintext byte
@@ -76,12 +78,13 @@ Details: [`zig/docs/PROTOCOL.md`](zig/docs/PROTOCOL.md),
 
 | Document | Content |
 |---|---|
-| [`zig/docs/CORE-API.md`](zig/docs/CORE-API.md) / [ru](zig/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 1.0.0) |
-| [`zig/docs/PROTOCOL.md`](zig/docs/PROTOCOL.md) / [ru](zig/docs/ru/PROTOCOL.md) | byte-level wire protocol v3 |
+| [`zig/docs/CORE-API.md`](zig/docs/CORE-API.md) / [ru](zig/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 2.0.0) |
+| [`zig/docs/PROTOCOL.md`](zig/docs/PROTOCOL.md) / [ru](zig/docs/ru/PROTOCOL.md) | byte-level wire protocol v4 |
 | [`zig/docs/ARCHITECTURE.md`](zig/docs/ARCHITECTURE.md) / [ru](zig/docs/ru/ARCHITECTURE.md) | layers, data flow, threading |
 | [`zig/docs/ROADMAP.md`](zig/docs/ROADMAP.md) / [ru](zig/docs/ru/ROADMAP.md) | technical plan and anti-plan |
 | [SECURITY.md](SECURITY.md) / [ru](docs/ru/SECURITY.md) | threat model, reporting, crypto inventory |
 | [CONTRIBUTING.md](CONTRIBUTING.md) / [ru](docs/ru/CONTRIBUTING.md) | contribution rules (kernel-style) |
+| [docs/DOCSTYLE.md](docs/DOCSTYLE.md) / [ru](docs/ru/DOCSTYLE.md) | binding rules for writing documentation |
 
 ## Official client
 
