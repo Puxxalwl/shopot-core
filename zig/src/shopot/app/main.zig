@@ -2104,7 +2104,7 @@ pub fn dispatchApi(app: *App, conn: *api_srv.Conn, req: ApiRequest) bool {
     switch (req.method) {
         .CLOSE => {
             // ответ и разрыв — без обработки payload
-            conn.sendResponse(@intFromEnum(req.method), req.request_id, .OK, &.{});
+            conn.sendResponse(@backingInt(req.method), req.request_id, .OK, &.{});
             return false;
         },
         .GET_VERSION => {
@@ -2143,12 +2143,12 @@ pub fn dispatchApi(app: *App, conn: *api_srv.Conn, req: ApiRequest) bool {
 
 /// Отправить ответ метода (единая точка).
 fn respond(conn: *api_srv.Conn, req: ApiRequest, status: api.Status, payload: []const u8) void {
-    conn.sendResponse(@intFromEnum(req.method), req.request_id, status, payload);
+    conn.sendResponse(@backingInt(req.method), req.request_id, status, payload);
 }
 
 /// INTERNAL при переполнении сборщика ответа.
 fn internal(conn: *api_srv.Conn, req: ApiRequest) bool {
-    conn.sendResponse(@intFromEnum(req.method), req.request_id, .INTERNAL, &.{});
+    conn.sendResponse(@backingInt(req.method), req.request_id, .INTERNAL, &.{});
     return true;
 }
 

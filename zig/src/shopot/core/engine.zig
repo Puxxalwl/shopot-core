@@ -56,6 +56,8 @@ pub const Contact = struct {
 pub const Reaction = struct {
     msg_id: [16]u8,
     from: [64]u8, // peer bundle
+    /// Операция: envelope.react_add / react_remove.
+    op: u8,
     /// Unicode code point реакции (u32; U+0000..U+10FFFF).
     code: u32,
 };
@@ -65,6 +67,8 @@ pub const Events = struct {
     onText: ?*const fn (ctx: *anyopaque, from: *const Contact, msg_id: [16]u8, ts_ms: i64, body: []const u8) void = null,
     onReaction: ?*const fn (ctx: *anyopaque, from: *const Contact, r: Reaction) void = null,
     onPresence: ?*const fn (ctx: *anyopaque, from: *const Contact, online: bool, last_seen_ms: i64) void = null,
+    /// Профиль пира обновился (эхо PROFILE: имя и avatar_id).
+    onProfile: ?*const fn (ctx: *anyopaque, from: *const Contact, name: []const u8, avatar_id: [16]u8) void = null,
     onCallSignal: ?*const fn (ctx: *anyopaque, from: *const Contact, op: u8, call_id: [16]u8) void = null,
     onCallAudio: ?*const fn (ctx: *anyopaque, from: *const Contact, seq: u32, data: []const u8) void = null,
     onBlockedNotice: ?*const fn (ctx: *anyopaque, from: *const Contact) void = null,
@@ -402,6 +406,8 @@ pub const Engine = struct {
                 if (pr.name.len > 0) c.setName(pr.name);
                 const known = c.avatar_id;
                 c.avatar_id = pr.avatar_id;
+                if (self.ev.onProfile) |cb|
+                    cb(self.ev.ctx, c, c.getName(), pr.avatar_id);
                 if (self.sessions.get(contact_id)) |sess| {
                     const changed = !std.mem.eql(u8, &known, &pr.avatar_id);
                     if (changed and !std.mem.eql(u8, &pr.avatar_id, &@as([16]u8, @splat(0)))) {
@@ -433,7 +439,7 @@ pub const Engine = struct {
                 if (self.ev.onFileData) |cb| cb(self.ev.ctx, c, fd);
             },
             .react => |r| {
-                if (self.ev.onReaction) |cb| cb(self.ev.ctx, c, .{ .msg_id = r.msg_id, .from = c.bundle, .code = r.code });
+                if (self.ev.onReaction) |cb| cb(self.ev.ctx, c, .{ .msg_id = r.msg_id, .op = r.op, .from = c.bundle, .code = r.code });
             },
             .block_notice => {
                 if (self.ev.onBlockedNotice) |cb| cb(self.ev.ctx, c);

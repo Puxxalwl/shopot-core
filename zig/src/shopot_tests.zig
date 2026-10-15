@@ -21,5 +21,6 @@ test {
     _ = @import("shopot/net/heartbeat.zig");
     _ = @import("shopot/net/tcp.zig");
     _ = @import("shopot/app/adpcm.zig");
+    _ = @import("shopot/app/api.zig");
     _ = @import("shopot/store/log.zig");
 }
