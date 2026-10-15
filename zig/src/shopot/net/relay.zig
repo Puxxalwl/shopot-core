@@ -3,11 +3,14 @@
 //! (E2EE уже внутри shopot-сессии) — релей видит только TLS-подобный шум.
 //!
 //! Протокол (обе стороны — клиенты релея):
-//!   клиент -> релей: [17 03 03 0020][marker 32]     (TLS-подобная запись)
-//!   релей -> обоим:  [17 03 03 0001 5A]             (спарен)
+//!   клиент -> релей: [17 03 03 0030][marker 32 + шум 16] (TLS-подобная
+//!                    запись AECD-правдоподобной длины: данные + «тег»)
+//!   релей -> обоим:  [17 03 03 0012][5A + шум 17]        (спарен)
 //!   далее: прозрачный сплит байтов (fake-TLS поток пира-а сквозной).
 //! marker = HMAC-SHA256(секрет, "shopot-relay-v1"): вычисляют обе
-//! стороны инвайта, релей видит только совпадение значений.
+//! стороны инвайта, релей видит только совпадение значений. Шум —
+//! HMAC(marker, метка+наносекунды): выглядит случайно, уникален на
+//! запись, без глобального состояния и без CSPRNG-syscall.
 //!
 //! Пары: первый коннект с marker-ом «владеет» слотом (presence), второй
 //! спаривается, лишние коннекты при активной паре закрываются. После
@@ -22,10 +25,31 @@ const tcp = @import("tcp.zig");
 const linux = std.os.linux;
 
 pub const marker_len = 32;
+/// Шум-хвост маркер-записи: запись выглядит как «32 байта + тег AECD».
+pub const marker_noise_len = 16;
 /// Сигнал «спарен» в теле TLS-подобной записи.
 pub const pair_signal: u8 = 0x5A;
+/// Шум-хвост сигнала: тело записи 1+17 = 18 байт (минимум AECD-записи).
+pub const pair_noise_len = 17;
 /// Метка домена релея в адресной части инвайта: @r/host:port.
 pub const addr_mark = "r/";
+
+/// Шум для хвостов relay-записей: HMAC-SHA256(marker, метка + наносекунды).
+/// Не криптозащита (содержимое и так не секрет), а проводная маскировка:
+/// байты неотличимы от случайных и не повторяются между записями.
+fn noiseTail(marker: *const [marker_len]u8, out: []u8) void {
+    // монотонные наносекунды прямым сисколлом (паттерн app/main.zig):
+    // без глобального состояния, без аллокаций
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    const ns: u64 = @bitCast(@as(i64, ts.sec) *% std.time.ns_per_s +% ts.nsec);
+    var inbuf: [21 + 8]u8 = undefined;
+    @memcpy(inbuf[0..21], "shopot-relay-noise-v1");
+    std.mem.writeInt(u64, inbuf[21..29], ns, .little);
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &inbuf, marker);
+    @memcpy(out, mac[0..out.len]);
+}
 
 /// marker из секрета инвайта (обе стороны вычисляют одинаково).
 pub fn markerFrom(secret: [16]u8) [marker_len]u8 {
@@ -57,18 +81,21 @@ pub fn dialMarker(alloc: std.mem.Allocator, addr: []const u8, marker: [marker_le
         tc.deinit();
         alloc.destroy(tc);
     }
-    var w: [5 + marker_len]u8 = undefined;
+    // [17 03 03 0030][marker 32 + шум 16]: запись len=48 — AECD-подобно
+    var w: [5 + marker_len + marker_noise_len]u8 = undefined;
     w[0] = 0x17;
     w[1] = 0x03;
     w[2] = 0x03;
     w[3] = 0;
-    w[4] = marker_len;
-    @memcpy(w[5..], &marker);
+    w[4] = marker_len + marker_noise_len;
+    @memcpy(w[5..][0..marker_len], &marker);
+    noiseTail(&marker, w[5 + marker_len ..][0..marker_noise_len]);
     try rawWriteAll(tc.fd, &w);
-    var r: [6]u8 = undefined;
+    // [17 03 03 0012][5A + шум 17]
+    var r: [5 + 1 + pair_noise_len]u8 = undefined;
     try rawReadAll(tc.fd, &r);
-    // [17 03 03 0001 5A]
-    if (r[0] != 0x17 or r[1] != 0x03 or r[2] != 0x03 or r[3] != 0 or r[4] != 1 or r[5] != pair_signal)
+    if (r[0] != 0x17 or r[1] != 0x03 or r[2] != 0x03 or r[3] != 0 or
+        r[4] != 1 + pair_noise_len or r[5] != pair_signal)
         return error.NotRelay;
     return tc;
 }
@@ -142,12 +169,14 @@ pub fn serve(alloc: std.mem.Allocator, listener: *tcp.Listener, stop: ?*std.atom
 /// Поток одного коннекта релея: прочитать marker, спарить, копировать
 /// свой -> пир. Обратное направление копирует пир-поток.
 fn relayConn(alloc: std.mem.Allocator, map: *std.AutoHashMap([marker_len]u8, *Pending), spin: *Spin, fd: linux.socket_t) void {
-    // [17 03 03 0020][marker 32]
+    // [17 03 03 0030][marker 32 + шум 16]
     var hdr: [5]u8 = undefined;
     rawReadAll(fd, &hdr) catch return closeFd(fd);
-    if (hdr[0] != 0x17 or hdr[1] != 0x03 or hdr[2] != 0x03 or hdr[4] != marker_len) return closeFd(fd);
-    var marker: [marker_len]u8 = undefined;
-    rawReadAll(fd, &marker) catch return closeFd(fd);
+    if (hdr[0] != 0x17 or hdr[1] != 0x03 or hdr[2] != 0x03 or
+        hdr[4] != marker_len + marker_noise_len) return closeFd(fd);
+    var body: [marker_len + marker_noise_len]u8 = undefined;
+    rawReadAll(fd, &body) catch return closeFd(fd);
+    const marker: [marker_len]u8 = body[0..marker_len].*;
 
     const self: *Pending = alloc.create(Pending) catch return closeFd(fd);
     self.* = .{ .fd = fd };
@@ -187,9 +216,16 @@ fn relayConn(alloc: std.mem.Allocator, map: *std.AutoHashMap([marker_len]u8, *Pe
             peer_fd = self.peer_fd.?;
         }
     }
-    // сигнал «спарен» обоим
+    // сигнал «спарен» обоим: [17 03 03 0012][5A + шум 17]
     if (second) {
-        const sig: [6]u8 = .{ 0x17, 0x03, 0x03, 0, 1, pair_signal };
+        var sig: [5 + 1 + pair_noise_len]u8 = undefined;
+        sig[0] = 0x17;
+        sig[1] = 0x03;
+        sig[2] = 0x03;
+        sig[3] = 0;
+        sig[4] = 1 + pair_noise_len;
+        sig[5] = pair_signal;
+        noiseTail(&marker, sig[6..][0..pair_noise_len]);
         rawWriteAll(fd, &sig) catch {};
         rawWriteAll(peer_fd, &sig) catch {};
     }
@@ -255,4 +291,23 @@ test "relay: presenceMarker детерминирован и отделён до�
     // домен отделён от инвайт-marker-а (те же байты секрета)
     const invite16: [16]u8 = @splat(7);
     try testing.expect(!std.mem.eql(u8, &p1, &markerFrom(invite16)));
+}
+
+test "relay: шум хвостов записей — не нулевой и уникальный на запись" {
+    const m: [marker_len]u8 = @splat(5);
+    var a: [marker_noise_len]u8 = undefined;
+    var b: [pair_noise_len]u8 = undefined;
+    noiseTail(&m, &a);
+    // не вырожден
+    try testing.expect(a[0] != 0 or a[1] != 0 or a[2] != 0);
+    // время идёт — хвосты уникальны (до 64 попыток: наносекунды монотонны)
+    var differs = false;
+    for (0..64) |_| {
+        noiseTail(&m, &b);
+        if (!std.mem.eql(u8, &a, b[0..a.len])) {
+            differs = true;
+            break;
+        }
+    }
+    try testing.expect(differs);
 }

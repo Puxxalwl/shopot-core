@@ -438,17 +438,41 @@ then:          transparent byte split (fake-TLS stream passes through)
 - The relay does **not** hide addresses from the relay itself; a DPI sees a
   TLS-like stream to the relay and back.
 
-## 16. Fake-TLS (wire mimicry)
+## 16. Fake-TLS v2 (wire mimicry)
 
-The whole TCP stream (m1/m2/m3 + obfuscated frames) is wrapped in a TLS-like
-envelope: first an imitated handshake (ClientHello with a random SNI from a
-list of unremarkable domains / ServerHello + CCS + Finished), then data as
-records `[17 03 03 len u16 BE][bytes]` up to 16384 per record — record
-headers big-endian, as in real TLS.
+The whole TCP stream (m1/m2/m3 + obfuscated frames) is wrapped in a byte-level
+imitation of Chrome ↔ TLS 1.3:
 
-This defeats passive DPI classification only. It is **not** real TLS: an
-active MITM that terminates the connection sees the forgery. IP hiding and
-IP-whitelist bypass are the relay's job (§15).
+- **ClientHello** is a byte-accurate template of a real Chrome 155 capture
+  (16 cipher suites, 19 extensions incl. X25519MLKEM768 + x25519 key shares,
+  ECH-grease, trust anchors, ALPS, ALPN h2/http1.1) — per connection the
+  random, session_id, GREASE codepoints, key-share blobs, ECH noise, SNI (from
+  a list of unremarkable domains) and the **order of the middle extensions**
+  (Fisher-Yates, as BoringSSL does) are randomized. Followed by CCS and an
+  encrypted Finished record (len 52) — the client direction is byte-for-byte a
+  real Chrome flight.
+- **Server flight**: ServerHello (echoing the client's session_id, AES-128-GCM,
+  x25519 key share) + CCS + 4 encrypted-looking records
+  (EncryptedExtensions/Certificate/CertificateVerify/Finished) with plausible
+  random sizes.
+- **Data**: records `[17 03 03 len u16 BE][payload][16-byte pseudo-AEAD tag]`,
+  len = payload + 16, max 16400 — exactly the AECD quantization of real
+  TLS 1.3. The tag is PRNG noise (content above is already AEAD-encrypted by
+  the session).
+- **Close**: a close_notify record (len 18) before TCP FIN; the peer maps it
+  to `Closed`. The 2-byte payload `[01 00]` is reserved.
+- **Relay framing** (§15) matches the quantization: marker record len 48
+  (32 + pseudo-tag), pair-signal record len 18 (minimum AECD record).
+- Speed: one `write` syscall per TLS record (staged header+payload+tag);
+  cosmetic noise from a per-connection PRNG; zero allocations per frame.
+
+This defeats passive DPI classification (JA3/JA4, record parsing, size
+statistics) only. It is **not** real TLS: an active MITM that terminates the
+connection sees the forgery (no real key material), and timing analysis
+(Finished sent without an RTT gap) is not imitated. IP hiding and
+IP-whitelist bypass are the relay's job (§15). The v2 framing is incompatible
+with first-generation fake-TLS: both ends must run the same core release
+(same rule as sealed frames, §19).
 
 ## 17. Core API (UDS)
 
@@ -463,7 +487,7 @@ Honest limits of the design:
 
 | Observer | Learns |
 |---|---|
-| on-path DPI | a TLS-like stream with quantized sizes (§16); no protocol markers |
+| on-path DPI | an indistinguishable-from-Chrome TLS 1.3 stream with AECD-quantized record sizes (§16); no protocol markers |
 | passive network observer | the *fact* that two IPs talk, volume, timing |
 | relay (self-hosted) | both endpoint IPs, volume, timing; no content |
 | contact | everything you send them, delivery confirmations, your current name/avatar |
