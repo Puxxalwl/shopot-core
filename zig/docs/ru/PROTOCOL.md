@@ -209,6 +209,7 @@ shopot://i/<base64url(bundle[64] || secret[16] || name_len u8 || name ≤32)>
 | 0x31 | CALL_AUDIO | `seq u32, data str16 ≤ 1024` |
 | 0x40 | JOIN | `bundle[64], name str8 ≤ 32, sig[64], hmac[32]` |
 | 0x42 | PROFILE | `name str8 ≤ 32, avatar_id[16]` |
+| 0x43 | CONTACT_CARD | `name str8 ≤ 32, bundle[64], addr str16 ≤ 64 (пусто = неизвестен)` — визитная карточка третьего лица, пересланная отправителем (SEND_CONTACT). Карточка знакомит, но не подключает: добавить этого человека можно только его собственным инвайтом. Неизвестные теги на приёме отбрасываются — старое ядро просто пропустит карточку |
 | 0x44 | RATCHET_KEY | `epoch u16, dh_pub[32]` (съедается слоем сессии) |
 | 0x50 | AVATAR | `avatar_id[16], data str16 ≤ 16000` |
 | 0x51 | AVATAR_ACK | `avatar_id[16]` |

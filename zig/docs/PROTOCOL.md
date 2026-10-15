@@ -210,6 +210,7 @@ shopot://i/<base64url(bundle[64] || secret[16] || name_len u8 || name ≤32)>
 | 0x31 | CALL_AUDIO | `seq u32, data str16 ≤ 1024` |
 | 0x40 | JOIN | `bundle[64], name str8 ≤ 32, sig[64], hmac[32]` |
 | 0x42 | PROFILE | `name str8 ≤ 32, avatar_id[16]` |
+| 0x43 | CONTACT_CARD | `name str8 ≤ 32, bundle[64], addr str16 ≤ 64 (empty = unknown)` — a third-party contact card forwarded by the sender (SEND_CONTACT). The card introduces, it does not connect: adding the person still requires their own invite. Unknown tags are discarded on receive, so an older core simply skips the card |
 | 0x44 | RATCHET_KEY | `epoch u16, dh_pub[32]` (consumed by session layer) |
 | 0x50 | AVATAR | `avatar_id[16], data str16 ≤ 16000` |
 | 0x51 | AVATAR_ACK | `avatar_id[16]` |

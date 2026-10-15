@@ -9,8 +9,11 @@ renders. The protocol is **binary**: no strings-as-protocol, no JSON, no
 human-readable text on the wire — only typed byte frames and machine-readable
 codes (methods, statuses, events).
 
-- API version: **2.0.0** (returned by `GET_VERSION`, semver). Major bump
-  over 1.0.0: message payloads gained a formatting-entities tail (§4.3).
+- API version: **2.2.0** (returned by `GET_VERSION`, semver). History:
+  2.0.0 — formatting-entities tail in message payloads (§4.3); 2.1.0 —
+  `SEARCH_MESSAGE`/`GLOBAL_SEARCH_MESSAGE` (§4.3); 2.2.0 — chat pinning/
+  deletion, message pinning, contact-card sharing (§4.8), the
+  `CONTACT_CARD` event, and the honest `delivered` bit (§7).
 - Normative wire protocol: [PROTOCOL.md](PROTOCOL.md).
 
 ## 1. Model
@@ -211,7 +214,18 @@ Payload: `[msg_id 16]`. Response:
 [react_count u32]
 × { [flags u8 (bit0 mine)][codepoint u32][ts_ms u64] }
 ```
-No record → `NOT_FOUND`.
+No record → `NOT_FOUND`. `bit1 delivered` is set by the receiver's ACK
+(`MESSAGE_DELIVERED`), not by the fact of writing to the socket: a sent
+message shows `delivered=0` until the ACK arrives. History is served from
+an in-memory cache; the log is read once at daemon start.
+
+#### `SEARCH_MESSAGE` (23) / `GLOBAL_SEARCH_MESSAGE` (24)
+Payload: `[cid u32][query str16][limit u32][offset u32]` (global: without
+`cid`). Response: `[total u32][count u32] × {[cid u32] (global only)
+[flags u8 (bit0 mine, bit1 delivered, bit2 fuzzy)][msg_id 16][ts_ms u64]
+[body str16][entity tail]}`. Case-insensitive exact substring matches
+first (newest → oldest), then fuzzy (word-level Levenshtein) for a
+single-word query. Errors: `BAD_ARGS` (empty query), `TOO_BIG`.
 
 ### 4.4 Own profile
 
@@ -277,6 +291,37 @@ Response: `[file_id 16][size u32][chunks u32]`.
 are normally unnecessary (autodial/LAN handle it); errors — `NO_CONTACT`,
 `TRANSPORT_FAILED`, `NO_RELAY`.
 
+### 4.8 Chats: pinning, deletion, contact cards
+
+| Method | id | Payload | Response |
+|---|---|---|---|
+| `PIN_CHAT` | 25 | `[cid u32]` | ∅ |
+| `GET_PINNED_CHAT` | 26 | ∅ | `[cid u32]` (0 = none) |
+| `UNPIN_CHAT` | 27 | ∅ | ∅ |
+| `DELETE_CHAT` | 28 | `[cid u32]` | ∅ |
+| `SEND_CONTACT` | 29 | `[to_cid u32][contact_cid u32]` | ∅ |
+| `PIN_MESSAGE` | 30 | `[cid u32][msg_id 16]` | ∅ |
+| `UNPIN_MESSAGE` | 31 | `[cid u32][msg_id 16]` | ∅ |
+| `GET_PINNED_MESSAGES` | 32 | `[cid u32]` | `[count u32] × {[msg_id 16]}` |
+
+- One pinned chat per daemon (idempotent re-pin). Pins survive restarts
+  (encrypted log).
+- `DELETE_CHAT` removes the conversation and the contact: the session is
+  torn down, outbox/file queues/history/reactions/pins of the chat are
+  purged. Re-meeting the same person (a new invite from them) creates a
+  **new cid with a clean history**. Until a restart the slot stays reserved
+  (cids of other chats do not shift); after a restart deleted slots are not
+  re-created — `LIST_CONTACTS` may return renumbered cids, so a client
+  re-syncs at bootstrap anyway.
+- `SEND_CONTACT` forwards a contact card (name, bundle, and — if known —
+  address) over a live session; `contact_cid = 0` sends your own card. The
+  receiver gets the `CONTACT_CARD` event. A card introduces, it does not
+  connect: adding that person requires their own invite. Errors:
+  `NO_CONTACT`, `CONTACT_BLOCKED`, `NO_SESSION`.
+- `PIN_MESSAGE` requires the message to exist in that chat's history
+  (`NOT_FOUND`); ≤ 16 pinned messages per chat (`TOO_BIG`). The order of
+  `GET_PINNED_MESSAGES` is the pinning order. `UNPIN_MESSAGE` is idempotent.
+
 ## 5. Events (EVENT)
 
 Broadcast to all connected clients, in any order, `request_id = 0`.
@@ -294,6 +339,7 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
 | `CONTACT_PROFILE` | 9 | `[cid u32][name str16][avatar_id 16]` |
 | `BLOCKED_BY_PEER` | 10 | `[cid u32]` |
 | `FILE_SENT` | 11 | `[cid u32][file_id 16][size u32][name str16]` |
+| `CONTACT_CARD` | 12 | `[cid u32][name str16][bundle 64][addr str16]` |
 
 - `MESSAGE_RECEIVED.ts_ms` = local receive time, consistent with GET_HISTORY
   timestamps. The `msg_id` is what reactions address.
@@ -303,6 +349,10 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
 - `CONTACT_JOINED`: the holder of your invite has connected — the contact
   exists now.
 - `CONTACT_PROFILE`: the contact's name/avatar_id changed (PROFILE echo).
+- `CONTACT_CARD`: a peer forwarded a third party's contact card
+  (SEND_CONTACT). The cid is the sender's; `addr` is empty when unknown.
+  A card introduces, it does not connect — adding the person requires
+  their own invite.
 
 ## 6. Limits (canonical table)
 
@@ -316,9 +366,14 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
 | file chunk | 16000 bytes |
 | concurrent file transfers per peer | 8 |
 | history limit parameter | 200 (0 → default 50) |
+| search limit parameter | 200 (0 → default 50) |
+| search query | 4096 bytes (case-insensitive: simple fold of ASCII + Cyrillic, other scripts as-is) |
 | outbox | 1000 records, TTL 30 days |
 | live invites | 4 (daemon memory, not persisted) |
 | message dedup window | 64 msg_ids per contact |
+| pinned chats | 1 per daemon |
+| pinned messages | 16 per chat |
+| contact card name / address | 32 / 64 bytes |
 | presence | PING after 4 s idle; 5 s interval; 3 misses → offline |
 | direct TCP port range | 7777–7786 (first free wins; all busy → LAN discovery off) |
 | LAN discovery | UDP multicast 239.77.77.77:57770, 74-byte announcements |
@@ -330,7 +385,10 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
    "will send later".
 2. The peer appears (LAN/autodial) → the core flushes the queue itself.
 3. The receiver of every TEXT sends an ACK envelope → the sender gets
-   `MESSAGE_DELIVERED`: the GUI shows the "delivered" check.
+   `MESSAGE_DELIVERED`: the GUI shows the "delivered" check. This ACK —
+   and only this ACK — sets the `delivered` bit in `GET_HISTORY`/
+   `GET_MESSAGE`/search records (including after a restart); an offline
+   queue entry is not a delivery.
 4. Duplicates are impossible: msg_ids are deduplicated on receipt.
 5. The queue survives a daemon restart (encrypted log); limits: 1000
    records, TTL 30 days.
@@ -407,7 +465,8 @@ the core does. Useful for reading logs and events:
 TEXT (0x10) carries msg_id/ts/body + the formatting entity tail; ACK (0x15) —
 delivery confirmation;
 REACT (0x13) — op + codepoint; JOIN (0x40) — invite proof; PROFILE (0x42) —
-name + avatar_id; AVATAR/AVATAR_ACK/AVATAR_REQ (0x50/0x51/0x52) — avatars;
+name + avatar_id; CONTACT_CARD (0x43) — a forwarded third-party contact card;
+AVATAR/AVATAR_ACK/AVATAR_REQ (0x50/0x51/0x52) — avatars;
 FILE_META/FILE_DATA/FILE_ACK (0x60/0x61/0x62) — files;
 CALL_SIGNAL/CALL_AUDIO (0x30/0x31) — calls; PING/PONG (0x20/0x21) — presence;
 BLOCK_NOTICE (0x14) — blocking.
