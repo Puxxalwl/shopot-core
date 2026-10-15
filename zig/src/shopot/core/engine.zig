@@ -394,6 +394,9 @@ pub const Engine = struct {
         const c = &self.contacts.items[idx];
         if (c.blocked) return; // hard ignore for blocked peers
         switch (env) {
+            // RATCHET_KEY до движка не доходит: сессия съедает его сама
+            // (крипто-состояние рэтчета), но exhaustiveness требует ветку
+            .ratchet_key => {},
             .text => |t| {
                 if (self.seenHas(contact_id, t.msg_id)) {
                     // повтор после реконнекта — уже доставлено; зеркальный ACK

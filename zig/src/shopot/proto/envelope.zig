@@ -17,6 +17,7 @@
 //!   JOIN          0x40: bundle: [64]u8, name: u8 + байты (≤ 32),
 //!                       sig: [64]u8, hmac: [32]u8
 //!   PROFILE       0x42: name: u8 + байты (≤ 32), avatar_id: [16]u8
+//!   RATCHET_KEY   0x44: epoch: u16, dh_pub: [32]u8 (PCS-ротация рэтчета)
 //!   AVATAR        0x50: avatar_id: [16]u8, data: u16 + байты (≤ 16000)
 //!   AVATAR_ACK   0x51: avatar_id: [16]u8
 //!   AVATAR_REQ   0x52: avatar_id: [16]u8
@@ -47,6 +48,10 @@ pub const Tag = enum(u8) {
     /// PROFILE: имя и текущий avatar_id отправителя (эхо при каждом
     /// установлении сессии).
     profile = 0x42,
+    /// RATCHET_KEY: свежий публичный X25519-ключ отправителя для DH-шага
+    /// рэтчета. Обрабатывается сессией (до движка): обмен пабликами обеих
+    /// сторон завершается совместным dhStep — новые цепочки, эпоха +1.
+    ratchet_key = 0x44,
     /// AVATAR: байты аватара (контент-адресованы SHA-256[0..16]).
     avatar = 0x50,
     /// AVATAR_ACK: аватар получен и сохранён.
@@ -207,6 +212,18 @@ pub const FileData = struct {
     data: []const u8,
 };
 
+/// RATCHET_KEY (0x44): PCS-ротация рэтчета. Отправитель сгенерировал свежую
+/// X25519-пару для следующей эпохи и предъявляет публичную часть; получив
+/// паблики ОБЕИХ сторон, каждая выполняет dhStep (свежий секрет свой,
+/// fresh-паблик чужой) — цепочки пересоздаются, компрометация старых
+/// цепочек больше не читает новые сообщения.
+pub const RatchetKey = struct {
+    /// Эпоха, на которую предназначен ключ = ratchet.epoch + 1 отправителя.
+    epoch: u16,
+    /// Свежий публичный X25519-ключ отправителя.
+    dh_pub: [32]u8,
+};
+
 /// JOIN (0x40): держатель инвайт-кода доказывает право на подключение.
 /// Отправляется первым конвертом сразу после рукопожатия.
 pub const Join = struct {
@@ -244,6 +261,8 @@ pub const Envelope = union(enum) {
     join: Join,
     /// PROFILE (0x42).
     profile: Profile,
+    /// RATCHET_KEY (0x44).
+    ratchet_key: RatchetKey,
     /// AVATAR (0x50).
     avatar: Avatar,
     /// AVATAR_ACK (0x51).
@@ -268,6 +287,7 @@ pub fn encodedLen(e: Envelope) usize {
         .call_audio => |m| 1 + 4 + 2 + m.data.len,
         .join => |m| 1 + 64 + 1 + m.name.len + join_sig_len + join_hmac_len,
         .profile => |m| 1 + 1 + m.name.len + id_len,
+        .ratchet_key => 1 + 2 + 32,
         .avatar => |m| 1 + id_len + 2 + m.data.len,
         .file_meta => |m| 1 + id_len + 1 + m.name.len + 4 + 32,
         .file_data => |m| 1 + id_len + 4 + 2 + m.data.len,
@@ -338,6 +358,11 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
             try w.put(@intCast(m.name.len));
             try w.putFixed(m.name);
             try w.putFixed(&m.avatar_id);
+        },
+        .ratchet_key => |m| {
+            try w.put(@backingInt(Tag.ratchet_key));
+            try w.putInt(u16, m.epoch);
+            try w.putFixed(&m.dh_pub);
         },
         .avatar => |m| {
             if (m.data.len > max_avatar_data) return error.TooBig;
@@ -446,6 +471,10 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
                 .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
             },
         },
+        @backingInt(Tag.ratchet_key) => .{ .ratchet_key = .{
+            .epoch = try r.getInt(u16),
+            .dh_pub = (try r.getFixed(32))[0..32].*,
+        } },
         @backingInt(Tag.avatar) => .{ .avatar = .{
             .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
             .data = blk: {
@@ -744,6 +773,29 @@ test "envelope: JOIN roundtrip" {
     try testing.expectEqualSlices(u8, &filled(32, 0x33), &back.join.hmac);
     // мусорный хвост — BadLen
     try testing.expectError(error.Truncated, decode(bytes[0 .. bytes.len - 1]));
+}
+
+test "envelope: RATCHET_KEY roundtrip" {
+    var buf: [max_encoded_len]u8 = undefined;
+    const e = Envelope{ .ratchet_key = .{
+        .epoch = 0x0304,
+        .dh_pub = filled(32, 0xA5),
+    } };
+    const bytes = try encode(&buf, e);
+    try testing.expectEqual(@as(usize, 1 + 2 + 32), bytes.len);
+    // тег 0x44, epoch u16 LE
+    try testing.expectEqual(@as(u8, 0x44), bytes[0]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x04, 0x03 }, bytes[1..3]);
+
+    const back = try decode(bytes);
+    try testing.expectEqual(@as(u16, 0x0304), back.ratchet_key.epoch);
+    try testing.expectEqualSlices(u8, &filled(32, 0xA5), &back.ratchet_key.dh_pub);
+    // обрезанный/с хвостом
+    try testing.expectError(error.Truncated, decode(bytes[0 .. bytes.len - 1]));
+    var with_tail: [40]u8 = undefined;
+    @memcpy(with_tail[0..bytes.len], bytes);
+    with_tail[bytes.len] = 0;
+    try testing.expectError(error.BadLen, decode(with_tail[0 .. bytes.len + 1]));
 }
 
 test "envelope: ACK roundtrip" {

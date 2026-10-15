@@ -31,6 +31,10 @@ pub const Ratchet = struct {
     send_counter: u64,
     /// Счётчик следующего входящего сообщения.
     recv_counter: u64,
+    /// Номер эпохи (0 из handshake, +1 на каждый dhStep). Уходит в заголовок
+    /// sealed-кадра: приёмник выбирает цепочку по эпохе, кадры предыдущей
+    /// эпохи в полёте расшифровываются по снапшоту цепочки у сессии.
+    epoch: u16 = 0,
 
     /// Собирает рэтчет из начальных цепочек (обычно из handshake).
     pub fn init(chain_send: [32]u8, chain_recv: [32]u8) Ratchet {
@@ -39,6 +43,7 @@ pub const Ratchet = struct {
             .chain_recv = chain_recv,
             .send_counter = 0,
             .recv_counter = 0,
+            .epoch = 0,
         };
     }
 
@@ -71,12 +76,17 @@ pub const Ratchet = struct {
         self.recv_counter += 1;
     }
 
-    /// DH-шаг: обе цепочки пересоздаются из X25519(`own_enc_sk`, `new_remote_pub`),
-    /// счётчики сбрасываются в 0. Направление "03" назначается стороне с меньшим
-    /// публичным ключом (детерминированное правило, одинаковое у обеих сторон),
-    /// поэтому chain_send одной стороны всегда совпадает с chain_recv другой.
-    pub fn dhStep(self: *Ratchet, new_remote_pub: [32]u8, own_enc_sk: [32]u8) Error!void {
-        var shared = X25519.scalarmult(own_enc_sk, new_remote_pub) catch return error.BadRemoteKey;
+    /// DH-шаг (PCS-ротация): обе цепочки пересоздаются из X25519(
+    /// `own_secret`, `new_remote_pub`), счётчики сбрасываются, эпоха +1.
+    /// В ротации `own_secret` — СВЕЖАЯ ключевая пара стороны (не статика
+    /// личности): обе стороны обмениваются свежими пабликами в конвертах
+    /// RATCHET_KEY и зовут dhStep с зеркальными аргументами — общий секрет
+    /// DH(a_fresh, b_fresh) каждый раз новый. Направление "03" назначается
+    /// стороне с меньшим публичным ключом (детерминированное правило,
+    /// одинаковое у обеих сторон), поэтому chain_send одной стороны всегда
+    /// совпадает с chain_recv другой.
+    pub fn dhStep(self: *Ratchet, new_remote_pub: [32]u8, own_secret: [32]u8) Error!void {
+        var shared = X25519.scalarmult(own_secret, new_remote_pub) catch return error.BadRemoteKey;
         var root = HkdfSha256.extract(ratchet_salt, &shared);
         std.crypto.secureZero(u8, &shared);
 
@@ -88,7 +98,7 @@ pub const Ratchet = struct {
         HmacSha256.create(&c4, &s4, &root);
         std.crypto.secureZero(u8, &root);
 
-        const own_public = X25519.recoverPublicKey(own_enc_sk);
+        const own_public = X25519.recoverPublicKey(own_secret);
         if (std.mem.order(u8, &own_public, &new_remote_pub) != .gt) {
             self.chain_send = c3;
             self.chain_recv = c4;
@@ -101,6 +111,21 @@ pub const Ratchet = struct {
 
         self.send_counter = 0;
         self.recv_counter = 0;
+        self.epoch +%= 1;
+    }
+
+    /// Выводит ключ сообщения для ПРОИЗВОЛЬНОЙ цепочки и счётчика — для
+    /// расшифровки кадров предыдущей эпохи по снапшоту цепочки (сессия
+    /// хранит его на время ротации). Текущая эпоха идёт через
+    /// peekRecv/commitRecv.
+    pub fn deriveKey(chain: [32]u8, counter: u64, msg_key: *[32]u8) void {
+        messageKey(chain, counter, msg_key);
+    }
+
+    /// Сдвигает ПРОИЗВОЛЬНУЮ цепочку (снапшот предыдущей эпохи у сессии)
+    /// после успешной расшифровки кадра той эпохи.
+    pub fn stepChainForward(chain: *[32]u8) void {
+        stepChain(chain);
     }
 };
 
@@ -208,6 +233,9 @@ test "ratchet: зеркальность сторон после dhStep" {
 
     try a.dhStep(pk_b, sk_a);
     try b.dhStep(pk_a, sk_b);
+    // эпоха синхронно +1 у обеих сторон
+    try std.testing.expectEqual(@as(u16, 1), a.epoch);
+    try std.testing.expectEqual(@as(u16, 1), b.epoch);
 
     // у обеих сторон одинаковые встречные цепочки
     try std.testing.expectEqualSlices(u8, &a.chain_send, &b.chain_recv);

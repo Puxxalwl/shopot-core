@@ -28,6 +28,7 @@ availability. We aim to acknowledge within 72 hours.
 | Ed25519   | std.crypto     | identity signatures (handshake auth, JOIN binding) |
 | ChaCha20-Poly1305 | std.crypto | AEAD for envelopes, frames, at-rest records |
 | Symmetric ratchet | own code on std HKDF/HMAC | per-message keys (advance-on-decrypt per Double Ratchet spec §3.5) |
+| DH ratchet (PCS) | own code on std X25519/HKDF | epoch rotation every 256 sent messages: both sides exchange fresh X25519 pubs (RATCHET_KEY envelope) and re-derive chains via a joint DH step |
 | HKDF-SHA256 | std.crypto.kdf | key derivation |
 | BLAKE2s-256 / SHA-256 | std.crypto | fingerprints, transcript hash, file integrity |
 | BIP-39    | own code (tests cover checksum) | mnemonic ↔ entropy |

@@ -435,6 +435,108 @@ test "block: traffic from blocked peer is dropped engine-wide" {
 }
 
 // ------------------------------------------------------ outbox flow (E2E)
+test "ratchet: PCS-ротация по порогу отправки, все сообщения доезжают" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    io_g.stored = io;
+    io_g.alloc = alloc;
+    obf_idx = 0;
+    obf_tracker = .{ null, null };
+    const id_a = try identity.Identity.fromSeed(filled(21));
+    const id_b = try identity.Identity.fromSeed(filled(23));
+
+    const pair = try pipePair(alloc);
+    var ca = pair[0];
+    var cb = pair[1];
+
+    var ha = Harness{ .alloc = alloc };
+    var hb = Harness{ .alloc = alloc };
+
+    var sb_opt: ?*session_mod.Session = null;
+    const th_b = try std.Thread.spawn(.{}, establishB, .{ alloc, cb.conn(), &id_b, id_a.bundle(), &hb, &sb_opt });
+
+    const sa = try session_mod.Session.establish(
+        alloc,
+        ca.conn(),
+        .initiator,
+        &id_a,
+        id_b.bundle(),
+        filled(2),
+        @ptrCast(&wrap_slot),
+        wrapConn,
+        .{ .ctx = &ha, .onEnvelope = Harness.onEnvelope, .onClosed = Harness.onClosed },
+        io,
+    );
+    th_b.join();
+    const sb = sb_opt orelse return error.ResponderFailed;
+
+    // порог ротации 4: за 24 сообщения обе стороны обменяются RATCHET_KEY
+    // несколько раз; кадры «в полёте» между RATCHET_KEY и dhStep должны
+    // расшифровываться по снапшоту цепочки, ни одно TEXT не теряется
+    sa.rotate_every = 4;
+    sb.rotate_every = 4;
+
+    for (0..24) |i| {
+        var body_buf: [16]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "a->b {d:0>2}", .{i});
+        try sa.sendText(body);
+    }
+    for (0..24) |i| {
+        var body_buf: [16]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "b->a {d:0>2}", .{i});
+        try sb.sendText(body);
+    }
+    for (0..24) |i| {
+        var body_buf: [16]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "a->b {d:0>2}", .{i});
+        try waitTexts(&hb, body);
+    }
+    for (0..24) |i| {
+        var body_buf: [16]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "b->a {d:0>2}", .{i});
+        try waitTexts(&ha, body);
+    }
+
+    // ротация реально случилась и стороны синхронны по эпохе
+    try std.testing.expect(sa.ratchet.epoch > 1);
+    try std.testing.expectEqual(sa.ratchet.epoch, sb.ratchet.epoch);
+    // снапшот prev_recv гасится первым кадром новой эпохи; у получателя
+    // последнего RATCHET_KEY он может остаться до следующего кадра —
+    // это не ошибка, протокол держит его сколько угодно долго
+
+    // после ротации обычный обмен жив
+    try sa.sendText("post-rotate");
+    try waitTexts(&hb, "post-rotate");
+    // кадр новой эпохи дошёл и погасил снапшот у B
+    try std.testing.expect(sb.prev_recv == null);
+
+    sa.close();
+    sb.close();
+    for (obf_tracker) |oc| {
+        if (oc) |o| {
+            o.deinit();
+            alloc.destroy(o);
+        }
+    }
+    alloc.destroy(sa);
+    alloc.destroy(sb);
+    ca.me.inbox.deinit(alloc);
+    cb.me.inbox.deinit(alloc);
+    alloc.destroy(ca.me);
+    alloc.destroy(cb.me);
+    for (ha.texts.items) |t| alloc.free(t);
+    for (hb.texts.items) |t| alloc.free(t);
+    ha.texts.deinit(alloc);
+    ha.text_ts.deinit(alloc);
+    hb.texts.deinit(alloc);
+    hb.text_ts.deinit(alloc);
+    ha.reacts.deinit(alloc);
+    hb.reacts.deinit(alloc);
+    ha.pings.deinit(alloc);
+    hb.pings.deinit(alloc);
+}
+
 test "outbox: очередь офлайн, доставка при сессии, ACK, дедуп" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;

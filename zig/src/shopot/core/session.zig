@@ -4,6 +4,14 @@
 //! stream wrapper (obfuscated AEAD) -> framed envelopes. TEXT payloads are
 //! additionally sealed by the per-message ratchet: two independent crypto
 //! layers, each with its own forward secrecy.
+//!
+//! PCS-ротация рэтчета: каждые rotate_every отправленных сообщений сторона
+//! генерирует свежую X25519-пару и шлёт паблик конвертом RATCHET_KEY; когда
+//! у обеих сторон есть оба fresh-паблика, обе делают dhStep — цепочки
+//! пересоздаются, эпоха +1. Sealed-кадры несут эпоху: кадры предыдущей
+//! эпохи «в полёте» расшифровываются по снапшоту цепочки (prev_recv),
+//! снапшот гасится первым кадром новой эпохи (порядок потока гарантирует,
+//! что старых кадров больше не будет).
 const std = @import("std");
 const interfaces = @import("interfaces.zig");
 const handshake = @import("../crypto/handshake.zig");
@@ -12,6 +20,8 @@ const kdf = @import("../crypto/kdf.zig");
 const aead = @import("../crypto/aead.zig");
 const identity_mod = @import("../crypto/identity.zig");
 const envelope = @import("../proto/envelope.zig");
+
+const X25519 = std.crypto.dh.X25519;
 
 pub const SessionError = error{
     HandshakeFailed,
@@ -40,6 +50,22 @@ pub const Events = struct {
 };
 
 const sealed_tag: u8 = 0xA1; // ratchet-sealed TEXT frame marker
+/// Заголовок sealed-кадра: [tag 0xA1][epoch u16 LE][counter u64 LE].
+const sealed_hdr_len: usize = 1 + 2 + 8;
+
+/// Свежая X25519-пара стороны для СЛЕДУЮЩЕЙ эпохи ротации.
+const RotPair = struct {
+    secret: [32]u8,
+    pub_key: [32]u8,
+};
+
+/// Снапшот приёмной цепочки предыдущей эпохи: кадры пира, отправленные до
+/// его dhStep, приходят после нашего — расшифровываются по снапшоту.
+const PrevChain = struct {
+    epoch: u16,
+    chain: [32]u8,
+    counter: u64,
+};
 
 pub const Session = struct {
     conn: interfaces.Conn,
@@ -51,6 +77,15 @@ pub const Session = struct {
     rx_thread: ?std.Thread = null,
     alloc: std.mem.Allocator,
     io: std.Io,
+    /// Порог отправленных сообщений для запуска DH-ротации (PCS).
+    /// Тесты уменьшают; 0 — ротация отключена.
+    rotate_every: u64 = 256,
+    /// Свежая X25519-пара для следующей эпохи (паблик уже отправлен пиру).
+    rot_own: ?RotPair = null,
+    /// Fresh-паблик пира для следующей эпохи.
+    rot_peer: ?[32]u8 = null,
+    /// Снапшот приёмной цепочки предыдущей эпохи (кадры пира в полёте).
+    prev_recv: ?PrevChain = null,
 
     pub fn establish(
         alloc: std.mem.Allocator,
@@ -283,6 +318,9 @@ pub const Session = struct {
     /// Приёмник разбирает поток кадр за кадром через leftover-буфер
     /// ObfReader — формат провода НЕ меняется. Сбой пачки оставляет записи
     /// outbox нетронутыми, повтор идемпотентен дедупом на приёме.
+    /// Sealed-кадр: [len u16][tag 0xA1][epoch u16][counter u64][box];
+    /// при достижении rotate_every отправок в пачку подмешивается конверт
+    /// RATCHET_KEY (запуск PCS-ротации).
     pub fn sendSealedTexts(self: *Session, envs: []const envelope.Envelope) SessionError!void {
         if (envs.len == 0) return;
         // 16356 = старший obf-класс 16384 минус оверхед кадра 26 и метка
@@ -294,12 +332,18 @@ pub const Session = struct {
         self.send_mu.lockUncancelable(self.io);
         defer self.send_mu.unlock(self.io);
         for (envs) |env| {
+            // триггер PCS-ротации: порог отправки достигнут, пары ещё нет
+            if (self.rotate_every != 0 and self.rot_own == null and
+                self.ratchet.send_counter >= self.rotate_every)
+            {
+                try self.rotateStartLocked(&batch, &used);
+            }
             var enc: [envelope.max_encoded_len]u8 = undefined;
             const plain = envelope.encode(&enc, env) catch return SessionError.TooBig;
-            const frame_len: usize = 9 + plain.len + aead.tag_length;
+            const frame_len: usize = sealed_hdr_len + plain.len + aead.tag_length;
             if (2 + frame_len > batch.len) return SessionError.TooBig;
             if (used > 0 and used + 2 + frame_len > batch.len) {
-                // буфер полон: флеш накопленного, конверт — в следующий
+                // следующий кадр не влезает: флеш накопленного
                 self.conn.writeAll(batch[0..used]) catch return SessionError.Closed;
                 used = 0;
             }
@@ -307,14 +351,90 @@ pub const Session = struct {
             // спереди): один conn.writeAll на всю пачку
             var msg_key: [32]u8 = undefined;
             const counter = self.ratchet.stepSend(&msg_key);
-            batch[used + 2] = sealed_tag;
-            std.mem.writeInt(u64, batch[used + 3 ..][0..8], counter, .little);
+            const dst = batch[used..];
+            dst[2] = sealed_tag;
+            std.mem.writeInt(u16, dst[3..5], self.ratchet.epoch, .little);
+            std.mem.writeInt(u64, dst[5..13], counter, .little);
             const nonce = aead.nonceFor(counter);
-            aead.seal(batch[used + 11 ..], plain, msg_key, nonce, batch[used + 2 ..][0..9]);
-            std.mem.writeInt(u16, batch[used..][0..2], @intCast(frame_len), .little);
+            aead.seal(dst[13..], plain, msg_key, nonce, dst[2 .. 2 + sealed_hdr_len]);
+            std.mem.writeInt(u16, dst[0..2], @intCast(frame_len), .little);
             used += 2 + frame_len;
         }
         if (used > 0) self.conn.writeAll(batch[0..used]) catch return SessionError.Closed;
+    }
+
+    /// Генерирует свежую X25519-пару и отправляет паблик пиру конвертом
+    /// RATCHET_KEY (в пачку, если она идёт, иначе отдельным writeAll).
+    /// Только под send_mu. Ошибка записи — ротация не стартует.
+    fn rotateStartLocked(self: *Session, batch: ?[]u8, used: *usize) SessionError!void {
+        const kp = X25519.KeyPair.generate(self.io);
+        var f: [2 + 35]u8 = undefined;
+        const plain = envelope.encode(f[2..], .{ .ratchet_key = .{
+            .epoch = self.ratchet.epoch +% 1,
+            .dh_pub = kp.public_key,
+        } }) catch return SessionError.TooBig;
+        std.mem.writeInt(u16, f[0..2], @intCast(plain.len), .little);
+        const frame = f[0 .. 2 + plain.len];
+        if (batch) |b| {
+            // флешим пачку, если конверт не влезает (порядок потока важен)
+            if (used.* > 0 and used.* + frame.len > b.len) {
+                self.conn.writeAll(b[0..used.*]) catch return SessionError.Closed;
+                used.* = 0;
+            }
+            @memcpy(b[used.*..][0..frame.len], frame);
+            used.* += frame.len;
+        } else {
+            self.conn.writeAll(frame) catch return SessionError.Closed;
+        }
+        self.rot_own = .{ .secret = kp.secret_key, .pub_key = kp.public_key };
+    }
+
+    /// Пир прислал fresh-паблик (конверт RATCHET_KEY). Только следующая
+    /// эпоха; дубликаты и отставание игнорируются. Если своей пары ещё нет —
+    /// генерируем и отвечаем, затем (обе части есть) — совместный dhStep.
+    /// Вызывается из rx-потока под send_mu.
+    fn handleRatchetKeyLocked(self: *Session, m: envelope.RatchetKey) void {
+        if (self.rotate_every == 0) return; // ротация отключена
+        if (m.epoch != self.ratchet.epoch +% 1) return;
+        if (self.rot_peer != null) return;
+        self.rot_peer = m.dh_pub;
+        if (self.rot_own == null) {
+            var unused: usize = 0;
+            self.rotateStartLocked(null, &unused) catch return;
+        }
+        self.tryAdvanceLocked();
+    }
+
+    /// Совместный DH-шаг: обе части есть → снапшот приёмной цепочки (кадры
+    /// пира в полёте), dhStep, секреты стёрты. Вырожденный DH-паблик пира —
+    /// враждебный протокол-нарушитель: сессия закрывается (peer-side уже
+    /// ротировался, цепочки всё равно разойдутся).
+    fn tryAdvanceLocked(self: *Session) void {
+        if (self.rot_own == null or self.rot_peer == null) return;
+        const peer = self.rot_peer.?;
+        var own_secret = self.rot_own.?.secret;
+        self.prev_recv = .{
+            .epoch = self.ratchet.epoch,
+            .chain = self.ratchet.chain_recv,
+            .counter = self.ratchet.recv_counter,
+        };
+        self.ratchet.dhStep(peer, own_secret) catch {
+            // низкопорядковый паблик: peer не мог честно ротироваться с ним
+            self.prev_recv = null;
+            self.closeConn();
+            return;
+        };
+        std.crypto.secureZero(u8, &own_secret);
+        std.crypto.secureZero(u8, &self.rot_own.?.secret);
+        self.rot_own = null;
+        self.rot_peer = null;
+    }
+
+    /// Закрыть транспорт (без join rx-потока — мы может быть В нём).
+    fn closeConn(self: *Session) void {
+        if (self.running.swap(false, .seq_cst)) {
+            self.conn.close();
+        }
     }
 
     /// Everything else rides the transport layer only (presence, reactions,
@@ -352,46 +472,96 @@ pub const Session = struct {
 
     fn rxLoop(self: *Session) void {
         var buf: [envelope.max_encoded_len + 64]u8 = undefined;
+        // plain-буфер живёт в кадре rxLoop: срезы конвертов (body) из него
+        // валидны до конца итерации, пока onEnvelope их не разберёт
+        var plain_buf: [envelope.max_encoded_len]u8 = undefined;
         while (self.running.load(.seq_cst)) {
             const n = readFrame(self.conn, &buf) catch break;
             if (n == 0) break;
             var env: envelope.Envelope = undefined;
             if (buf[0] == sealed_tag) {
-                if (n < 10) continue;
-                const counter = std.mem.readInt(u64, buf[1..9], .little);
-                var msg_key: [32]u8 = undefined;
-                self.send_mu.lockUncancelable(self.io);
-                // вывод ключа БЕЗ сдвига цепочки: счётчик обязан совпасть
-                // с ожидаемым (повтор/перестановка — кадр отбрасывается),
-                // цепочка сдвигается только после успешной расшифровки.
-                // Раньше stepRecv сдвигал цепочку ДО open: один битый кадр
-                // навсегда рассинхронизировал стороны — все последующие
-                // TEXT молча терялись.
-                const expected = self.ratchet.peekRecv(&msg_key);
-                if (counter != expected) {
-                    self.send_mu.unlock(self.io);
-                    continue;
-                }
-                const nonce = aead.nonceFor(counter);
-                const box = buf[9..n];
-                var plain_buf: [envelope.max_encoded_len]u8 = undefined;
-                if (aead.open(&plain_buf, box, msg_key, nonce, buf[0..9])) |_| {
-                    // успех — только теперь шаг цепочки приёма
-                    self.ratchet.commitRecv();
-                } else |_| {
-                    self.send_mu.unlock(self.io);
-                    continue;
-                }
-                self.send_mu.unlock(self.io);
-                const plain_len = box.len - aead.tag_length;
-                env = envelope.decode(plain_buf[0..plain_len]) catch continue;
+                env = self.rxSealed(buf[0..n], &plain_buf) orelse continue;
             } else {
                 env = envelope.decode(buf[0..n]) catch continue;
+            }
+            // RATCHET_KEY — протокол ротации, сессия съедает его сама:
+            // движок крипто-состояние сессии не видит
+            if (env == .ratchet_key) {
+                self.send_mu.lockUncancelable(self.io);
+                defer self.send_mu.unlock(self.io);
+                self.handleRatchetKeyLocked(env.ratchet_key);
+                continue;
             }
             self.ev.onEnvelope(self.ev.ctx, env);
         }
         self.running.store(false, .seq_cst);
         self.ev.onClosed(self.ev.ctx);
+    }
+
+    /// Расшифровка sealed-кадра [tag][epoch u16][counter u64][box] под
+    /// send_mu. Текущая эпоха: peekRecv (ключ без сдвига цепочки, счётчик
+    /// обязан совпасть — повтор/перестановка отбрасываются), commitRecv
+    /// только после успешного open (Double Ratchet spec §3.5: один битый
+    /// кадр не рассинхронизирует стороны). Предыдущая эпоха: кадры пира
+    /// «в полёте» (отправлены до его dhStep, пришли после нашего) — ключ из
+    /// снапшота prev_recv, счётчик строго продолжает последовательность.
+    /// Первый успешный кадр текущей (новой) эпохи гасит снапшот: порядок
+    /// потока гарантирует, что старых кадров пира больше не будет.
+    /// null — кадр отброшен (битый/чужая эпоха/повтор счётчика).
+    /// Открытый текст кладётся в `plain_buf` КАДРА ВЫЗЫВАЮЩЕГО: срезы
+    /// декодированного конверта обязаны жить после возврата.
+    fn rxSealed(self: *Session, frame: []const u8, plain_buf: []u8) ?envelope.Envelope {
+        if (frame.len < sealed_hdr_len + aead.tag_length) return null;
+        const epoch = std.mem.readInt(u16, frame[1..3], .little);
+        const counter = std.mem.readInt(u64, frame[3..11], .little);
+        const box = frame[sealed_hdr_len..];
+        const ad = frame[0..sealed_hdr_len];
+
+        self.send_mu.lockUncancelable(self.io);
+        defer self.send_mu.unlock(self.io);
+
+        var msg_key: [32]u8 = undefined;
+        var commit_current = false;
+        var commit_prev = false;
+
+        if (epoch == self.ratchet.epoch) {
+            const expected = self.ratchet.peekRecv(&msg_key);
+            if (counter != expected) return null;
+            if (aead.open(plain_buf, box, msg_key, aead.nonceFor(counter), ad)) |_| {
+                commit_current = true;
+            } else |_| {
+                return null;
+            }
+        } else if (self.prev_recv != null and epoch == self.prev_recv.?.epoch) {
+            const p: *PrevChain = &self.prev_recv.?;
+            if (counter != p.counter) return null;
+            ratchet_mod.Ratchet.deriveKey(p.chain, counter, &msg_key);
+            if (aead.open(plain_buf, box, msg_key, aead.nonceFor(counter), ad)) |_| {
+                commit_prev = true;
+            } else |_| {
+                return null;
+            }
+        } else {
+            // неизвестная/слишком старая эпоха — кадр отбрасывается
+            return null;
+        }
+
+        const plain_len = box.len - aead.tag_length;
+        const env = envelope.decode(plain_buf[0..plain_len]) catch return null;
+        if (commit_current) {
+            self.ratchet.commitRecv();
+            // кадр НОВОЙ эпохи дошёл — старых кадров пира больше не будет
+            if (self.prev_recv != null) {
+                std.crypto.secureZero(u8, &self.prev_recv.?.chain);
+                self.prev_recv = null;
+            }
+        }
+        if (commit_prev) {
+            const p: *PrevChain = &self.prev_recv.?;
+            ratchet_mod.Ratchet.stepChainForward(&p.chain);
+            p.counter += 1;
+        }
+        return env;
     }
 
     fn fillRandom(self: *Session, dest: []u8) void {
@@ -418,18 +588,20 @@ test "session: битый sealed-кадр не рассинхронизируе�
     try std.testing.expectEqual(@as(u64, 0), counter);
     var good: [envelope.max_encoded_len + 64]u8 = undefined;
     good[0] = sealed_tag;
-    std.mem.writeInt(u64, good[1..9], counter, .little);
-    aead.seal(good[9..], plain, msg_key, aead.nonceFor(counter), good[0..9]);
-    const good_frame_len: usize = 9 + plain.len + aead.tag_length;
+    std.mem.writeInt(u16, good[1..3], peer_ratchet.epoch, .little);
+    std.mem.writeInt(u64, good[3..11], counter, .little);
+    aead.seal(good[11..], plain, msg_key, aead.nonceFor(counter), good[0..11]);
+    const good_frame_len: usize = sealed_hdr_len + plain.len + aead.tag_length;
 
     // битый sealed-кадр с ТОТ ЖЕ counter 0, но мусор вместо бокса:
     // open обязана провалиться, цепочка приёма сдвигаться НЕ должна
     var bad: [envelope.max_encoded_len + 64]u8 = undefined;
     bad[0] = sealed_tag;
-    std.mem.writeInt(u64, bad[1..9], counter, .little);
+    std.mem.writeInt(u16, bad[1..3], peer_ratchet.epoch, .little);
+    std.mem.writeInt(u64, bad[3..11], counter, .little);
     const garbage_len: usize = plain.len + aead.tag_length;
-    for (bad[9..][0..garbage_len], 0..) |*b, i| b.* = @truncate(i *% 31 +% 5);
-    const bad_frame_len: usize = 9 + garbage_len;
+    for (bad[11..][0..garbage_len], 0..) |*b, i| b.* = @truncate(i *% 31 +% 5);
+    const bad_frame_len: usize = sealed_hdr_len + garbage_len;
 
     // скрипт провода: [hdr][битый][hdr][валидный]
     var wire: [2 * (envelope.max_encoded_len + 64 + 2)]u8 = undefined;
@@ -456,7 +628,7 @@ test "session: битый sealed-кадр не рассинхронизируе�
     // старый код: stepRecv до open сдвигал цепочку на битом кадре,
     // валидный кадр больше не расшифровывался — сообщение терялось молча
     try std.testing.expect(collector.got);
-    try std.testing.expectEqualStrings("survivor", collector.got_body);
+    try std.testing.expectEqualStrings("survivor", collector.bodyOf(0));
     try std.testing.expectEqual(@as(u64, 1), s.ratchet.recv_counter);
 }
 
@@ -475,9 +647,10 @@ test "session: повтор sealed-кадра (counter не тот) отбрас
     const c0 = peer_ratchet.stepSend(&msg_key);
     var box: [envelope.max_encoded_len + 64]u8 = undefined;
     box[0] = sealed_tag;
-    std.mem.writeInt(u64, box[1..9], c0, .little);
-    aead.seal(box[9..], plain, msg_key, aead.nonceFor(c0), box[0..9]);
-    const frame_len: usize = 9 + plain.len + aead.tag_length;
+    std.mem.writeInt(u16, box[1..3], peer_ratchet.epoch, .little);
+    std.mem.writeInt(u64, box[3..11], c0, .little);
+    aead.seal(box[11..], plain, msg_key, aead.nonceFor(c0), box[0..11]);
+    const frame_len: usize = sealed_hdr_len + plain.len + aead.tag_length;
 
     // один и тот же кадр ДВАЖДЫ: второй — повтор (counter 0 при ожидаемом 1)
     var wire: [2 * (envelope.max_encoded_len + 64 + 2)]u8 = undefined;
@@ -502,7 +675,7 @@ test "session: повтор sealed-кадра (counter не тот) отбрас
 
     // первый принят, повтор отброшен: ровно одно событие, счётчик 1
     try std.testing.expect(collector.got);
-    try std.testing.expectEqualStrings("dup", collector.got_body);
+    try std.testing.expectEqualStrings("dup", collector.bodyOf(0));
     try std.testing.expectEqual(@as(u64, 1), s.ratchet.recv_counter);
 }
 
@@ -535,10 +708,13 @@ test "session module compiles" {
 // ==== Тест rxLoop: битый sealed-кадр не рассинхронизирует рэтчет ====
 
 /// Фейковый Conn: readAll последовательно выдаёт заготовленные байты,
-/// исчерпание — Closed. writeAll не нужен (приём только).
+/// исчерпание — Closed. writeAll захватывает записанное в `out` (сессия
+/// так отвечает конвертом RATCHET_KEY — тест парсит паблик из ответа).
 const ScriptConn = struct {
     bytes: []const u8,
     pos: usize = 0,
+    out: [128]u8 = undefined,
+    out_len: usize = 0,
 
     fn readAllImpl(ptr: *anyopaque, buf: []u8) interfaces.ConnError!void {
         const self: *ScriptConn = @ptrCast(@alignCast(ptr));
@@ -549,8 +725,10 @@ const ScriptConn = struct {
     }
 
     fn writeAllImpl(ptr: *anyopaque, bytes: []const u8) interfaces.ConnError!void {
-        _ = ptr;
-        _ = bytes;
+        const self: *ScriptConn = @ptrCast(@alignCast(ptr));
+        if (bytes.len > self.out.len - self.out_len) return error.Closed;
+        @memcpy(self.out[self.out_len..][0..bytes.len], bytes);
+        self.out_len += bytes.len;
     }
 
     fn closeImpl(ptr: *anyopaque) void {
@@ -568,16 +746,25 @@ const ScriptConn = struct {
     }
 };
 
+/// Сборщик TEXT-событий: тела КОПИРУЮТСЯ в фиксированные буферы — срезы
+/// onEnvelope указывают в стек rxSealed и вне вызова невалидны.
 const RxCollector = struct {
-    got_body: []const u8 = "",
     got: bool = false,
+    count: u32 = 0,
+    bodies: [8][16]u8 = @splat(@splat(0)),
+    lens: [8]u8 = @splat(0),
 
     fn onEnvelope(ctx: *anyopaque, env: envelope.Envelope) void {
         const self: *RxCollector = @ptrCast(@alignCast(ctx));
         switch (env) {
             .text => |t| {
                 self.got = true;
-                self.got_body = t.body;
+                if (self.count < self.bodies.len) {
+                    const n: u8 = @intCast(@min(t.body.len, 16));
+                    @memcpy(self.bodies[self.count][0..n], t.body[0..n]);
+                    self.lens[self.count] = n;
+                }
+                self.count += 1;
             },
             else => {},
         }
@@ -586,4 +773,118 @@ const RxCollector = struct {
     fn onClosed(ctx: *anyopaque) void {
         _ = ctx;
     }
+
+    /// Тело i-го принятого TEXT (копия, ≤ 16 байтов).
+    fn bodyOf(self: *const RxCollector, i: usize) []const u8 {
+        return self.bodies[i][0..self.lens[i]];
+    }
 };
+
+/// Тестовый хелпер: sealed-кадр [tag][epoch u16][counter u64][box] с шагом
+/// рэтчета отправителя `r`; возвращает длину кадра, пишет в `out`.
+fn sealFrame(out: []u8, r: *ratchet_mod.Ratchet, body: []const u8) usize {
+    var env_buf: [envelope.max_encoded_len]u8 = undefined;
+    const plain = envelope.encode(&env_buf, .{ .text = .{
+        .msg_id = @splat(7),
+        .ts_ms = 1,
+        .body = body,
+    } }) catch unreachable;
+    var msg_key: [32]u8 = undefined;
+    const counter = r.stepSend(&msg_key);
+    out[0] = sealed_tag;
+    std.mem.writeInt(u16, out[1..3], r.epoch, .little);
+    std.mem.writeInt(u64, out[3..11], counter, .little);
+    aead.seal(out[11..], plain, msg_key, aead.nonceFor(counter), out[0..11]);
+    return sealed_hdr_len + plain.len + aead.tag_length;
+}
+
+/// Тестовый хелпер: кадр [len u16][payload] в конец `wire` (w — позиция).
+fn pushFrame(wire: []u8, w: *usize, payload: []const u8) void {
+    std.mem.writeInt(u16, wire[w.*..][0..2], @intCast(payload.len), .little);
+    @memcpy(wire[w.* + 2 ..][0..payload.len], payload);
+    w.* += 2 + payload.len;
+}
+
+test "session: PCS-ротация — dhStep, кадры в полёте, новая эпоха" {
+    const chain_a: [32]u8 = @splat(0x51);
+    const chain_b: [32]u8 = @splat(0x62);
+    // сессия s: send=chain_a, recv=chain_b; пир зеркально
+    var peer = ratchet_mod.Ratchet.init(chain_b, chain_a);
+
+    // фаза 1: 2 sealed-кадра эпохи 0, конверт RATCHET_KEY пира, ещё один
+    // кадр эпохи 0 «в полёте» (пир отослал его до своего dhStep)
+    const peer_kp = X25519.KeyPair.generate(std.testing.io);
+    var wire1: [512]u8 = undefined;
+    var w: usize = 0;
+    {
+        var f: [envelope.max_encoded_len + 64]u8 = undefined;
+        pushFrame(&wire1, &w, f[0..sealFrame(&f, &peer, "msg-0")]);
+        pushFrame(&wire1, &w, f[0..sealFrame(&f, &peer, "msg-1")]);
+    }
+    {
+        // RATCHET_KEY пира для эпохи 1
+        var env_buf: [envelope.max_encoded_len]u8 = undefined;
+        const rk = try envelope.encode(&env_buf, .{ .ratchet_key = .{
+            .epoch = 1,
+            .dh_pub = peer_kp.public_key,
+        } });
+        pushFrame(&wire1, &w, rk);
+    }
+    {
+        var f: [envelope.max_encoded_len + 64]u8 = undefined;
+        pushFrame(&wire1, &w, f[0..sealFrame(&f, &peer, "flight")]);
+    }
+
+    var script = ScriptConn{ .bytes = wire1[0..w] };
+    var collector = RxCollector{};
+    var s = Session{
+        .conn = script.conn(),
+        .ratchet = ratchet_mod.Ratchet.init(chain_a, chain_b),
+        .keys = .{ .send_key = @splat(0), .recv_key = @splat(0), .transcript = @splat(0) },
+        .ev = .{ .ctx = &collector, .onEnvelope = RxCollector.onEnvelope, .onClosed = RxCollector.onClosed },
+        .alloc = std.testing.allocator,
+        .io = std.testing.io,
+        .rotate_every = 4,
+    };
+    s.rxLoop(); // RATCHET_KEY: s отвечает пабликом и делает dhStep
+
+    // сессия ротировалась: эпоха 1, s дёрнула счётчики приёма в 0
+    try std.testing.expectEqual(@as(u16, 1), s.ratchet.epoch);
+    try std.testing.expect(s.rot_own == null);
+    try std.testing.expect(s.rot_peer == null);
+    // кадр «в полёте» (эпоха 0, counter 2) расшифрован по снапшоту
+    try std.testing.expectEqual(@as(u32, 3), collector.count);
+    try std.testing.expectEqualStrings("msg-0", collector.bodyOf(0));
+    try std.testing.expectEqualStrings("flight", collector.bodyOf(2));
+    // снапшот ещё жив: новых кадров эпохи 1 не было
+    try std.testing.expect(s.prev_recv != null);
+    try std.testing.expectEqual(@as(u16, 0), s.prev_recv.?.epoch);
+    try std.testing.expectEqual(@as(u64, 3), s.prev_recv.?.counter);
+
+    // ответ сессии — конверт RATCHET_KEY: парсим паблик, пир делает dhStep
+    try std.testing.expectEqual(@as(usize, 2 + 1 + 2 + 32), script.out_len);
+    try std.testing.expectEqual(envelope.Tag.ratchet_key, @as(envelope.Tag, @fromBackingInt(@intCast(script.out[2]))));
+    const s_pub = script.out[5..37].*;
+    try peer.dhStep(s_pub, peer_kp.secret_key);
+    try std.testing.expectEqual(@as(u16, 1), peer.epoch);
+
+    // фаза 2: кадры НОВОЙ эпохи; первый кадр эпохи 1 гасит снапшот
+    var wire2: [512]u8 = undefined;
+    w = 0;
+    {
+        var f: [envelope.max_encoded_len + 64]u8 = undefined;
+        pushFrame(&wire2, &w, f[0..sealFrame(&f, &peer, "new-0")]);
+        pushFrame(&wire2, &w, f[0..sealFrame(&f, &peer, "new-1")]);
+    }
+    var script2 = ScriptConn{ .bytes = wire2[0..w] };
+    s.conn = script2.conn();
+    s.running.store(true, .seq_cst);
+    s.rxLoop();
+
+    try std.testing.expectEqual(@as(u32, 5), collector.count);
+    try std.testing.expectEqualStrings("new-0", collector.bodyOf(3));
+    try std.testing.expectEqualStrings("new-1", collector.bodyOf(4));
+    // первый кадр новой эпохи погасил снапшот: старых кадров не будет
+    try std.testing.expect(s.prev_recv == null);
+    try std.testing.expectEqual(@as(u64, 2), s.ratchet.recv_counter);
+}
