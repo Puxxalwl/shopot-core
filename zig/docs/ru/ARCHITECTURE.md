@@ -1,7 +1,7 @@
 # Архитектура (ядро zig)
 
 Справочник слоёв и потоков данных ядра `shopot-zig`. Английская версия:
-[ARCHITECTURE.md](ARCHITECTURE.md).
+[../ARCHITECTURE.md](../ARCHITECTURE.md).
 
 ## 1. Принципы
 

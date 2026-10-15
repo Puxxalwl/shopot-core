@@ -1,6 +1,6 @@
 # Контрибуция в shopot-core
 
-[English](CONTRIBUTING.md) | **Русский**
+[English](../../CONTRIBUTING.md) | **Русский**
 
 Правила контрибуции смоделированы с процесса Linux kernel
 ([submitting-patches](https://docs.kernel.org/process/submitting-patches.html),
@@ -149,7 +149,7 @@ AEAD-бокс был привязан только к счётчику: заме
 ## 7. Безопасность
 
 Не открывайте публичные issues об уязвимостях. Следуйте
-[SECURITY.ru.md](SECURITY.ru.md) (приватный GitHub security-репорт; цель —
+[SECURITY.md](SECURITY.md) (приватный GitHub security-репорт; цель —
 подтверждение за 72 часа).
 
 ## 8. Лицензия

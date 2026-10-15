@@ -6,11 +6,16 @@
 //!   клиент -> релей: [17 03 03 0020][marker 32]     (TLS-подобная запись)
 //!   релей -> обоим:  [17 03 03 0001 5A]             (спарен)
 //!   далее: прозрачный сплит байтов (fake-TLS поток пира-а сквозной).
-//! marker = HMAC-SHA256(invite_secret, "shopot-relay-v1"): вычисляют обе
+//! marker = HMAC-SHA256(секрет, "shopot-relay-v1"): вычисляют обе
 //! стороны инвайта, релей видит только совпадение значений.
 //!
-//! Пары: первый коннект с marker-ом «владеет» им, второй спаривается,
-//! третий с тем же marker-ом закрывается (секрет инвайта одноразовый).
+//! Пары: первый коннект с marker-ом «владеет» слотом (presence), второй
+//! спаривается, лишние коннекты при активной паре закрываются. После
+//! обрыва пары слот ОСВОБОЖДАЕТСЯ: любая сторона может перерегистриро-
+//! ваться и перекачать соединение без нового инвайта (докачка присутствия).
+//! Два вида marker-а: одноразовый инвайт-секрет (invite_secret, фаза
+//! знакомства) и ДОЛГОСРОЧНЫЙ контакт-секрет (identity.pairSecret ->
+//! presenceMarker, фаза присутствия).
 //! Режим демона: `shopot relay <host:port>` — никакого состояния shopot.
 const std = @import("std");
 const tcp = @import("tcp.zig");
@@ -29,18 +34,35 @@ pub fn markerFrom(secret: [16]u8) [marker_len]u8 {
     return m;
 }
 
+/// Marker релей-присутствия: из ДОЛГОСРОЧНОГО парного секрета контакта
+/// (identity.pairSecret — статик-статик X25519). Отличается доменом от
+/// инвайт-marker-а: инвайт одноразовый, этот живёт столько, сколько
+/// контакт.
+pub fn presenceMarker(pair_secret: [32]u8) [marker_len]u8 {
+    var m: [marker_len]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&m, "shopot-relay-presence-v1", &pair_secret);
+    return m;
+}
+
 /// Клиент: подключиться к релею и зарегистрироваться marker-ом.
 /// Возвращает готовый к сплиту коннект (после сигнала 0x5A).
 pub fn dial(alloc: std.mem.Allocator, addr: []const u8, secret: [16]u8) !*tcp.TcpConn {
+    return dialMarker(alloc, addr, markerFrom(secret));
+}
+
+/// То же с явным marker-ом (присутствие: контакт-секрет).
+pub fn dialMarker(alloc: std.mem.Allocator, addr: []const u8, marker: [marker_len]u8) !*tcp.TcpConn {
     const tc = try tcp.dial(alloc, addr);
-    errdefer tc.deinit();
+    errdefer {
+        tc.deinit();
+        alloc.destroy(tc);
+    }
     var w: [5 + marker_len]u8 = undefined;
     w[0] = 0x17;
     w[1] = 0x03;
     w[2] = 0x03;
     w[3] = 0;
     w[4] = marker_len;
-    const marker = markerFrom(secret);
     @memcpy(w[5..], &marker);
     try rawWriteAll(tc.fd, &w);
     var r: [6]u8 = undefined;
@@ -92,19 +114,28 @@ const Spin = struct {
 
 const sleep50: linux.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
 
-/// Сервер релея: цикл accept, спаривание, сплит. Блокирует навсегда.
-pub fn serve(alloc: std.mem.Allocator, listener: *tcp.Listener) void {
+/// Сервер релея: цикл accept, спаривание, сплит. Блокирует навсегда;
+/// stop (для тестов): флаг + закрытый слушатель выводят из цикла.
+pub fn serve(alloc: std.mem.Allocator, listener: *tcp.Listener, stop: ?*std.atomic.Value(bool)) void {
     var map = std.AutoHashMap([marker_len]u8, *Pending).init(alloc);
     defer map.deinit();
     var spin = Spin{};
 
     while (true) {
-        const tc = listener.accept(alloc) catch continue;
+        const tc = listener.accept(alloc) catch {
+            if (stop) |st| {
+                if (st.load(.seq_cst)) break;
+            }
+            continue;
+        };
+        // tc-структура не нужна потоку (он работает с fd): копия в аргументах
         const th = std.Thread.spawn(.{}, relayConn, .{ alloc, &map, &spin, tc.fd }) catch {
             _ = linux.close(tc.fd);
+            alloc.destroy(tc);
             continue;
         };
         th.detach();
+        alloc.destroy(tc);
     }
 }
 
@@ -118,28 +149,31 @@ fn relayConn(alloc: std.mem.Allocator, map: *std.AutoHashMap([marker_len]u8, *Pe
     var marker: [marker_len]u8 = undefined;
     rawReadAll(fd, &marker) catch return closeFd(fd);
 
-    var self: *Pending = alloc.create(Pending) catch return closeFd(fd);
+    const self: *Pending = alloc.create(Pending) catch return closeFd(fd);
     self.* = .{ .fd = fd };
 
     var peer_fd: linux.socket_t = 0;
-    var first: bool = false;
+    var second: bool = false;
+    var entry: *Pending = self; // валидно только для second
     {
         spin.lock();
         defer spin.unlock();
         if (map.get(marker)) |other| {
             if (other.paired) {
-                // marker уже выкуплен: дубль (секрет инвайта одноразовый)
+                // пара активна: слот занят, лишний коннект закрываем
                 alloc.destroy(self);
                 return closeFd(fd);
             }
-            // второй клиент: спарить и оповестить первого
+            // второй клиент: спарить и оповестить первого; запись
+            // ОСТАЁТСЯ в map на время пары (лишние коннекты — см. выше),
+            // снятие регистрации и закрытие fd — обязанность second
             other.peer_fd = fd;
             other.paired = true;
             peer_fd = other.fd;
-            self.paired = true;
+            second = true;
+            entry = other;
         } else {
             // первый: зарегистрироваться и ждать пару (поллинг 50 мс)
-            first = true;
             map.put(marker, self) catch {
                 alloc.destroy(self);
                 return closeFd(fd);
@@ -150,28 +184,35 @@ fn relayConn(alloc: std.mem.Allocator, map: *std.AutoHashMap([marker_len]u8, *Pe
                 spin.lock();
                 // счёт коннекта мог умереть? пира ждём до закрытия fd
             }
-            peer_fd = self.peer_fd orelse {
-                _ = map.remove(marker);
-                alloc.destroy(self);
-                return closeFd(fd);
-            };
-            _ = map.remove(marker);
-            alloc.destroy(self);
+            peer_fd = self.peer_fd.?;
         }
     }
     // сигнал «спарен» обоим
-    if (!first) {
+    if (second) {
         const sig: [6]u8 = .{ 0x17, 0x03, 0x03, 0, 1, pair_signal };
         rawWriteAll(fd, &sig) catch {};
         rawWriteAll(peer_fd, &sig) catch {};
     }
     // сплит: свой fd -> пир (обратное направление копирует пир-поток)
     splice(fd, peer_fd);
-    // обрыв одного направления закрывает оба
-    _ = linux.shutdown(fd, linux.SHUT.RDWR);
-    _ = linux.shutdown(peer_fd, linux.SHUT.RDWR);
-    closeFd(fd);
-    closeFd(peer_fd);
+    if (second) {
+        // пара закончилась: слот освободить, оба fd закрыть единожды
+        // (first закрывать не должен — shutdown ниже будит его splice)
+        spin.lock();
+        if (map.get(marker)) |cur| {
+            if (cur == entry) {
+                _ = map.remove(marker);
+                alloc.destroy(entry);
+            }
+        }
+        spin.unlock();
+        alloc.destroy(self); // свой Pending
+        _ = linux.shutdown(fd, linux.SHUT.RDWR);
+        _ = linux.shutdown(peer_fd, linux.SHUT.RDWR);
+        closeFd(fd);
+        closeFd(peer_fd);
+    }
+    // first: второй поток закрывает оба fd; выходим молча
 }
 
 fn closeFd(fd: linux.socket_t) void {
@@ -202,4 +243,16 @@ test "relay: marker детерминирован и зависит от секр
     try testing.expectEqualSlices(u8, &m1, &m2);
     try testing.expect(!std.mem.eql(u8, &m1, &m3));
     try testing.expect(m1[0] != 0 or m1[1] != 0); // не вырожден
+}
+
+test "relay: presenceMarker детерминирован и отделён доменом от инвайта" {
+    const sec: [32]u8 = @splat(7);
+    const p1 = presenceMarker(sec);
+    const p2 = presenceMarker(sec);
+    try testing.expectEqualSlices(u8, &p1, &p2);
+    const other: [32]u8 = @splat(8);
+    try testing.expect(!std.mem.eql(u8, &p1, &presenceMarker(other)));
+    // домен отделён от инвайт-marker-а (те же байты секрета)
+    const invite16: [16]u8 = @splat(7);
+    try testing.expect(!std.mem.eql(u8, &p1, &markerFrom(invite16)));
 }

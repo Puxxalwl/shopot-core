@@ -1,6 +1,6 @@
 # Security policy
 
-**English** | [Русский](SECURITY.ru.md)
+**English** | [Русский](docs/ru/SECURITY.md)
 
 ## Scope
 

@@ -2,7 +2,7 @@
 
 Normative byte-level specification of the shopot P2P messenger wire protocol.
 Implementation: `shopot-zig` (this repository). Russian version:
-[PROTOCOL.ru.md](PROTOCOL.ru.md).
+[ru/PROTOCOL.md](ru/PROTOCOL.md).
 
 **Rules of the wire**
 
@@ -361,17 +361,32 @@ relay → both:  [17 03 03 0001 5A]              (paired)
 then:          transparent byte split (fake-TLS stream passes through)
 ```
 
-- `marker = HMAC-SHA256(invite_secret, "shopot-relay-v1")` — computed by both
-  invitation sides; the relay only compares values.
-- The first connection with a marker "owns" it, the second is paired, a third
-  duplicate is closed (the invite secret is one-time).
+- Two kinds of marker, both `HMAC-SHA256` over a shared secret:
+  - invite phase: `HMAC(invite_secret, "shopot-relay-v1")` — computed by both
+    invitation sides; the relay only compares values (one-time, burned on JOIN);
+  - presence phase: `HMAC(pair_secret, "shopot-relay-presence-v1")`, where
+    `pair_secret = X25519(my_static_enc, peer_static_enc)` — the Noise-KK-style
+    pre-message `ss`: both sides derive it from long-term identity keys with
+    zero exchanges; the relay cannot compute it.
+- Slot semantics: the first connection with a marker "owns" the slot, the
+  second is paired; while a pair is active extra connections are closed.
+  When the pair ends the slot is **freed** — either side can re-register and
+  re-pair (this is what makes presence work).
 - Invite code with relay: `shopot://i/<b64>@r/<host:port>`.
 - The A side (`invite <name> relay <addr>`) keeps its registration and
   reconnects on break until the invite is redeemed; the B side (`add <code>`)
   dials the relay with the marker, then the normal handshake+JOIN runs over
   the split.
-- Limitation: reconnecting after JOIN through a relay currently requires a
-  fresh invite (persistent relay presence is on the roadmap).
+- Persistent presence after JOIN: the contact remembers the relay address
+  (stored in the encrypted contact log — survives daemon restarts) and the
+  presence loop re-registers the slot with the contact-level marker whenever
+  no live session exists. When the peer appears, the relay pairs the two and
+  a fresh session runs — **no new invite needed**. The handshake role is
+  deterministic: the side with the lexicographically smaller bundle
+  initiates. Blocking a contact stops its presence; unblocking restores it.
+- Note: static-static X25519 compromise reveals the marker (relay-side DoS /
+  pairing annoyance only — the full XX handshake still authenticates); a
+  compromised identity key is game-over anyway.
 - The relay does **not** hide addresses from the relay itself; a DPI sees a
   TLS-like stream to the relay and back.
 

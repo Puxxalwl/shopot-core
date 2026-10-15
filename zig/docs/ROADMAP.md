@@ -2,7 +2,7 @@
 
 Priorities for agents and client authors. Everything is std-only: no OS
 packages, no external services. Order = recommended implementation order.
-Russian version: [ROADMAP.ru.md](ROADMAP.ru.md).
+Russian version: [ru/ROADMAP.md](ru/ROADMAP.md).
 
 ## P0 — ✅ DONE
 
@@ -14,8 +14,8 @@ Russian version: [ROADMAP.ru.md](ROADMAP.ru.md).
 - ~~Calls 16 kHz + ADPCM + DTX~~: 72 kbit/s.
 - ~~Chunked files~~: FILE_META/FILE_DATA, SHA verification, dedup.
 
-Remaining from P0: persistent relay presence of a contact (reconnecting
-through a relay after JOIN currently requires a new invite).
+Remaining from P0: ✅ done — persistent relay presence (contact-level
+secret, reconnect without a new invite).
 
 ## P0+ — ✅ DONE: ratchet PCS rotation
 
@@ -32,10 +32,14 @@ through a relay after JOIN currently requires a new invite).
 
 Fake-TLS hides the protocol from DPI; the relay hides the IP. What remains:
 
-- **Relay presence**: the contact stores the relay address and keeps its
-  registration (marker = HMAC over a long-lived contact-level secret),
-  reconnecting without a new invite. The invite secret is currently
-  one-time — a contact-level secret is needed.
+- ✅ **Relay presence**: the contact stores the relay address (in the
+  encrypted log, survives restarts) and keeps its registration with
+  `marker = HMAC(X25519(my_static, peer_static), "shopot-relay-presence-v1")`
+  — both sides derive it without any exchange (Noise-KK-style pre-message
+  `ss`); reconnecting after a session drop re-pairs through the relay with
+  no new invite (`relayPresenceLoop` in app, deterministic handshake role
+  by bundle order). The relay frees the marker slot when the pair ends, so
+  either side can re-register (E2E: two pairing cycles over loopback TCP).
 - **Multi-relay**: an invite with several addresses (failover).
 
 ## P0 — calls: quality

@@ -1,7 +1,7 @@
 # Architecture (zig core)
 
 Layer and data-flow reference for the `shopot-zig` core. Russian version:
-[ARCHITECTURE.ru.md](ARCHITECTURE.ru.md).
+[ru/ARCHITECTURE.md](ru/ARCHITECTURE.md).
 
 ## 1. Principles
 

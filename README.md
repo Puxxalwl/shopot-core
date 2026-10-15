@@ -1,6 +1,6 @@
 # shopot
 
-**English** | [Русский](README.ru.md)
+**English** | [Русский](docs/ru/README.md)
 
 Serverless P2P messenger core: **zero servers of our own**, message history
 lives on the two devices only. Implementation: pure Zig, std-only — no
@@ -76,12 +76,12 @@ Details: [`zig/docs/PROTOCOL.md`](zig/docs/PROTOCOL.md),
 
 | Document | Content |
 |---|---|
-| [`zig/docs/CORE-API.md`](zig/docs/CORE-API.md) / [ru](zig/docs/CORE-API.ru.md) | binary UDS interface for GUI clients (API 1.0.0) |
-| [`zig/docs/PROTOCOL.md`](zig/docs/PROTOCOL.md) / [ru](zig/docs/PROTOCOL.ru.md) | byte-level wire protocol v3 |
-| [`zig/docs/ARCHITECTURE.md`](zig/docs/ARCHITECTURE.md) / [ru](zig/docs/ARCHITECTURE.ru.md) | layers, data flow, threading |
-| [`zig/docs/ROADMAP.md`](zig/docs/ROADMAP.md) / [ru](zig/docs/ROADMAP.ru.md) | technical plan and anti-plan |
-| [SECURITY.md](SECURITY.md) / [ru](SECURITY.ru.md) | threat model, reporting, crypto inventory |
-| [CONTRIBUTING.md](CONTRIBUTING.md) / [ru](CONTRIBUTING.ru.md) | contribution rules (kernel-style) |
+| [`zig/docs/CORE-API.md`](zig/docs/CORE-API.md) / [ru](zig/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 1.0.0) |
+| [`zig/docs/PROTOCOL.md`](zig/docs/PROTOCOL.md) / [ru](zig/docs/ru/PROTOCOL.md) | byte-level wire protocol v3 |
+| [`zig/docs/ARCHITECTURE.md`](zig/docs/ARCHITECTURE.md) / [ru](zig/docs/ru/ARCHITECTURE.md) | layers, data flow, threading |
+| [`zig/docs/ROADMAP.md`](zig/docs/ROADMAP.md) / [ru](zig/docs/ru/ROADMAP.md) | technical plan and anti-plan |
+| [SECURITY.md](SECURITY.md) / [ru](docs/ru/SECURITY.md) | threat model, reporting, crypto inventory |
+| [CONTRIBUTING.md](CONTRIBUTING.md) / [ru](docs/ru/CONTRIBUTING.md) | contribution rules (kernel-style) |
 
 ## Official client
 

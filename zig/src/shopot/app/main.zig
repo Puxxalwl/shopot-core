@@ -133,6 +133,11 @@ pub const App = struct {
     ftlss: std.ArrayListUnmanaged(*shopot.net.faketls.FakeTlsConn) = .empty,
     /// Приём файлов в полёте: file_id -> RxFile.
     rx_files: std.AutoHashMapUnmanaged([16]u8, *RxFile) = .empty,
+    /// Relay-адрес контакта (cid -> копия): держим присутствие в релее
+    /// marker-ом из контакт-секрета, реконнект без нового инвайта.
+    contact_relays: std.AutoHashMapUnmanaged(i64, []u8) = .empty,
+    /// Запущенные presence-потоки (cid): защита от дублей.
+    presence_runs: std.AutoHashMapUnmanaged(i64, void) = .empty,
     /// Копия $HOME (для файлов/путей).
     home_buf: [512]u8 = @splat(0),
     home_len: usize = 0,
@@ -307,12 +312,18 @@ fn evBlockedByPeer(app: *App, cid: i64) void {
     api_srv.fanoutEventLocked(app, .BLOCKED_BY_PEER, w.items());
 }
 
+/// Relay-адрес приглашения/контакта (host:port, буфер).
+const relay_addr_max = 64;
+
 /// Выданное одностороннее приглашение (реестр в App.invites).
 const InviteReg = struct {
     secret: [invite_mod.secret_len]u8 = @splat(0),
     created_ms: i64 = 0,
     /// true — код уже redeemed (секрет погашен).
     used: bool = false,
+    /// Relay-адрес (если relay-инвайт): после JOIN — присутствие.
+    relay_buf: [relay_addr_max]u8 = @splat(0),
+    relay_len: u8 = 0,
 };
 
 /// JOIN-данные, которые отправим после установления сессии.
@@ -377,6 +388,9 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
     };
     var failed = false;
     var cid: i64 = 0;
+    // relay-адрес приглашения: после JOIN — присутствие контакта
+    var relay_addr_buf: [relay_addr_max]u8 = @splat(0);
+    var relay_addr_len: usize = 0;
     {
         app.lock();
         defer app.unlock();
@@ -396,6 +410,8 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
             failed = true;
         } else {
             app.invites[matched.?].used = true;
+            relay_addr_len = app.invites[matched.?].relay_len;
+            @memcpy(relay_addr_buf[0..relay_addr_len], app.invites[matched.?].relay_buf[0..relay_addr_len]);
             if (contactIdByBundle(app, j.bundle)) |existing| {
                 cid = existing; // переподключение держателем кода
             } else {
@@ -406,7 +422,7 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
                 cid = @intCast(ni + 1);
                 app.hb.put(cid, .{}) catch {};
                 // контакт переживает рестарт: пишем в шифрованный лог
-                if (app.log) |log| logContact(app, log, j.name, j.bundle, null);
+                if (app.log) |log| logContact(app, log, j.name, j.bundle, null, relay_addr_buf[0..relay_addr_len]);
             }
             if (!failed) {
                 sc.cid = cid;
@@ -419,6 +435,13 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
     if (failed) {
         sess.close();
         return;
+    }
+    // relay-инвайт: присутствие с этого момента — marker из
+    // контакт-секрета, реконнекты без нового инвайта
+    if (relay_addr_len > 0) {
+        app.lock();
+        defer app.unlock();
+        startRelayPresenceLocked(app, cid, relay_addr_buf[0..relay_addr_len]);
     }
     app.lock();
     defer app.unlock();
@@ -1225,6 +1248,100 @@ fn readRawAll(tc: *tcp.TcpConn, out: []u8) !void {
 
 // ------------------------------------------------------------- commands
 
+/// Запомнить relay-адрес контакта и поднять presence-поток (один на
+/// контакт). ВЫЗЫВАЕТСЯ ПОД app.mu; поток сам ждёт снятия лока.
+fn startRelayPresenceLocked(app: *App, cid: i64, addr: []const u8) void {
+    if (addr.len == 0) return;
+    if (app.contact_relays.getPtr(cid)) |old| {
+        if (!std.mem.eql(u8, old.*, addr)) {
+            const dup = app.alloc.dupe(u8, addr) catch return;
+            app.alloc.free(old.*);
+            old.* = dup;
+        }
+    } else {
+        const dup = app.alloc.dupe(u8, addr) catch return;
+        app.contact_relays.put(app.alloc, cid, dup) catch {
+            app.alloc.free(dup);
+            return;
+        };
+    }
+    if (app.presence_runs.contains(cid)) return;
+    app.presence_runs.put(app.alloc, cid, {}) catch return;
+    const th = std.Thread.spawn(.{}, relayPresenceLoop, .{ app, cid }) catch {
+        _ = app.presence_runs.remove(cid);
+        return;
+    };
+    th.detach();
+}
+
+/// Поток релей-присутствия контакта: пока контакт жив и не заблокирован,
+/// держим регистрацию слота marker-ом из ДОЛГОСРОЧНОГО контакт-секрета
+/// (identity.pairSecret -> relay.presenceMarker): пир появляется в релее —
+/// спариваемся и поднимаем сессию БЕЗ нового инвайта. Инициатор
+/// рукопожатия — сторона с меньшим bundle (детерминизм: обе стороны
+/// вычисляют роль одинаково). Сессия уже жива — регистрация не нужна,
+/// ждём её смерти (прямой путь и присутствие не конфликтуют).
+fn relayPresenceLoop(app: *App, cid: i64) void {
+    defer {
+        app.lock();
+        defer app.unlock();
+        _ = app.presence_runs.remove(cid);
+    }
+    var marker: [32]u8 = undefined;
+    var me_initiator: bool = false;
+    var addr_copy: []u8 = undefined;
+    {
+        app.lock();
+        defer app.unlock();
+        const idx = app.eng.findIndex(cid) orelse return;
+        const c = &app.eng.contacts.items[idx];
+        const sec = app.id.pairSecret(c.bundle) catch return;
+        marker = shopot.net.relay.presenceMarker(sec);
+        const my_bundle = app.id.bundle();
+        me_initiator = std.mem.order(u8, &my_bundle, &c.bundle) == .lt;
+        const stored = app.contact_relays.get(cid) orelse return;
+        addr_copy = app.alloc.dupe(u8, stored) catch return;
+    }
+    defer app.alloc.free(addr_copy);
+    const sleep1: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
+    const sleep2: std.os.linux.timespec = .{ .sec = 2, .nsec = 0 };
+    while (app.running) {
+        {
+            app.lock();
+            defer app.unlock();
+            const idx = app.eng.findIndex(cid) orelse return; // контакт удалён
+            if (app.eng.contacts.items[idx].blocked) return;
+            if (app.eng.sessions.contains(cid)) {
+                // живая сессия: присутствие не нужно
+                _ = std.os.linux.nanosleep(&sleep1, null);
+                continue;
+            }
+        }
+        // dial блокируется в релее до прихода пира (наш marker — слот)
+        const tc = shopot.net.relay.dialMarker(app.alloc, addr_copy, marker) catch {
+            _ = std.os.linux.nanosleep(&sleep2, null);
+            continue;
+        };
+        {
+            app.lock();
+            defer app.unlock();
+            app.raw_conns.append(app.alloc, tc) catch {
+                tc.deinit();
+                _ = std.os.linux.nanosleep(&sleep2, null);
+                continue;
+            };
+        }
+        if (me_initiator) {
+            establishSessionOnConn(app, cid, tc) catch {};
+        } else {
+            // ждём m1 от пира: как TCP-accept
+            handleAcceptedConn(app, tc);
+        }
+        // сессия поднята или упала — цикл проверит и повторит регистрацию
+        _ = std.os.linux.nanosleep(&sleep1, null);
+    }
+}
+
 /// Поток A-стороны релея: держит регистрацию marker-ом, пока инвайт жив.
 /// Спаривание -> handleAcceptedConn (JOIN поднимет контакт). Обрыв ->
 /// переподключение (пир может дозваниваться долго).
@@ -1293,6 +1410,11 @@ fn apiCreateInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
         }
         const i = slot orelse return .TOO_MANY_INVITES;
         app.invites[i] = .{ .secret = secret, .created_ms = app.nowMs(), .used = false };
+        if (is_relay) {
+            const n = @min(addr_in.len, relay_addr_max);
+            @memcpy(app.invites[i].relay_buf[0..n], addr_in[0..n]);
+            app.invites[i].relay_len = @intCast(n);
+        }
     }
     var out: [256]u8 = undefined;
     var rbuf: [80]u8 = undefined;
@@ -1360,7 +1482,8 @@ fn apiAcceptInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
         app.hb.put(cid, .{}) catch {};
         if (addr) |a| saveContactAddr(app, cid, a);
         if (app.log) |log| {
-            logContact(app, log, name, bundle, addr);
+            // relay-инвайт: адрес релея в лог — присутствие после рестарта
+            logContact(app, log, name, bundle, addr, if (relay_secret != null) addr else null);
         }
     }
     w.putU32(@intCast(cid)) catch return .INTERNAL;
@@ -1373,6 +1496,11 @@ fn apiAcceptInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     if (addr) |a| {
         if (relay_secret) |sec| {
             establishToRelay(app, a, cid, .initiator, sec) catch {};
+            // держатель relay-кода: сразу держим присутствие (marker из
+            // контакт-секрета) — реконнекты без нового инвайта
+            app.lock();
+            startRelayPresenceLocked(app, cid, a);
+            app.unlock();
         } else {
             establishTo(app, a, cid, .initiator) catch {};
         }
@@ -1457,9 +1585,6 @@ fn establishTo(app: *App, addr: []const u8, cid: i64, role: session_mod.Handshak
 /// establishTo с опциональным релеем: secret != null — адрес это релей,
 /// подключение через marker-спаривание (пир не видит наш IP).
 fn establishToRelay(app: *App, addr: []const u8, cid: i64, role: session_mod.HandshakeRole, relay_secret: ?[16]u8) !void {
-    const idx: usize = @intCast(cid - 1);
-    if (idx >= app.eng.contacts.items.len) return error.NoContact;
-    const bundle = app.eng.contacts.items[idx].bundle;
     const tc = if (relay_secret) |sec|
         shopot.net.relay.dial(app.alloc, addr, sec) catch return error.NoRelay
     else
@@ -1469,6 +1594,20 @@ fn establishToRelay(app: *App, addr: []const u8, cid: i64, role: session_mod.Han
         defer app.unlock();
         try app.raw_conns.append(app.alloc, tc);
     }
+    if (role != .initiator) {
+        // responder через релей: ждём m1 как accept
+        handleAcceptedConn(app, tc);
+        return;
+    }
+    try establishSessionOnConn(app, cid, tc);
+}
+
+/// Поднять сессию ИНИЦИАТОРОМ на уже подключённом конне (relay-присутствие
+/// и establishToRelay): fake-TLS client, рукопожатие, bind.
+fn establishSessionOnConn(app: *App, cid: i64, tc: *tcp.TcpConn) !void {
+    const idx: usize = @intCast(cid - 1);
+    if (idx >= app.eng.contacts.items.len) return error.NoContact;
+    const bundle = app.eng.contacts.items[idx].bundle;
     var eph: [32]u8 = undefined;
     app.io.random(&eph);
     const sc = try app.alloc.create(SessCtx);
@@ -1491,7 +1630,7 @@ fn establishToRelay(app: *App, addr: []const u8, cid: i64, role: session_mod.Han
     const s = session_mod.Session.establish(
         app.alloc,
         ft.conn,
-        role,
+        .initiator,
         app.id,
         bundle,
         eph,
@@ -1621,6 +1760,10 @@ fn apiBlock(app: *App, payload: []const u8, flag: bool) api.Status {
         app.eng.block(@intCast(cid)) catch |e| return statusOf(e);
     } else {
         app.eng.unblock(@intCast(cid)) catch |e| return statusOf(e);
+        // разблокировка: вернуть релей-присутствие, если было
+        if (app.contact_relays.get(@as(i64, @intCast(cid)))) |ra| {
+            startRelayPresenceLocked(app, @intCast(cid), ra);
+        }
     }
     if (app.log) |log| {
         var buf: [65]u8 = undefined;
@@ -1631,10 +1774,12 @@ fn apiBlock(app: *App, payload: []const u8, flag: bool) api.Status {
     return .OK;
 }
 
-/// Записать контакт в лог (с адресом, если известен).
-fn logContact(app: *App, log: *store_mod.Log, name: []const u8, bundle: [64]u8, addr_: ?[]const u8) void {
+/// Записать контакт в лог (с адресом, если известен; relay_addr — хвост
+/// [rlen][rhost][rport LE] для восстановления присутствия после рестарта).
+fn logContact(app: *App, log: *store_mod.Log, name: []const u8, bundle: [64]u8, addr_: ?[]const u8, relay_addr: ?[]const u8) void {
     const a: []const u8 = addr_ orelse "";
-    var buf: [64 + 1 + 32 + 1 + 64 + 2]u8 = undefined;
+    const ra: []const u8 = relay_addr orelse "";
+    var buf: [64 + 1 + 32 + 1 + 64 + 2 + 1 + 64 + 2]u8 = undefined;
     var n: usize = 0;
     buf[0] = @intCast(name.len);
     n = 1;
@@ -1651,6 +1796,16 @@ fn logContact(app: *App, log: *store_mod.Log, name: []const u8, bundle: [64]u8, 
         @memcpy(buf[n .. n + alen], host_port.host);
         n += alen;
         std.mem.writeInt(u16, buf[n..][0..2], host_port.port, .little);
+        n += 2;
+    }
+    // хвост relay-адреса: [rlen][rhost][rport u16 LE] (старые логи короче)
+    const rhp = splitHostPort(ra);
+    if (rhp.host.len > 0 and rhp.host.len <= 64) {
+        buf[n] = @intCast(rhp.host.len);
+        n += 1;
+        @memcpy(buf[n .. n + rhp.host.len], rhp.host);
+        n += rhp.host.len;
+        std.mem.writeInt(u16, buf[n..][0..2], rhp.port, .little);
         n += 2;
     }
     _ = log.append(.contact, buf[0..n]) catch {};
@@ -1678,7 +1833,9 @@ fn saveContactAddr(app: *App, cid: i64, host_port_str: []const u8) void {
         std.mem.eql(u8, c.addr_buf[0..c.addr_len], hp.host)) return;
     c.setAddr(hp.host, hp.port);
     if (app.log) |log| {
-        logContact(app, log, c.getName(), c.bundle, host_port_str);
+        // не теряем relay-хвост контакта при перезаписи адреса
+        const relay_saved = app.contact_relays.get(cid);
+        logContact(app, log, c.getName(), c.bundle, host_port_str, relay_saved);
     }
 }
 
@@ -2041,6 +2198,20 @@ fn loadContacts(app: *App) void {
                 const port = std.mem.readInt(u16, rec[tail + 1 + alen ..][0..2], .little);
                 c.setAddr(rec[tail + 1 .. tail + 1 + alen], port);
             }
+            // relay-хвост: [rlen][rhost][rport LE] — присутствие после рестарта
+            const rtail = tail + 1 + alen + 2;
+            if (rec.len >= rtail + 1) {
+                const rlen: usize = rec[rtail];
+                if (rlen > 0 and rlen <= 64 and rec.len >= rtail + 1 + rlen + 2) {
+                    const rport = std.mem.readInt(u16, rec[rtail + 1 + rlen ..][0..2], .little);
+                    var rbuf: [72]u8 = undefined;
+                    const rhost = rec[rtail + 1 .. rtail + 1 + rlen];
+                    const raddr = std.fmt.bufPrint(&rbuf, "{s}:{d}", .{ rhost, rport }) catch rbuf[0..0];
+                    if (raddr.len > 0) {
+                        startRelayPresenceLocked(app, @intCast(idx + 1), raddr);
+                    }
+                }
+            }
         }
     }
     // outbox: добавление/погашение в порядке записи лога
@@ -2269,7 +2440,7 @@ pub fn main(start: std.process.Init) !void {
         std.debug.print("relay: слушаю {s}, спариваю по marker-у инвайта\n", .{addr});
         var dbg_state = std.heap.DebugAllocator(.{ .thread_safe = true }){};
         const alloc = dbg_state.allocator();
-        shopot.net.relay.serve(alloc, &listener);
+        shopot.net.relay.serve(alloc, &listener, null);
         return;
     }
 

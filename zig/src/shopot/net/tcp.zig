@@ -35,6 +35,10 @@ pub const TcpConn = struct {
 
     fn closeImpl(ptr: *anyopaque) void {
         const self: *TcpConn = @ptrCast(@alignCast(ptr));
+        // shutdown, не close: заблокированный в read() поток другой стороны
+        // (rx-поток сессии) просыпается по EOF — close(fd) его НЕ будит
+        // (Linux), а rx-поток затем закрывает fd сам
+        _ = std.os.linux.shutdown(self.fd, std.os.linux.SHUT.RDWR);
         _ = std.os.linux.close(self.fd);
     }
 
@@ -135,7 +139,7 @@ pub const Listener = struct {
     }
 
     pub fn deinit(self: *Listener) void {
-        posix.close(self.fd);
+        _ = std.os.linux.close(self.fd);
     }
 };
 

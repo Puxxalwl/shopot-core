@@ -1,7 +1,7 @@
 # CORE-API — shopot core binary interface
 
 Technical specification for GUI client authors. Russian version:
-[CORE-API.ru.md](CORE-API.ru.md).
+[ru/CORE-API.md](ru/CORE-API.md).
 
 The core (the `shopot serve` daemon) owns the cryptography, contacts,
 sessions, and delivery. A client connects over a Unix domain socket and

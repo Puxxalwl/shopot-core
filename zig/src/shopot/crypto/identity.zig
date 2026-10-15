@@ -52,6 +52,18 @@ pub const Identity = struct {
         return id;
     }
 
+    /// Парный ДОЛГОСРОЧНЫЙ секрет с контактом: X25519(мой статический
+    /// enc-секрет, enc-паблик пира) — эквивалент pre-message ss из Noise KK:
+    /// обе стороны выводят одно и то же значение, релей/наблюдатель его не
+    /// знает. Основа релей-присутствия: marker спаривания без нового инвайта
+    /// (relay.presenceMarker). Компромисция статического ключа раскрывает
+    /// marker — но компромисция identity и так game-over.
+    pub fn pairSecret(self: *const Identity, peer_bundle: [bundle_length]u8) error{InvalidPublicKey}![32]u8 {
+        var peer_enc: [32]u8 = undefined;
+        @memcpy(&peer_enc, peer_bundle[0..32]);
+        return X25519.scalarmult(self.enc_secret, peer_enc) catch return error.InvalidPublicKey;
+    }
+
     /// Bundle публичных ключей: enc_pk || sign_pk (64 байта).
     pub fn bundle(self: *const Identity) [bundle_length]u8 {
         var out: [bundle_length]u8 = undefined;
@@ -214,4 +226,18 @@ test "identity: deinit обнуляет секреты" {
     try std.testing.expectEqualSlices(u8, &sk_zeros, &id.sign_kp.secret_key.bytes);
     try std.testing.expect(!std.mem.eql(u8, &enc_copy, &id.enc_secret));
     try std.testing.expect(!std.mem.eql(u8, &sign_copy, &id.sign_kp.secret_key.bytes));
+}
+
+test "identity: pairSecret симметричен и зависит от пары" {
+    const a = try Identity.fromSeed(@splat(@as(u8, 1)));
+    const b = try Identity.fromSeed(@splat(@as(u8, 2)));
+    const c = try Identity.fromSeed(@splat(@as(u8, 3)));
+    const s_ab1 = try a.pairSecret(b.bundle());
+    const s_ba = try b.pairSecret(a.bundle());
+    try std.testing.expectEqualSlices(u8, &s_ab1, &s_ba); // статик-статик DH
+    const s_ac = try a.pairSecret(c.bundle());
+    try std.testing.expect(!std.mem.eql(u8, &s_ab1, &s_ac));
+    // дегенерат: свой паблик (не должен совпадать с чужим секретом)
+    const s_aa = try a.pairSecret(a.bundle());
+    try std.testing.expect(!std.mem.eql(u8, &s_ab1, &s_aa));
 }

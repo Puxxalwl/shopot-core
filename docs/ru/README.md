@@ -1,10 +1,10 @@
 # shopot
 
-[English](README.md) | **Русский**
+[English](../../README.md) | **Русский**
 
 Ядро серверлесс P2P-мессенджера: **ноль своих серверов**, история сообщений
 живёт только на двух устройствах. Реализация — чистый Zig, std-only: без
-пакетов и зависимостей от ОС. Исходники: [`zig/`](zig/).
+пакетов и зависимостей от ОС. Исходники: [`zig/`](../../zig/).
 
 C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из master; архив — тег
 `cpp-archive`.
@@ -42,7 +42,7 @@ shopot-zig serve         # демон: ядро + UDS-апи (~/.shopot/api.sock
 Интерфейса командной строки нет: единственный клиент — GUI, подключающийся
 к ядру по UDS бинарным кадровым протоколом (типизированные ответы, машинные
 коды ошибок, события). Спецификация для авторов клиента:
-[`zig/docs/CORE-API.ru.md`](zig/docs/CORE-API.ru.md) (API 1.0.0).
+[`zig/docs/ru/CORE-API.md`](../../zig/docs/ru/CORE-API.md) (API 1.0.0).
 
 Добавление друга — одно действие: `CREATE_INVITE` выдаёт односторонний код
 (`shopot://i/...`), держатель делает единственный `ACCEPT_INVITE`. Контакт,
@@ -69,19 +69,19 @@ shopot-zig serve         # демон: ядро + UDS-апи (~/.shopot/api.sock
   транспорт
 - Хранилище: append-only AEAD-лог, ни одного байта открытого текста
 
-Детали: [`zig/docs/PROTOCOL.ru.md`](zig/docs/PROTOCOL.ru.md),
-[SECURITY.ru.md](SECURITY.ru.md).
+Детали: [`zig/docs/ru/PROTOCOL.md`](../../zig/docs/ru/PROTOCOL.md),
+[SECURITY.md](SECURITY.md).
 
 ## Документация
 
 | Документ | Содержание |
 |---|---|
-| [`zig/docs/CORE-API.ru.md`](zig/docs/CORE-API.ru.md) / [en](zig/docs/CORE-API.md) | бинарный UDS-интерфейс для GUI-клиентов (API 1.0.0) |
-| [`zig/docs/PROTOCOL.ru.md`](zig/docs/PROTOCOL.ru.md) / [en](zig/docs/PROTOCOL.md) | байтовая спецификация провода v3 |
-| [`zig/docs/ARCHITECTURE.ru.md`](zig/docs/ARCHITECTURE.ru.md) / [en](zig/docs/ARCHITECTURE.md) | слои, потоки данных, трединг |
-| [`zig/docs/ROADMAP.ru.md`](zig/docs/ROADMAP.ru.md) / [en](zig/docs/ROADMAP.md) | технический план и анти-план |
-| [SECURITY.ru.md](SECURITY.ru.md) / [en](SECURITY.md) | модель угроз, репортинг, инвентаризация крипты |
-| [CONTRIBUTING.ru.md](CONTRIBUTING.ru.md) / [en](CONTRIBUTING.md) | правила контрибуции (kernel-style) |
+| [`zig/docs/ru/CORE-API.md`](../../zig/docs/ru/CORE-API.md) / [en](../../zig/docs/CORE-API.md) | бинарный UDS-интерфейс для GUI-клиентов (API 1.0.0) |
+| [`zig/docs/ru/PROTOCOL.md`](../../zig/docs/ru/PROTOCOL.md) / [en](../../zig/docs/PROTOCOL.md) | байтовая спецификация провода v3 |
+| [`zig/docs/ru/ARCHITECTURE.md`](../../zig/docs/ru/ARCHITECTURE.md) / [en](../../zig/docs/ARCHITECTURE.md) | слои, потоки данных, трединг |
+| [`zig/docs/ru/ROADMAP.md`](../../zig/docs/ru/ROADMAP.md) / [en](../../zig/docs/ROADMAP.md) | технический план и анти-план |
+| [SECURITY.md](SECURITY.md) / [en](../../SECURITY.md) | модель угроз, репортинг, инвентаризация крипты |
+| [CONTRIBUTING.md](CONTRIBUTING.md) / [en](../../CONTRIBUTING.md) | правила контрибуции (kernel-style) |
 
 ## Официальный клиент
 
@@ -90,4 +90,4 @@ shopot-zig serve         # демон: ядро + UDS-апи (~/.shopot/api.sock
 
 ## Лицензия
 
-MIT — см. [LICENSE](LICENSE).
+MIT — см. [LICENSE](../../LICENSE).

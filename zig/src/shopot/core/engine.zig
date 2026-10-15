@@ -203,7 +203,7 @@ pub const Engine = struct {
         return idx;
     }
 
-    fn findIndex(self: *Engine, id: i64) ?usize {
+    pub fn findIndex(self: *Engine, id: i64) ?usize {
         if (id < 1) return null;
         const idx: usize = @intCast(id - 1);
         if (idx >= self.contacts.items.len) return null;

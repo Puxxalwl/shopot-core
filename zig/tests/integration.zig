@@ -9,6 +9,8 @@ const identity = shopot.crypto.identity;
 const envelope = shopot.proto.envelope;
 const session_mod = shopot.core.session;
 const obfuscate = shopot.net.obfuscate;
+const tcp = shopot.net.tcp;
+const relay = shopot.net.relay;
 
 // -------------------------------------------------------------- pipe pair
 const io_g = struct {
@@ -561,6 +563,196 @@ test "ratchet: PCS-ротация по порогу отправки, все с�
     hb.reacts.deinit(alloc);
     ha.pings.deinit(alloc);
     hb.pings.deinit(alloc);
+}
+
+// --------------------------------------------- relay presence (E2E, TCP)
+
+/// Сторона presence-соединения: dial в релей marker-ом из контакт-секрета,
+/// рукопожатие. Роль — по порядку bundle (детерминизм на обеих сторонах).
+fn relayPresenceSide(
+    alloc: std.mem.Allocator,
+    id: *const identity.Identity,
+    peer_bundle: [64]u8,
+    eph: [32]u8,
+    role: session_mod.HandshakeRole,
+    addr: []const u8,
+    marker: [32]u8,
+    ctx: *EngineCtx,
+    out: *?*session_mod.Session,
+    tc_out: *?*tcp.TcpConn,
+) void {
+    const tc = relay.dialMarker(alloc, addr, marker) catch return;
+    tc_out.* = tc;
+    out.* = session_mod.Session.establish(
+        alloc,
+        tc.conn(),
+        role,
+        id,
+        peer_bundle,
+        eph,
+        @ptrCast(&wrap_slot),
+        wrapConn,
+        .{ .ctx = ctx, .onEnvelope = engineDispatch, .onClosed = Harness.onClosed },
+        io_g.stored,
+    ) catch null;
+}
+
+test "relay: присутствие — переподключение без инвайта (контакт-секрет)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    io_g.stored = io;
+    io_g.alloc = alloc;
+    obf_idx = 0;
+    obf_tracker = @splat(null);
+
+    // relay на loopback: фиксированные порты (SO_REUSEADDR), слушает вечно
+    var addr_buf: [24]u8 = undefined;
+    var relay_len: usize = 0;
+    var srv: ?tcp.Listener = null;
+    for ([_]u16{ 39231, 39247, 39283, 39319 }) |port| {
+        relay_len = (std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port}) catch unreachable).len;
+        srv = tcp.listen(addr_buf[0..relay_len]) catch null;
+        if (srv != null) break;
+    }
+    var listener = srv orelse return error.NoRelay;
+    // поток релея с флагом остановки: в конце закрываем слушатель и
+    // дожидаемся выхода (map/entries освобождаются в serve)
+    var relay_stop = std.atomic.Value(bool).init(false);
+    const th = try std.Thread.spawn(.{}, relay.serve, .{ alloc, &listener, &relay_stop });
+    const relay_addr = addr_buf[0..relay_len];
+
+    const id_a = try identity.Identity.fromSeed(filled(41));
+    const id_b = try identity.Identity.fromSeed(filled(43));
+
+    var ha = Harness{ .alloc = alloc };
+    var hb = Harness{ .alloc = alloc };
+
+    var eng_a = shopot.core.engine.Engine.init(alloc, io, id_a, .{ .ctx = &ha, .onText = eng_events.onText });
+    var eng_b = shopot.core.engine.Engine.init(alloc, io, id_b, .{ .ctx = &hb, .onText = eng_events.onText });
+    const idx_b = try eng_a.addContact("b", id_b.bundle());
+    _ = try eng_b.addContact("a", id_a.bundle());
+    const cid_b: i64 = @intCast(idx_b + 1);
+
+    // marker из ДОЛГОСРОЧНОГО контакт-секрета (статик-статик X25519):
+    // обе стороны без обмена, без нового инвайта
+    const sec = try id_a.pairSecret(id_b.bundle());
+    const sec_b = try id_b.pairSecret(id_a.bundle());
+    try std.testing.expectEqualSlices(u8, &sec, &sec_b);
+    const marker = relay.presenceMarker(sec);
+    const a_init = std.mem.order(u8, &id_a.bundle(), &id_b.bundle()) == .lt;
+
+    var ctx_a = EngineCtx{ .engine = &eng_a, .contact_id = cid_b, .harness = &ha };
+    var ctx_b = EngineCtx{ .engine = &eng_b, .contact_id = 1, .harness = &hb };
+
+    var conns: std.ArrayListUnmanaged(*tcp.TcpConn) = .empty;
+    defer conns.deinit(alloc);
+
+    // цикл 1 и цикл 2: «обе стороны онлайн» -> спаривание -> сессия;
+    // после разрыва слот освобождается и спаривание происходит СНОВА
+    for (0..2) |cycle| {
+        var sa_opt: ?*session_mod.Session = null;
+        var sb_opt: ?*session_mod.Session = null;
+        var tca_opt: ?*tcp.TcpConn = null;
+        var tcb_opt: ?*tcp.TcpConn = null;
+        const role_a: session_mod.HandshakeRole = if (a_init) .initiator else .responder;
+        const role_b: session_mod.HandshakeRole = if (a_init) .responder else .initiator;
+        const th_b = try std.Thread.spawn(.{}, relayPresenceSide, .{
+            alloc,      &id_b,  id_a.bundle(), filled(@intCast(12 + cycle)), role_b,
+            relay_addr, marker, &ctx_b,        &sb_opt,                      &tcb_opt,
+        });
+        // A-сторона: dial с ретраем (слот мог ещё не освободиться после
+        // прошлого цикла — релей снимает регистрацию асинхронно)
+        var sa: *session_mod.Session = undefined;
+        var tca: *tcp.TcpConn = undefined;
+        var a_ok = false;
+        for (0..50) |_| {
+            relayPresenceSide(alloc, &id_a, id_b.bundle(), filled(@intCast(11 + cycle)), role_a, relay_addr, marker, &ctx_a, &sa_opt, &tca_opt);
+            if (sa_opt != null) {
+                a_ok = true;
+                sa = sa_opt.?;
+                tca = tca_opt.?;
+                break;
+            }
+            // неудачная попытка (слот ещё занят): коннект убрать
+            if (tca_opt) |tc| {
+                tc.deinit();
+                alloc.destroy(tc);
+                tca_opt = null;
+            }
+            std.Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+        }
+        th_b.join();
+        try std.testing.expect(a_ok);
+        const sb = sb_opt orelse return error.ResponderFailed;
+        conns.append(alloc, tca) catch return error.OutOfMemory;
+        conns.append(alloc, tcb_opt.?) catch return error.OutOfMemory;
+        eng_mu.lockUncancelable(io);
+        eng_a.sessions.put(cid_b, sa) catch return error.OutOfMemory;
+        eng_b.sessions.put(1, sb) catch return error.OutOfMemory;
+        eng_mu.unlock(io);
+
+        // лишний коннект при активной паре закрывается релеем
+        var extra: ?*session_mod.Session = null;
+        var extra_tc: ?*tcp.TcpConn = null;
+        var extra_err = false;
+        relayPresenceSide(alloc, &id_a, id_b.bundle(), filled(90), .initiator, relay_addr, marker, &ctx_a, &extra, &extra_tc);
+        if (extra == null) {
+            extra_err = true;
+            if (extra_tc) |et| {
+                et.deinit();
+                alloc.destroy(et);
+            }
+        }
+        try std.testing.expect(extra_err);
+
+        // текст ходит в обе стороны через relay-сплит
+        eng_mu.lockUncancelable(io);
+        _ = eng_a.sendText(cid_b, "pres-a") catch return error.Internal;
+        eng_mu.unlock(io);
+        try waitTexts(&hb, "pres-a");
+        eng_mu.lockUncancelable(io);
+        _ = eng_b.sendText(1, "pres-b") catch return error.Internal;
+        eng_mu.unlock(io);
+        try waitTexts(&ha, "pres-b");
+
+        // разрыв: релей освободит слот, следующий цикл спарит заново
+        eng_mu.lockUncancelable(io);
+        _ = eng_a.sessions.remove(cid_b);
+        _ = eng_b.sessions.remove(1);
+        eng_mu.unlock(io);
+        sa.close();
+        sb.close();
+        alloc.destroy(sa);
+        alloc.destroy(sb);
+        std.Io.sleep(io, .{ .nanoseconds = 300 * std.time.ns_per_ms }, .awake) catch {};
+    }
+
+    eng_a.deinit();
+    eng_b.deinit();
+    for (conns.items) |tc| {
+        alloc.destroy(tc);
+    }
+    for (obf_tracker) |oc| {
+        if (oc) |o| {
+            o.deinit();
+            alloc.destroy(o);
+        }
+    }
+    for (ha.texts.items) |t| alloc.free(t);
+    for (hb.texts.items) |t| alloc.free(t);
+    ha.texts.deinit(alloc);
+    hb.texts.deinit(alloc);
+    ha.reacts.deinit(alloc);
+    hb.reacts.deinit(alloc);
+    ha.pings.deinit(alloc);
+    hb.pings.deinit(alloc);
+
+    // релей: остановить — shutdown на слушающем сокете будит заблоки-
+    // рованный accept (close fd его НЕ будит), флаг завершит цикл
+    relay_stop.store(true, .seq_cst);
+    _ = std.os.linux.shutdown(listener.fd, std.os.linux.SHUT.RDWR);
+    th.join();
+    listener.deinit();
 }
 
 // ------------------------------------------------- file transfer (E2E)

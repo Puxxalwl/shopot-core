@@ -1,6 +1,6 @@
 # Contributing to shopot-core
 
-**English** | [Русский](CONTRIBUTING.ru.md)
+**English** | [Русский](docs/ru/CONTRIBUTING.md)
 
 Contribution rules are modeled on the Linux kernel process
 ([submitting-patches](https://docs.kernel.org/process/submitting-patches.html),
