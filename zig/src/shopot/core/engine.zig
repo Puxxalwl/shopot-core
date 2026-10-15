@@ -192,7 +192,10 @@ pub const Engine = struct {
             .body = body,
         } };
         if (self.sessions.get(contact_id)) |s| {
-            s.sendEnvelope(env) catch {
+            // рэтчет-запечатанный TEXT (слой 2): msg_id/ts_ms наши — дедуп,
+            // ACK и история согласованы; раньше уходил голым sendEnvelope
+            // и слой рэтчета не задействовался вовсе
+            s.sendSealedText(env) catch {
                 // сессия умерла между проверкой и записью — в очередь
                 self.outboxAppend(contact_id, msg_id, ts_ms, body) catch {};
                 return .{ .result = .queued, .msg_id = msg_id };
@@ -265,30 +268,38 @@ pub const Engine = struct {
         s.sendEnvelope(.{ .file_data = .{ .file_id = file_id, .seq = seq, .data = data } }) catch return EngineError.NoSession;
     }
 
-    /// Сессия поднята: слить outbox по cid (идемпотентно — дедуп на приёме).
+    /// Сессия поднялась: слить outbox по cid (идемпотентно — дедуп на приёме).
+    /// Пачками по 64 конверта: sendSealedTexts запечатывает пачку и кладёт
+    /// её в один obf-кадр (коалесценция мелких конвертов, ROADMAP P1) —
+    /// реконнект с очередью не стоит кадр 128+26 байт на каждое сообщение.
+    /// Сбой пачки оставляет записи нетронутыми: повтор идемпотентен дедупом.
     pub fn flushOutbox(self: *Engine, contact_id: i64) void {
         if (self.findIndex(contact_id) == null) return;
-        if (self.sessions.get(contact_id)) |s| {
-            var i: usize = 0;
-            while (i < self.outbox.items.len) {
-                const e = self.outbox.items[i];
-                const fresh = e.ts_ms + outbox_ttl_ms > @as(u64, @intCast(self.nowMs()));
-                if (e.cid != contact_id or !fresh) {
-                    if (e.cid == contact_id and !fresh) {
-                        const old = self.outbox.orderedRemove(i);
-                        self.alloc.free(old.body);
-                        continue;
-                    }
-                    i += 1;
+        const s = self.sessions.get(contact_id) orelse return;
+        var batch: [64]envelope.Envelope = undefined;
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < self.outbox.items.len) {
+            const e = self.outbox.items[i];
+            const fresh = e.ts_ms + outbox_ttl_ms > @as(u64, @intCast(self.nowMs()));
+            if (e.cid != contact_id or !fresh) {
+                if (e.cid == contact_id and !fresh) {
+                    const old = self.outbox.orderedRemove(i);
+                    self.alloc.free(old.body);
                     continue;
                 }
-                s.sendEnvelope(.{ .text = .{ .msg_id = e.msg_id, .ts_ms = e.ts_ms, .body = e.body } }) catch {
-                    i += 1;
-                    continue;
-                };
                 i += 1;
+                continue;
+            }
+            batch[n] = .{ .text = .{ .msg_id = e.msg_id, .ts_ms = e.ts_ms, .body = e.body } };
+            n += 1;
+            i += 1;
+            if (n == batch.len) {
+                s.sendSealedTexts(batch[0..n]) catch return;
+                n = 0;
             }
         }
+        if (n > 0) s.sendSealedTexts(batch[0..n]) catch {};
     }
 
     /// ACK дошёл: выкинуть запись outbox, событие onDelivered.

@@ -1,6 +1,8 @@
 //! Личность из 32-байтного сида: ключ X25519 для шифрования и Ed25519 для
 //! подписей. Скаляры выводятся HKDF-SHA256(seed, "shopot-id-v3"): 64 байта,
-//! первые 32 — enc-сид X25519, следующие 32 — сид Ed25519.
+//! первые 32 — enc-сид X25519, следующие 32 — сид Ed25519. Пара Ed25519
+//! выводится ОДИН раз при fromSeed и кэшируется: подпись не тянет за собой
+//! повторный скалярный вывод (было: generateDeterministic на каждый sign).
 
 const std = @import("std");
 
@@ -26,8 +28,9 @@ pub const Identity = struct {
     enc_secret: [32]u8,
     /// Публичный ключ X25519.
     enc_public: [32]u8,
-    /// Сид Ed25519 (обнуляется в deinit).
-    sign_seed: [32]u8,
+    /// Кэшированная пара Ed25519: sign() без повторного вывода пары.
+    /// Секретные байты обнуляются в deinit.
+    sign_kp: Ed25519.KeyPair,
     /// Публичный ключ Ed25519.
     sign_public: [32]u8,
 
@@ -42,7 +45,7 @@ pub const Identity = struct {
         const id = Identity{
             .enc_secret = enc_kp.secret_key,
             .enc_public = enc_kp.public_key,
-            .sign_seed = okm[32..64].*,
+            .sign_kp = sign_kp,
             .sign_public = sign_kp.public_key.toBytes(),
         };
         @memset(&okm, 0);
@@ -84,12 +87,11 @@ pub const Identity = struct {
         return buf[0..fingerprint_length];
     }
 
-    /// Подписывает `msg` сидом Ed25519 личности; 64-байтовая подпись в `sig_out`.
-    /// KeyMismatch/WeakPublicKey недостижимы для ключа, выведенного из сида
-    /// (pk строится вместе с подписью), но входят в набор std-подписи.
+    /// Подписывает `msg` парой Ed25519 личности (пара уже выведена в
+    /// fromSeed — повторного скалярного вывода нет); 64-байтовая подпись
+    /// в `sig_out`. KeyMismatch недостижим: pk хранится вместе с секретом.
     pub fn sign(self: *const Identity, msg: []const u8, sig_out: *[64]u8) error{ IdentityElement, NonCanonical, KeyMismatch, WeakPublicKey }!void {
-        const kp = try Ed25519.KeyPair.generateDeterministic(self.sign_seed);
-        const sig = try kp.sign(msg, null);
+        const sig = try self.sign_kp.sign(msg, null);
         sig_out.* = sig.toBytes();
     }
 
@@ -103,7 +105,7 @@ pub const Identity = struct {
     /// Обнуляет секретные скаляры личности.
     pub fn deinit(self: *Identity) void {
         std.crypto.secureZero(u8, &self.enc_secret);
-        std.crypto.secureZero(u8, &self.sign_seed);
+        std.crypto.secureZero(u8, &self.sign_kp.secret_key.bytes);
     }
 };
 
@@ -115,7 +117,6 @@ test "identity: детерминизм из сида" {
     const b = try Identity.fromSeed(seed);
     try std.testing.expectEqualSlices(u8, &a.enc_secret, &b.enc_secret);
     try std.testing.expectEqualSlices(u8, &a.enc_public, &b.enc_public);
-    try std.testing.expectEqualSlices(u8, &a.sign_seed, &b.sign_seed);
     try std.testing.expectEqualSlices(u8, &a.sign_public, &b.sign_public);
     try std.testing.expectEqualSlices(u8, &a.bundle(), &b.bundle());
 }
@@ -130,7 +131,7 @@ test "identity: разные сиды -> разные ключи" {
     try std.testing.expect(!std.mem.eql(u8, &a.sign_public, &b.sign_public));
     try std.testing.expect(!std.mem.eql(u8, &a.bundle(), &b.bundle()));
     try std.testing.expect(!std.mem.eql(u8, &a.enc_secret, &b.enc_secret));
-    try std.testing.expect(!std.mem.eql(u8, &a.sign_seed, &b.sign_seed));
+    try std.testing.expect(!std.mem.eql(u8, &a.sign_kp.secret_key.bytes, &b.sign_kp.secret_key.bytes));
 
     // сид из всех нулей тоже валиден и детерминистичен
     seed_a = @splat(0);
@@ -204,12 +205,13 @@ test "identity: deinit обнуляет секреты" {
 
     const zeros: [32]u8 = @splat(0);
     var enc_copy: [32]u8 = id.enc_secret;
-    var sign_copy: [32]u8 = id.sign_seed;
+    var sign_copy: [64]u8 = id.sign_kp.secret_key.bytes;
     try std.testing.expect(!std.mem.eql(u8, &enc_copy, &zeros));
 
     id.deinit();
     try std.testing.expectEqualSlices(u8, &zeros, &id.enc_secret);
-    try std.testing.expectEqualSlices(u8, &zeros, &id.sign_seed);
+    const sk_zeros: [64]u8 = @splat(0);
+    try std.testing.expectEqualSlices(u8, &sk_zeros, &id.sign_kp.secret_key.bytes);
     try std.testing.expect(!std.mem.eql(u8, &enc_copy, &id.enc_secret));
-    try std.testing.expect(!std.mem.eql(u8, &sign_copy, &id.sign_seed));
+    try std.testing.expect(!std.mem.eql(u8, &sign_copy, &id.sign_kp.secret_key.bytes));
 }

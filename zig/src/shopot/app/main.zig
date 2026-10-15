@@ -1020,7 +1020,8 @@ fn identifyCb(ctx: *anyopaque, enc_pk: [32]u8) ?session_mod.Session.IdentifyResu
     const app: *App = @ptrCast(@alignCast(ctx));
     for (app.eng.contacts.items) |c| {
         if (std.mem.eql(u8, c.bundle[0..32], &enc_pk)) {
-            return .{ .sign_pk = c.bundle[32..64].* };
+            // enc_pk нужен для сверки статики в m3 (bundle = enc_pk || sign_pk)
+            return .{ .enc_pk = c.bundle[0..32].*, .sign_pk = c.bundle[32..64].* };
         }
     }
     return null;
@@ -1447,7 +1448,7 @@ fn establishToRelay(app: *App, addr: []const u8, cid: i64, role: session_mod.Han
         ft.conn,
         role,
         app.id,
-        bundle[32..64].*,
+        bundle,
         eph,
         app,
         wrapConn,
@@ -1512,7 +1513,7 @@ fn acceptLoop(app: *App, listener: *tcp.Listener, cid: i64) void {
             raw,
             .responder,
             app.id,
-            bundle[32..64].*,
+            bundle,
             eph,
             app,
             wrapConn,

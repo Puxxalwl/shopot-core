@@ -24,19 +24,22 @@ availability. We aim to acknowledge within 72 hours.
 
 | primitive | implementation | used for |
 |-----------|----------------|----------|
-| X25519    | libsodium      | identity encryption key, ephemeral ECDH, ratchet DH steps |
-| Ed25519   | libsodium      | identity signatures (handshake auth) |
-| XSalsa20-Poly1305 | libsodium | AEAD for envelopes, chunks, at-rest records |
-| Double ratchet | own code on libsodium HMAC | per-message keys, alternating DH rotation (PCS) |
-| HKDF-SHA256 | built on libsodium HMAC | key derivation |
-| SHA-256   | libsodium      | fingerprints, room hash, file integrity |
+| X25519    | std.crypto     | identity encryption key, ephemeral ECDH, ratchet DH steps |
+| Ed25519   | std.crypto     | identity signatures (handshake auth, JOIN binding) |
+| ChaCha20-Poly1305 | std.crypto | AEAD for envelopes, frames, at-rest records |
+| Symmetric ratchet | own code on std HKDF/HMAC | per-message keys (advance-on-decrypt per Double Ratchet spec §3.5) |
+| HKDF-SHA256 | std.crypto.kdf | key derivation |
+| BLAKE2s-256 / SHA-256 | std.crypto | fingerprints, transcript hash, file integrity |
 | BIP-39    | own code (tests cover checksum) | mnemonic ↔ entropy |
 
-Design rules: no custom primitives, random 24-byte nonces (safe for
-XSalsa20), message keys used exactly once and wiped, ratchet rotations
-strictly alternating (race-free by construction), identity/ratchet/storage
-secrets wiped when their owning objects die, authentication failures drop
-frames silently without oracle behaviour.
+Handshake additionally verifies the remote static X25519 key from m2/m3
+against the known contact bundle (KeyMismatch closes the connection), per
+the noise-libp2p practice of validating the remote static after an XX
+handshake. Design rules: no custom primitives, counter-derived nonces
+(no (key, nonce) reuse by construction), message keys used exactly once and
+wiped, receive chain advances only after a successful decrypt, identity/
+ratchet/storage secrets wiped when their owning objects die, authentication
+failures drop frames silently without oracle behaviour.
 
 ## Hardening notes for app developers
 

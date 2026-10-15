@@ -163,14 +163,14 @@ test "two sessions: handshake, sealed text, reaction, presence" {
     var hb = Harness{ .alloc = alloc };
 
     var sb_opt: ?*session_mod.Session = null;
-    const th_b = try std.Thread.spawn(.{}, establishB, .{ alloc, cb.conn(), &id_b, id_a.bundle()[32..64].*, &hb, &sb_opt });
+    const th_b = try std.Thread.spawn(.{}, establishB, .{ alloc, cb.conn(), &id_b, id_a.bundle(), &hb, &sb_opt });
 
     const sa = try session_mod.Session.establish(
         alloc,
         ca.conn(),
         .initiator,
         &id_a,
-        id_b.bundle()[32..64].*,
+        id_b.bundle(),
         filled(1),
         @ptrCast(&wrap_slot),
         wrapConn,
@@ -232,7 +232,7 @@ fn establishB(
     alloc: std.mem.Allocator,
     conn: interfaces.Conn,
     id_b: *const identity.Identity,
-    peer_sign: [32]u8,
+    peer_bundle: [64]u8,
     hb: *Harness,
     out: *?*session_mod.Session,
 ) void {
@@ -241,7 +241,7 @@ fn establishB(
         conn,
         .responder,
         id_b,
-        peer_sign,
+        peer_bundle,
         filled(2),
         @ptrCast(&wrap_slot),
         wrapConn,
@@ -349,13 +349,13 @@ test "block: traffic from blocked peer is dropped engine-wide" {
     // establish as in test 1 (responder on its own thread)
     var sb_opt: ?*session_mod.Session = null;
     const th_b = try std.Thread.spawn(.{}, struct {
-        fn go(conn: interfaces.Conn, id_b_ptr: *const identity.Identity, peer_sign: [32]u8, ctx: *EngineCtx, out: *?*session_mod.Session) void {
+        fn go(conn: interfaces.Conn, id_b_ptr: *const identity.Identity, peer_bundle: [64]u8, ctx: *EngineCtx, out: *?*session_mod.Session) void {
             out.* = session_mod.Session.establish(
                 io_g.alloc,
                 conn,
                 .responder,
                 id_b_ptr,
-                peer_sign,
+                peer_bundle,
                 filled(5),
                 @ptrCast(&wrap_slot),
                 wrapConn,
@@ -363,14 +363,14 @@ test "block: traffic from blocked peer is dropped engine-wide" {
                 io_g.stored,
             ) catch null;
         }
-    }.go, .{ cb.conn(), &id_b, id_a.bundle()[32..64].*, &ctx_b, &sb_opt });
+    }.go, .{ cb.conn(), &id_b, id_a.bundle(), &ctx_b, &sb_opt });
 
     const sa = try session_mod.Session.establish(
         alloc,
         ca.conn(),
         .initiator,
         &id_a,
-        id_b.bundle()[32..64].*,
+        id_b.bundle(),
         filled(4),
         @ptrCast(&wrap_slot),
         wrapConn,
@@ -478,13 +478,13 @@ test "outbox: очередь офлайн, доставка при сессии,
     // 2) поднимаем сессии
     var sb_opt: ?*session_mod.Session = null;
     const th_b = try std.Thread.spawn(.{}, struct {
-        fn go(conn: interfaces.Conn, id_b_ptr: *const identity.Identity, peer_sign: [32]u8, ctx: *EngineCtx, out: *?*session_mod.Session) void {
+        fn go(conn: interfaces.Conn, id_b_ptr: *const identity.Identity, peer_bundle: [64]u8, ctx: *EngineCtx, out: *?*session_mod.Session) void {
             out.* = session_mod.Session.establish(
                 io_g.alloc,
                 conn,
                 .responder,
                 id_b_ptr,
-                peer_sign,
+                peer_bundle,
                 filled(6),
                 @ptrCast(&wrap_slot),
                 wrapConn,
@@ -492,14 +492,14 @@ test "outbox: очередь офлайн, доставка при сессии,
                 io_g.stored,
             ) catch null;
         }
-    }.go, .{ cb.conn(), &id_b, id_a.bundle()[32..64].*, &ctx_b, &sb_opt });
+    }.go, .{ cb.conn(), &id_b, id_a.bundle(), &ctx_b, &sb_opt });
 
     const sa = try session_mod.Session.establish(
         alloc,
         ca.conn(),
         .initiator,
         &id_a,
-        id_b.bundle()[32..64].*,
+        id_b.bundle(),
         filled(4),
         @ptrCast(&wrap_slot),
         wrapConn,

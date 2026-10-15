@@ -1,7 +1,10 @@
 //! Симметричный рэтчет: шаг сообщения эволюционирует цепочку
 //! (msg_key = HKDF-Expand(ck, "shopot-msg-v3" || u64 LE counter),
 //! затем ck = HMAC-SHA256(ck, 0x02)), DH-шаг пересоздаёт обе цепочки из
-//! X25519 (root = HKDF(shared, "shopot-ratchet-v3")). Направления делятся
+//! X25519 (root = HKDF(shared, "shopot-ratchet-v3")). Приём разделён на
+//! peekRecv (вывод ключа ОЖИДАЕМОГО кадра без сдвига цепочки) и commitRecv
+//! (сдвиг после успешной расшифровки) — по Double Ratchet spec §3.5/§8.10.
+//! Направления делятся
 //! детерминированно: сторона с лексикографически меньшим публичным ключом
 //! шлёт по цепочке HMAC(root, 0x03) и принимает по HMAC(root, 0x04),
 //! противоположная — наоборот; обе стороны получают одинаковые значения
@@ -49,14 +52,23 @@ pub const Ratchet = struct {
         return counter;
     }
 
-    /// Выводит ключ входящего сообщения в `msg_key` и возвращает счётчик
-    /// nonce; затем сдвигает цепочку приёма. Зеркален stepSend.
-    pub fn stepRecv(self: *Ratchet, msg_key: *[32]u8) u64 {
-        const counter = self.recv_counter;
-        self.recv_counter += 1;
-        messageKey(self.chain_recv, counter, msg_key);
+    /// Выводит ключ ОЖИДАЕМОГО входящего сообщения в `msg_key` и возвращает
+    /// его счётчик, НЕ сдвигая цепочку приёма: цепочка обязана сдвигаться
+    /// только после УСПЕШНОЙ расшифровки кадра (commitRecv), иначе один
+    /// битый кадр навсегда рассинхронизирует стороны (см. spec Double
+    /// Ratchet, §3.5: ключ выводится под конкретный номер сообщения).
+    /// Зеркален stepSend при том же состоянии цепочки.
+    pub fn peekRecv(self: *const Ratchet, msg_key: *[32]u8) u64 {
+        messageKey(self.chain_recv, self.recv_counter, msg_key);
+        return self.recv_counter;
+    }
+
+    /// Сдвигает цепочку приёма и счётчик после успешной расшифровки кадра,
+    /// выведенного через peekRecv. Повторный вызов без peek — ошибка
+    /// программирования (рассинхронизация), поэтому сдвиг необратим.
+    pub fn commitRecv(self: *Ratchet) void {
         stepChain(&self.chain_recv);
-        return counter;
+        self.recv_counter += 1;
     }
 
     /// DH-шаг: обе цепочки пересоздаются из X25519(`own_enc_sk`, `new_remote_pub`),
@@ -128,18 +140,46 @@ test "ratchet: эволюция ключей и счётчиков" {
 
     // цепочка приёма независима от цепочки отправки
     var rk0: [32]u8 = undefined;
-    try std.testing.expectEqual(@as(u64, 0), r.stepRecv(&rk0));
+    try std.testing.expectEqual(@as(u64, 0), r.peekRecv(&rk0));
+    r.commitRecv();
     try std.testing.expect(!std.mem.eql(u8, &k0, &rk0));
 }
 
-test "ratchet: stepRecv зеркален stepSend" {
+test "ratchet: peekRecv не сдвигает цепочку до commitRecv" {
+    var a = Ratchet.init(@splat(3), @splat(4));
+
+    // два peek без commit: один и тот же ключ и счётчик (кадр можно
+    // попытаться расшифровать повторно, цепочка не поехала)
+    var k1: [32]u8 = undefined;
+    var k2: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(u64, 0), a.peekRecv(&k1));
+    try std.testing.expectEqual(@as(u64, 0), a.peekRecv(&k2));
+    try std.testing.expectEqualSlices(u8, &k1, &k2);
+
+    // «расшифровка не удалась» — цепочка не сдвинута, следующий кадр
+    // выводится из того же состояния
+    var k3: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(u64, 0), a.peekRecv(&k3));
+    try std.testing.expectEqualSlices(u8, &k1, &k3);
+
+    // успешная расшифровка: commit сдвигает цепочку и счётчик
+    a.commitRecv();
+    var k4: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(u64, 1), a.peekRecv(&k4));
+    try std.testing.expect(!std.mem.eql(u8, &k1, &k4));
+    // счётчик отправки не тронут: peek/commit не влияют на исходящие
+    try std.testing.expectEqual(@as(u64, 0), a.send_counter);
+}
+
+test "ratchet: peekRecv+commitRecv зеркальны stepSend" {
     var a = Ratchet.init(@splat(3), @splat(4));
     var b = Ratchet.init(@splat(4), @splat(3)); // встречные цепочки
 
     var mk: [32]u8 = undefined;
     var rk: [32]u8 = undefined;
     const sc = a.stepSend(&mk);
-    const rc = b.stepRecv(&rk);
+    const rc = b.peekRecv(&rk);
+    b.commitRecv();
 
     try std.testing.expectEqual(sc, rc);
     try std.testing.expectEqualSlices(u8, &mk, &rk);
@@ -147,7 +187,8 @@ test "ratchet: stepRecv зеркален stepSend" {
     var mk2: [32]u8 = undefined;
     var rk2: [32]u8 = undefined;
     const sc2 = a.stepSend(&mk2);
-    const rc2 = b.stepRecv(&rk2);
+    const rc2 = b.peekRecv(&rk2);
+    b.commitRecv();
     try std.testing.expectEqual(sc2, rc2);
     try std.testing.expectEqualSlices(u8, &mk2, &rk2);
     try std.testing.expect(!std.mem.eql(u8, &mk, &mk2));
@@ -178,7 +219,8 @@ test "ratchet: зеркальность сторон после dhStep" {
     var mk: [32]u8 = undefined;
     var rk: [32]u8 = undefined;
     const sc = a.stepSend(&mk);
-    const rc = b.stepRecv(&rk);
+    const rc = b.peekRecv(&rk);
+    b.commitRecv();
     try std.testing.expectEqual(sc, rc);
     try std.testing.expectEqualSlices(u8, &mk, &rk);
 }

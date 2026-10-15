@@ -55,6 +55,10 @@ pub const Error = error{
     Tampered,
     /// Подпись транскрипта не сошлась.
     BadSignature,
+    /// Статический ключ X25519 в боксе не равен ожидаемому из bundle
+    /// контакта (привязка личности к статике; практика libp2p-noise:
+    /// приложение обязано проверить remote static после XX).
+    KeyMismatch,
 };
 
 /// Сессионные ключи; send/recv зеркальны у двух сторон.
@@ -90,13 +94,11 @@ fn mixKey(ck: *[32]u8, ikm: []const u8) [32]u8 {
     return key;
 }
 
-/// Подписывает `transcript` сидом Ed25519 личности. Сид уже валидирован при
-/// создании Identity (fromSeed), поэтому повторный детерминированный вывод
-/// не может отказать; вырожденный случай схлопнут в error.Tampered.
+/// Подписывает `transcript` парой Ed25519 личности (пара кэшируется в
+/// Identity с fromSeed — повторного скалярного вывода нет). Ошибки
+/// подписи схлопнуты в error.Tampered: для валидной личности недостижимы.
 fn signTranscript(id: *const identity.Identity, transcript: [32]u8, sig_out: *[sig_len]u8) error{Tampered}!void {
-    const kp = Ed25519.KeyPair.generateDeterministic(id.sign_seed) catch return error.Tampered;
-    const sig = kp.sign(&transcript, null) catch return error.Tampered;
-    sig_out.* = sig.toBytes();
+    id.sign(&transcript, sig_out) catch return error.Tampered;
 }
 
 /// Инициатор (первый в рукопожатии).
@@ -123,9 +125,12 @@ pub const Initiator = struct {
         };
     }
 
-    /// Обрабатывает m2 (проверяет sig по `peer_sign_public`), пишет m3,
-    /// возвращает сессионные ключи.
-    pub fn recv2(self: *Initiator, out_m3: *[m3_len]u8, m2: []const u8, peer_sign_public: [32]u8) Error!SessionKeys {
+    /// Обрабатывает m2 (проверяет sig по `peer_sign_public`, сверяет
+    /// статический ключ с `peer_enc_public`, если тот известен), пишет m3,
+    /// возвращает сессионные ключи. Сверка статики закрывает разрыв
+    /// «sig покрывает транскрипт до бокса»: без неё сессионный ключ мог
+    /// быть выведен с чужой статикой, не равной bundle контакта.
+    pub fn recv2(self: *Initiator, out_m3: *[m3_len]u8, m2: []const u8, peer_sign_public: [32]u8, peer_enc_public: ?[32]u8) Error!SessionKeys {
         if (m2.len != m2_len) return error.BadLength;
 
         const e2_public: [32]u8 = m2[0..32].*;
@@ -144,6 +149,11 @@ pub const Initiator = struct {
         const resp_enc_public: [32]u8 = payload[0..32].*;
         const sig_r: [sig_len]u8 = payload[32..payload_len].*;
         @memset(&payload, 0);
+
+        // статический ключ обязан совпадать с известным bundle контакта
+        if (peer_enc_public) |expected| {
+            if (!std.mem.eql(u8, &resp_enc_public, &expected)) return error.KeyMismatch;
+        }
 
         // подпись ответчика над транскриптом h2
         try identity.Identity.verify(peer_sign_public, &self.h, sig_r);
@@ -232,8 +242,10 @@ pub const Responder = struct {
 
     /// Обрабатывает m3. peer_sign_public == null — режим pending-join:
     /// подпись НЕ проверяется (контакт неизвестен), личность доказывается
-    /// JOIN-конвертом поверх сессии. Возвращает сессионные ключи.
-    pub fn recv3(self: *Responder, m3: []const u8, peer_sign_public: ?[32]u8) Error!SessionKeys {
+    /// JOIN-конвертом поверх сессии; peer_enc_public == null — то же для
+    /// сверки статики. Для известного контакта оба значения передаются из
+    /// bundle. Возвращает сессионные ключи.
+    pub fn recv3(self: *Responder, m3: []const u8, peer_sign_public: ?[32]u8, peer_enc_public: ?[32]u8) Error!SessionKeys {
         if (m3.len != m3_len) return error.BadLength;
 
         // открыть box2: init_enc_pk || sig_i (ad = h3)
@@ -242,6 +254,11 @@ pub const Responder = struct {
         const init_enc_public: [32]u8 = payload[0..32].*;
         const sig_i: [sig_len]u8 = payload[32..payload_len].*;
         @memset(&payload, 0);
+
+        // статический ключ обязан совпадать с известным bundle контакта
+        if (peer_enc_public) |expected| {
+            if (!std.mem.eql(u8, &init_enc_public, &expected)) return error.KeyMismatch;
+        }
 
         // подпись инициатора над транскриптом h3
         if (peer_sign_public) |pk| {
@@ -300,8 +317,8 @@ fn runHandshake() !struct { init_keys: SessionKeys, resp_keys: SessionKeys, m1: 
 
     var init = Initiator.start(&m1, &id_i, eph_i_seed);
     var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
-    const init_keys = try init.recv2(&m3, &m2, id_r.sign_public);
-    const resp_keys = try resp.recv3(&m3, id_i.sign_public);
+    const init_keys = try init.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public);
+    const resp_keys = try resp.recv3(&m3, id_i.sign_public, id_i.enc_public);
 
     return .{ .init_keys = init_keys, .resp_keys = resp_keys, .m1 = m1, .m2 = m2, .m3 = m3 };
 }
@@ -354,13 +371,13 @@ test "handshake: детерминизм при тех же сидах" {
     const eph_alt: [32]u8 = @splat(0x33);
     var ia = Initiator.start(&m1a, &id_i, eph_i_seed);
     var ra = try Responder.recv1(&m2a, &id_r, &m1a, eph_r_seed);
-    const ka = try ia.recv2(&m3a, &m2a, id_r.sign_public);
-    _ = try ra.recv3(&m3a, id_i.sign_public);
+    const ka = try ia.recv2(&m3a, &m2a, id_r.sign_public, id_r.enc_public);
+    _ = try ra.recv3(&m3a, id_i.sign_public, id_i.enc_public);
 
     var ib = Initiator.start(&m1b, &id_i, eph_alt);
     var rb = try Responder.recv1(&m2b, &id_r, &m1b, eph_alt);
-    const kb = try ib.recv2(&m3b, &m2b, id_r.sign_public);
-    _ = try rb.recv3(&m3b, id_i.sign_public);
+    const kb = try ib.recv2(&m3b, &m2b, id_r.sign_public, id_r.enc_public);
+    _ = try rb.recv3(&m3b, id_i.sign_public, id_i.enc_public);
 
     try std.testing.expect(!std.mem.eql(u8, &ka.send_key, &kb.send_key));
     try std.testing.expect(!std.mem.eql(u8, &ka.transcript, &kb.transcript));
@@ -382,12 +399,12 @@ test "handshake: битый байт в m2 -> Tampered" {
 
     // порча шифротекста box1
     m2[m2.len - 1] ^= 0x01;
-    try std.testing.expectError(error.Tampered, init.recv2(&m3, &m2, id_r.sign_public));
+    try std.testing.expectError(error.Tampered, init.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public));
 
     // порча e2_pub -> другой ee -> box1 не открывается
     m2[m2.len - 1] ^= 0x01;
     m2[0] ^= 0x01;
-    try std.testing.expectError(error.Tampered, init.recv2(&m3, &m2, id_r.sign_public));
+    try std.testing.expectError(error.Tampered, init.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public));
 }
 
 test "handshake: чужой sign_pk у инициатора -> BadSignature" {
@@ -407,7 +424,7 @@ test "handshake: чужой sign_pk у инициатора -> BadSignature" {
     _ = &resp;
 
     // инициатор сверяет sig_r не с тем ключом
-    try std.testing.expectError(error.BadSignature, init.recv2(&m3, &m2, id_x.sign_public));
+    try std.testing.expectError(error.BadSignature, init.recv2(&m3, &m2, id_x.sign_public, id_r.enc_public));
 }
 
 test "handshake: подмена sign_pk у ответчика -> BadSignature" {
@@ -424,16 +441,16 @@ test "handshake: подмена sign_pk у ответчика -> BadSignature" {
 
     var init = Initiator.start(&m1, &id_i, eph_i_seed);
     var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
-    const keys = try init.recv2(&m3, &m2, id_r.sign_public);
+    const keys = try init.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public);
 
     // ответчик сверяет sig_i не с тем ключом
-    try std.testing.expectError(error.BadSignature, resp.recv3(&m3, id_x.sign_public));
+    try std.testing.expectError(error.BadSignature, resp.recv3(&m3, id_x.sign_public, id_i.enc_public));
 
     // контроль: с правильным ключом всё проходит
     var init2 = Initiator.start(&m1, &id_i, eph_i_seed);
     var resp2 = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
-    const keys2 = try init2.recv2(&m3, &m2, id_r.sign_public);
-    const keys3 = try resp2.recv3(&m3, id_i.sign_public);
+    const keys2 = try init2.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public);
+    const keys3 = try resp2.recv3(&m3, id_i.sign_public, id_i.enc_public);
     try std.testing.expectEqualSlices(u8, &keys.send_key, &keys2.send_key);
     try std.testing.expectEqualSlices(u8, &keys3.send_key, &keys.recv_key);
 }
@@ -452,9 +469,38 @@ test "handshake: BadLength" {
 
     var init = Initiator.start(&m1, &id_i, eph_i_seed);
     _ = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
-    try std.testing.expectError(error.BadLength, init.recv2(&m3, m2[0 .. m2.len - 1], id_r.sign_public));
+    try std.testing.expectError(error.BadLength, init.recv2(&m3, m2[0 .. m2.len - 1], id_r.sign_public, id_r.enc_public));
 
     var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
-    _ = try init.recv2(&m3, &m2, id_r.sign_public);
-    try std.testing.expectError(error.BadLength, resp.recv3(m3[0 .. m3.len - 2], id_i.sign_public));
+    _ = try init.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public);
+    try std.testing.expectError(error.BadLength, resp.recv3(m3[0 .. m3.len - 2], id_i.sign_public, id_i.enc_public));
+}
+
+test "handshake: чужая статика в боксе -> KeyMismatch" {
+    var id_i = try testIdentity(seed_i);
+    defer id_i.deinit();
+    var id_r = try testIdentity(seed_r);
+    defer id_r.deinit();
+    var id_x = try testIdentity(0xEE);
+    defer id_x.deinit();
+
+    var m1: [m1_len]u8 = undefined;
+    var m2: [m2_len]u8 = undefined;
+    var m3: [m3_len]u8 = undefined;
+
+    var init = Initiator.start(&m1, &id_i, eph_i_seed);
+    var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
+
+    // инициатор ждёт статику id_x, а пришла id_r
+    try std.testing.expectError(error.KeyMismatch, init.recv2(&m3, &m2, id_r.sign_public, id_x.enc_public));
+
+    // контрольный m3 (валидный путь), затем ответчик ждёт статику id_x,
+    // а в m3 — id_i
+    var init2 = Initiator.start(&m1, &id_i, eph_i_seed);
+    _ = try init2.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public);
+    try std.testing.expectError(error.KeyMismatch, resp.recv3(&m3, id_i.sign_public, id_x.enc_public));
+
+    // null (pending-join): сверка не делается, всё проходит
+    var resp2 = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
+    _ = try resp2.recv3(&m3, null, null);
 }
