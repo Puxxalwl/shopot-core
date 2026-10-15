@@ -448,7 +448,8 @@ test "block: traffic from blocked peer is dropped engine-wide" {
             alloc.destroy(o);
         }
     }
-    alloc.destroy(sa);
+    // sa уже уничтожена eng_a.deinit(): block() снял её с карты в retired,
+    // движок — единственный владелец снятых сессий
     alloc.destroy(sb);
     ca.me.inbox.deinit(alloc);
     cb.me.inbox.deinit(alloc);

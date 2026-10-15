@@ -19,6 +19,7 @@ const audio_mod = @import("audio.zig");
 const adpcm_mod = @import("adpcm.zig");
 const api_srv = @import("api_server.zig");
 const api = @import("api.zig");
+const search_mod = @import("search.zig");
 
 const usage =
     \\shopot-zig — ядро шифрованного мессенджера (std-only Zig).
@@ -138,6 +139,17 @@ pub const App = struct {
     contact_relays: std.AutoHashMapUnmanaged(i64, []u8) = .empty,
     /// Запущенные presence-потоки (cid): защита от дублей.
     presence_runs: std.AutoHashMapUnmanaged(i64, void) = .empty,
+    /// Кэш истории: сырые записи kind msg (owned, формат лога) —
+    /// GET_HISTORY/GET_MESSAGE/SEARCH читают память, лог трогается только
+    /// при записи. Заполняется при старте, пополняется в persistMsg.
+    hist: std.ArrayListUnmanaged([]u8) = .empty,
+    /// msg_id -> индекс в hist (одна запись на msg_id).
+    hist_idx: std.AutoHashMapUnmanaged([16]u8, usize) = .empty,
+    /// Закреплённый чат (cid; 0 — не закреплено). Переживает рестарт (set:3/set:4).
+    pinned_chat: i64 = 0,
+    /// Закреплённые сообщения: cid -> msg_id в порядке закрепления
+    /// (переживает рестарт, set:5/set:6). Капа — max_pinned_msgs.
+    pinned_msgs: std.AutoHashMapUnmanaged(i64, std.ArrayListUnmanaged([16]u8)) = .empty,
     /// Копия $HOME (для файлов/путей).
     home_buf: [512]u8 = @splat(0),
     home_len: usize = 0,
@@ -173,11 +185,14 @@ pub const App = struct {
     /// bind без взятия лока — вызывать ПОД self.mu.
     fn bindSessionLocked(self: *App, cid: i64, s: *session_mod.Session, sc: *SessCtx) !void {
         if (self.eng.sessions.get(cid)) |old| {
-            old.close();
-            self.eng.alloc.destroy(old);
+            // прошлую сессию — в retired: shutdown транспорта будит её
+            // rx-поток, join и destroy сделает drainRetired тикера ВНЕ
+            // лока (close+join здесь — deadlock: rx выходит через app.mu)
+            self.eng.retireSession(cid, old);
         }
         try self.eng.sessions.put(cid, s);
         try self.sess_ctx.put(cid, sc);
+        sc.s = s;
         // prime presence: считаем контакт живым сразу после рукопожатия
         const now = self.nowMs();
         self.eng.markSeen(cid, now);
@@ -191,7 +206,7 @@ pub const App = struct {
     }
 
     fn events(self: *App) engine_mod.Events {
-        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onProfile = onProfileEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv, .onAvatar = onAvatarEv, .onAvatarReq = onAvatarReqEv, .onFileMeta = onFileMetaEv, .onFileData = onFileDataEv, .onFileSent = onFileSentEv };
+        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onProfile = onProfileEv, .onContactCard = onContactCardEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv, .onAvatar = onAvatarEv, .onAvatarReq = onAvatarReqEv, .onFileMeta = onFileMetaEv, .onFileData = onFileDataEv, .onFileSent = onFileSentEv };
     }
 };
 
@@ -319,6 +334,17 @@ fn evContactProfile(app: *App, cid: i64, name: []const u8, avatar_id: [16]u8) vo
     api_srv.fanoutEventLocked(app, .CONTACT_PROFILE, w.items());
 }
 
+/// CONTACT_CARD: пир переслал визитку третьего лица.
+fn evContactCard(app: *App, cid: i64, name: []const u8, bundle: [64]u8, addr: []const u8) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putStr16(name) catch return;
+    w.putBytes(&bundle) catch return;
+    w.putStr16(addr) catch return;
+    api_srv.fanoutEventLocked(app, .CONTACT_CARD, w.items());
+}
+
 /// BLOCKED_BY_PEER: пир заблокировал нас.
 fn evBlockedByPeer(app: *App, cid: i64) void {
     var w = api.Writer.init(app.alloc);
@@ -356,7 +382,8 @@ const JoinInfo = struct {
 const SessCtx = struct {
     app: *App,
     cid: i64,
-    /// Сессия pending-join (cid == -1): связка для промоушена после JOIN.
+    /// Сессия контекста: pending-join (cid == -1) — до промоушена,
+    /// привязанная — выставляется в bindSessionLocked.
     s: ?*session_mod.Session = null,
 };
 
@@ -388,17 +415,19 @@ fn envIn(ctx: *anyopaque, env: envelope.Envelope) void {
 fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
     const app = sc.app;
     const sess = sc.s orelse return;
+    // Мы В rx-потоке сессии: close() ждёт rx (join самого себя — deadlock),
+    // поэтому гасим только транспорт — rx выйдет сам и рапортует onClosed.
     const j = switch (env) {
         .join => |j| j,
         else => {
-            sess.close();
+            sess.shutdown();
             return;
         },
     };
     const transcript = sess.keys.transcript;
     // 1) подпись: bundle заявителя привязан к ключам этой сессии
     identity.Identity.verify(j.bundle[32..64].*, &transcript, j.sig) catch {
-        sess.close();
+        sess.shutdown();
         return;
     };
     var failed = false;
@@ -448,7 +477,7 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
         }
     }
     if (failed) {
-        sess.close();
+        sess.shutdown();
         return;
     }
     // relay-инвайт: присутствие с этого момента — marker из
@@ -465,8 +494,28 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
     evPresence(app, cid, true, app.nowMs());
 }
 
+/// Сессия умерла (её rx-поток завершился и рапортовал сюда). Снимаем
+/// привязку с карты — ТОЛЬКО если она всё ещё наша (ребинд мог поставить
+/// новую): иначе мёртвый указатель в eng.sessions навсегда блокирует
+/// автодозвон и linker (обе петли видят «сессия есть» и не звонят), а
+/// каждое sendText молча падает в outbox — «отправится позже» при живых
+/// сторонах. Сессию уводим в retired: drain тикера сделает join+destroy.
 fn onClosed(ctx: *anyopaque) void {
-    _ = ctx;
+    const sc: *SessCtx = @ptrCast(@alignCast(ctx));
+    if (sc.cid < 1) return; // pending-join: привязки не было
+    const s = sc.s orelse return;
+    const app = sc.app;
+    app.lock();
+    defer app.unlock();
+    const cur = app.eng.sessions.get(sc.cid) orelse return;
+    if (cur != s) return; // уже заменена новой сессией — не трогаем
+    app.eng.retireSession(sc.cid, s);
+    _ = app.sess_ctx.remove(sc.cid);
+    if (app.eng.findIndex(sc.cid)) |idx| {
+        app.eng.contacts.items[idx].online = false;
+        if (app.eng.ev.onPresence) |cb|
+            cb(app.eng.ev.ctx, &app.eng.contacts.items[idx], false, app.nowMs());
+    }
 }
 
 /// Индекс контакта по указателю (события движка отдают *const Contact).
@@ -677,6 +726,13 @@ fn onProfileEv(ctx: *anyopaque, from: *const engine_mod.Contact, name: []const u
     evContactProfile(app, @intCast(idx + 1), name, avatar_id);
 }
 
+/// CONTACT_CARD от пира: визитка третьего лица — наружу событием.
+fn onContactCardEv(ctx: *anyopaque, from: *const engine_mod.Contact, name: []const u8, bundle: [64]u8, addr: []const u8) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const idx = contactIndexOf(app, from) orelse return;
+    evContactCard(app, @intCast(idx + 1), name, bundle, addr);
+}
+
 fn onBlockedEv(ctx: *anyopaque, from: *const engine_mod.Contact) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
@@ -764,8 +820,11 @@ fn onCallAudioEv(ctx: *anyopaque, from: *const engine_mod.Contact, seq: u32, dat
 }
 
 /// Найти cid по bundle (порядок стабильный: contacts[i] — id i+1).
+/// Удалённые чаты невидимы: повторное знакомство с этим человеком создаст
+/// НОВЫЙ cid с чистой историей.
 fn contactIdByBundle(app: *App, bundle: [64]u8) ?i64 {
     for (app.eng.contacts.items, 0..) |c, i| {
+        if (c.deleted) continue;
         if (std.mem.eql(u8, &c.bundle, &bundle)) return @intCast(i + 1);
     }
     return null;
@@ -914,28 +973,54 @@ fn tickerLoop(app: *App) void {
     while (app.running) {
         const req: std.os.linux.timespec = .{ .sec = 0, .nsec = 250 * std.time.ns_per_ms };
         _ = std.os.linux.nanosleep(&req, null);
-        app.lock();
-        defer app.unlock();
-        var it = app.hb.iterator();
-        const now = app.nowMs();
-        while (it.next()) |e| {
-            const cid = e.key_ptr.*;
-            const st = e.value_ptr;
-            const s = app.eng.sessions.get(cid) orelse continue;
-            switch (st.tick(now)) {
-                .none => {},
-                .send_ping => |p| s.sendEnvelope(.{ .presence_ping = .{
-                    .seq = p.seq,
-                    .ts_ms = @intCast(p.ts_ms),
-                } }) catch {},
-                .mark_offline => {
-                    app.eng.contacts.items[@intCast(cid - 1)].online = false;
-                    if (app.eng.ev.onPresence) |cb|
-                        cb(app.eng.ev.ctx, &app.eng.contacts.items[@intCast(cid - 1)], false, now);
-                },
+        {
+            app.lock();
+            defer app.unlock();
+            var it = app.hb.iterator();
+            const now = app.nowMs();
+            while (it.next()) |e| {
+                const cid = e.key_ptr.*;
+                const st = e.value_ptr;
+                const s = app.eng.sessions.get(cid) orelse continue;
+                switch (st.tick(now)) {
+                    .none => {},
+                    .send_ping => |p| s.sendEnvelope(.{ .presence_ping = .{
+                        .seq = p.seq,
+                        .ts_ms = @intCast(p.ts_ms),
+                    } }) catch {},
+                    .mark_offline => {
+                        app.eng.contacts.items[@intCast(cid - 1)].online = false;
+                        if (app.eng.ev.onPresence) |cb|
+                            cb(app.eng.ev.ctx, &app.eng.contacts.items[@intCast(cid - 1)], false, now);
+                        // молчащая (half-open) сессия мертва: снять с карты —
+                        // автодозвон/linker поднимут соединение заново; сам
+                        // указатель уйдёт в retired и будет закрыт drain-ом
+                        app.eng.retireSession(cid, s);
+                    },
+                }
             }
         }
+        // retired-слив: join rx-потоков и destroy — строго ВНЕ app.mu
+        drainRetired(app);
     }
+}
+
+/// Закрыть и освободить снятые с карты сессии. Вызывается из тикера БЕЗ
+/// app.mu: close() ждёт rx-поток, чей выход берёт лок (join под спин-локом
+/// — deadlock). Сессии в retired никому не видны — конкурентных_close нет.
+fn drainRetired(app: *App) void {
+    var dead: []*session_mod.Session = undefined;
+    {
+        app.lock();
+        defer app.unlock();
+        if (app.eng.retired.items.len == 0) return;
+        dead = app.eng.retired.toOwnedSlice(app.alloc) catch return;
+    }
+    for (dead) |s| {
+        s.close();
+        app.eng.alloc.destroy(s);
+    }
+    app.alloc.free(dead);
 }
 
 /// START_CALL: инициировать звонок. Ответ: [call_id 16].
@@ -1022,7 +1107,7 @@ fn autodialLoop(app: *App) void {
             defer app.unlock();
             for (app.eng.contacts.items, 0..) |*c, i| {
                 const cid: i64 = @intCast(i + 1);
-                if (app.eng.sessions.get(cid) != null or c.blocked) {
+                if (app.eng.sessions.get(cid) != null or c.blocked or c.deleted) {
                     _ = attempts.remove(cid);
                     continue;
                 }
@@ -1065,33 +1150,31 @@ fn linkerLoop(app: *App) void {
             const a = disc.waitAnnounce(300) orelse break;
             if (std.mem.eql(u8, &a.bundle, &my_bundle)) continue;
             const cid = contactIdByBundle(app, a.bundle) orelse continue;
+            // адрес анонса — сохранить для автодозвона (последний известный);
+            // мутация контактов — строго под app.mu (ticker и рендер итерируют)
+            var ab_ip: [16]u8 = undefined;
+            const ip_str = fmtIpBuf(&ab_ip, a.ip);
+            {
+                app.lock();
+                defer app.unlock();
+                const c = &app.eng.contacts.items[@intCast(cid - 1)];
+                if (c.deleted) continue;
+                c.setAddr(ip_str, a.port);
+            }
             app.lock();
             const linked = app.eng.sessions.get(cid) != null;
             const blocked = app.eng.contacts.items[@intCast(cid - 1)].blocked;
             const join_due = app.join_map.contains(cid);
             app.unlock();
             if (linked or blocked) continue;
-            // адрес анонса — сохранить для автодозвона (последний известный)
-            {
-                var ab_ip: [16]u8 = undefined;
-                const c = &app.eng.contacts.items[@intCast(cid - 1)];
-                c.setAddr(fmtIpBuf(&ab_ip, a.ip), a.port);
-            }
             // инициатор — сторона с меньшим bundle (детерминизм, без гонки);
             // держатель инвайт-кода инициирует ВСЕГДА: приглашающий его не знает
             const i_init = std.mem.order(u8, &my_bundle, &a.bundle) == .lt;
             if (!i_init and !join_due) continue;
             var ab: [32]u8 = undefined;
             const addr = discover_mod.fmtAddr(&ab, a.ip, a.port);
+            // markSeen не нужен: establishTo -> bindSession сам метит онлайн
             establishTo(app, addr, cid, .initiator) catch continue;
-            app.lock();
-            if (!app.eng.contacts.items[@intCast(cid - 1)].online)
-                app.eng.markSeen(cid, app.nowMs());
-            app.unlock();
-            app.lock();
-            if (!app.eng.contacts.items[@intCast(cid - 1)].online)
-                app.eng.markSeen(cid, app.nowMs());
-            app.unlock();
         }
         _ = std.os.linux.nanosleep(&sleep, null);
     }
@@ -1103,6 +1186,8 @@ fn identifyCb(ctx: *anyopaque, enc_pk: [32]u8) ?session_mod.Session.IdentifyResu
     const app: *App = @ptrCast(@alignCast(ctx));
     for (app.eng.contacts.items) |c| {
         if (std.mem.eql(u8, c.bundle[0..32], &enc_pk)) {
+            // удалённый чат мёртв: incoming от него — как от незнакомца
+            if (c.deleted) return null;
             // enc_pk нужен для сверки статики в m3 (bundle = enc_pk || sign_pk)
             return .{ .enc_pk = c.bundle[0..32].*, .sign_pk = c.bundle[32..64].* };
         }
@@ -1326,6 +1411,7 @@ fn relayPresenceLoop(app: *App, cid: i64) void {
             defer app.unlock();
             const idx = app.eng.findIndex(cid) orelse return; // контакт удалён
             if (app.eng.contacts.items[idx].blocked) return;
+            if (app.eng.contacts.items[idx].deleted) return;
             if (app.eng.sessions.contains(cid)) {
                 // живая сессия: присутствие не нужно
                 _ = std.os.linux.nanosleep(&sleep1, null);
@@ -1545,10 +1631,15 @@ fn apiListContacts(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     const max_contacts = 10000;
     app.lock();
     defer app.unlock();
-    const n = @min(app.eng.contacts.items.len, max_contacts);
     if (app.eng.contacts.items.len > max_contacts) return .TOO_BIG;
+    // удалённые чаты (слоты-надгробия) в списке не видны
+    var n: usize = 0;
+    for (app.eng.contacts.items) |c| {
+        if (!c.deleted) n += 1;
+    }
     w.putU32(@intCast(n)) catch return .INTERNAL;
-    for (app.eng.contacts.items[0..n], 0..) |c, i| {
+    for (app.eng.contacts.items, 0..) |c, i| {
+        if (c.deleted) continue;
         const cid: i64 = @intCast(i + 1);
         var flags: u8 = 0;
         if (c.online) flags |= 1;
@@ -1744,8 +1835,11 @@ fn apiSendMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     app.lock();
     defer app.unlock();
     if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    if (app.eng.contacts.items[cid - 1].deleted) return .NO_CONTACT;
     const oc = app.eng.sendText(@intCast(cid), body, ents[0..n]) catch |e| return statusOf(e);
-    persistMsg(app, @intCast(cid), true, oc.msg_id, oc.result == .sent, app.nowMs(), body, ents[0..n]);
+    // delivered в истории = подтверждено ACK (не «улетело в сокет»):
+    // погашение пишет persistOutboxAck по событию MESSAGE_DELIVERED
+    persistMsg(app, @intCast(cid), true, oc.msg_id, false, app.nowMs(), body, ents[0..n]);
     if (oc.result == .queued) persistOutboxAdd(app);
     w.putBytes(&oc.msg_id) catch return .INTERNAL;
     w.putU8(if (oc.result == .queued) 1 else 0) catch return .INTERNAL;
@@ -1792,6 +1886,260 @@ fn apiBlock(app: *App, payload: []const u8, flag: bool) api.Status {
         @memcpy(buf[0..64], &app.eng.contacts.items[cid - 1].bundle);
         buf[64] = @intFromBool(flag);
         _ = log.append(.block, &buf) catch {};
+    }
+    return .OK;
+}
+
+// --------------------------------------------- закрепления и удаление чатов
+
+/// Капа закреплённых сообщений на чат.
+const max_pinned_msgs = 16;
+
+/// PIN_CHAT (25): [cid u32] → ∅. Закреплённый чат один на ядро,
+/// переживает рестарт (set:3/set:4).
+fn apiPinChat(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    if (app.eng.contacts.items[cid - 1].deleted) return .NO_CONTACT;
+    app.pinned_chat = cid;
+    if (app.log) |log| {
+        var buf: [3]u8 = undefined;
+        buf[0] = 3;
+        std.mem.writeInt(u16, buf[1..3], @intCast(cid), .little);
+        _ = log.append(.set, &buf) catch {};
+    }
+    return .OK;
+}
+
+/// GET_PINNED_CHAT (26): ∅ → [cid u32] (0 — не закреплено).
+fn apiGetPinnedChat(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    if (payload.len != 0) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    var cid: u32 = 0;
+    if (app.pinned_chat >= 1 and app.pinned_chat <= app.eng.contacts.items.len) {
+        if (!app.eng.contacts.items[@intCast(app.pinned_chat - 1)].deleted) {
+            cid = @intCast(app.pinned_chat);
+        }
+    }
+    w.putU32(cid) catch return .INTERNAL;
+    return .OK;
+}
+
+/// UNPIN_CHAT (27): ∅ → ∅. Идемпотентно.
+fn apiUnpinChat(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    if (payload.len != 0) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    app.pinned_chat = 0;
+    if (app.log) |log| {
+        const buf = [_]u8{4};
+        _ = log.append(.set, &buf) catch {};
+    }
+    return .OK;
+}
+
+/// DELETE_CHAT (28): [cid u32] → ∅. Слот контакта остаётся (cid стабильны
+/// до рестарта), но контакт невидим и мёртв: сессия снята, outbox/файлы/
+/// история/закрепления очищены, автодозвон и линкер его не трогают.
+/// Переживает рестарт (set:7 по bundle). Повторное знакомство — новый cid
+/// с чистой историей.
+fn apiDeleteChat(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    const c = &app.eng.contacts.items[cid - 1];
+    if (c.deleted) return .NO_CONTACT;
+    // сессия — в retired (drain закроет и освободит)
+    if (app.eng.sessions.get(@intCast(cid))) |s| app.eng.retireSession(@intCast(cid), s);
+    _ = app.sess_ctx.remove(@intCast(cid));
+    // очередь недоставленных
+    var i: usize = 0;
+    while (i < app.eng.outbox.items.len) {
+        if (app.eng.outbox.items[i].cid == cid) {
+            const e = app.eng.outbox.orderedRemove(i);
+            app.alloc.free(e.body);
+            app.alloc.free(e.ents_tail);
+        } else i += 1;
+    }
+    // исходящие файлы в полёте
+    var j: usize = 0;
+    while (j < app.eng.file_tx.items.len) {
+        if (app.eng.file_tx.items[j].cid == cid) {
+            var f = app.eng.file_tx.orderedRemove(j);
+            std.crypto.secureZero(u8, &f.sha);
+            app.alloc.free(f.name);
+            app.alloc.free(f.data);
+        } else j += 1;
+    }
+    // история (кэш), реакции не трогаем — записи без cid-хозяина
+    // невидимы: GET_MESSAGE удалённых чатов не бывает
+    histPurgeFor(app, cid);
+    // закрепления
+    if (app.pinned_chat == cid) app.pinned_chat = 0;
+    if (app.pinned_msgs.fetchRemove(cid)) |kv| {
+        var list = kv.value;
+        list.deinit(app.alloc);
+    }
+    // presence-состояния
+    _ = app.hb.remove(cid);
+    if (app.eng.seen.fetchRemove(cid)) |kv| {
+        var seen = kv.value;
+        seen.deinit(app.alloc);
+    }
+    _ = app.eng.last_seen_ms.remove(cid);
+    if (app.contact_relays.fetchRemove(cid)) |kv| {
+        app.alloc.free(kv.value);
+    }
+    // надгробие: при загрузке слот cid станет невидимым (bundle не годится:
+    // повторное знакомство с тем же человеком — ДРУГОЙ слот, надгробие по
+    // bundle съело бы и его)
+    c.deleted = true;
+    c.online = false;
+    if (app.log) |log| {
+        var buf: [3]u8 = undefined;
+        buf[0] = 7;
+        std.mem.writeInt(u16, buf[1..3], @intCast(cid), .little);
+        _ = log.append(.set, &buf) catch {};
+    }
+    return .OK;
+}
+
+/// SEND_CONTACT (29): [to_cid u32][contact_cid u32 (0 = моя карточка)] → ∅.
+/// Отправляет конверт CONTACT_CARD по живой сессии; получатель видит
+/// событие CONTACT_CARD. Добавить человека из карточки можно только его
+/// собственным инвайтом — карточка знакомит, не подключает.
+fn apiSendContact(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    var r = api.Reader.init(payload);
+    const to_cid = r.readU32() catch return .BAD_FRAME;
+    const contact_cid = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    if (to_cid < 1 or to_cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    const to = &app.eng.contacts.items[to_cid - 1];
+    if (to.deleted) return .NO_CONTACT;
+    if (to.blocked) return .CONTACT_BLOCKED;
+    var name_buf: [32]u8 = undefined;
+    var name_len: usize = 0;
+    var bundle: [64]u8 = undefined;
+    var ab: [80]u8 = undefined;
+    var card_addr: []const u8 = "";
+    if (contact_cid == 0) {
+        // своя карточка: имя профиля + свой bundle
+        const my_name = app.eng.myName();
+        @memcpy(name_buf[0..my_name.len], my_name);
+        name_len = my_name.len;
+        bundle = app.id.bundle();
+    } else {
+        if (contact_cid > app.eng.contacts.items.len) return .NO_CONTACT;
+        const c = &app.eng.contacts.items[contact_cid - 1];
+        if (c.deleted) return .NO_CONTACT;
+        const cname = c.getName();
+        @memcpy(name_buf[0..cname.len], cname);
+        name_len = cname.len;
+        bundle = c.bundle;
+        if (c.addr(&ab)) |a| card_addr = a;
+    }
+    const s = app.eng.sessions.get(@intCast(to_cid)) orelse return .NO_SESSION;
+    s.sendEnvelope(.{ .contact_card = .{
+        .name = name_buf[0..name_len],
+        .bundle = bundle,
+        .addr = card_addr,
+    } }) catch return .NO_SESSION;
+    return .OK;
+}
+
+/// PIN_MESSAGE (30): [cid u32][msg_id 16] → ∅. Сообщение обязано быть в
+/// истории чата; капа max_pinned_msgs на чат. Переживает рестарт (set:5).
+fn apiPinMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    const msg_id: [16]u8 = (r.readBytes(16) catch return .BAD_FRAME)[0..16].*;
+    if (r.hasMore()) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    if (app.eng.contacts.items[cid - 1].deleted) return .NO_CONTACT;
+    const list = app.pinned_msgs.getOrPut(app.alloc, @intCast(cid)) catch return .INTERNAL;
+    if (!list.found_existing) list.value_ptr.* = .empty;
+    for (list.value_ptr.items) |m| {
+        if (std.mem.eql(u8, &m, &msg_id)) return .OK; // уже закреплено
+    }
+    // сообщение из этого чата?
+    const idx = app.hist_idx.get(msg_id) orelse return .NOT_FOUND;
+    const rec = app.hist.items[idx];
+    if (rec.len < 2 or std.mem.readInt(u16, rec[0..2], .little) != cid) return .NOT_FOUND;
+    if (list.value_ptr.items.len >= max_pinned_msgs) return .TOO_BIG;
+    list.value_ptr.append(app.alloc, msg_id) catch return .INTERNAL;
+    if (app.log) |log| {
+        var buf: [19]u8 = undefined;
+        buf[0] = 5;
+        std.mem.writeInt(u16, buf[1..3], @intCast(cid), .little);
+        @memcpy(buf[3..19], &msg_id);
+        _ = log.append(.set, &buf) catch {};
+    }
+    return .OK;
+}
+
+/// UNPIN_MESSAGE (31): [cid u32][msg_id 16] → ∅. Идемпотентно (set:6).
+fn apiUnpinMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    const msg_id: [16]u8 = (r.readBytes(16) catch return .BAD_FRAME)[0..16].*;
+    if (r.hasMore()) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    if (app.pinned_msgs.getPtr(@intCast(cid))) |list| {
+        var i: usize = 0;
+        while (i < list.items.len) : (i += 1) {
+            if (std.mem.eql(u8, &list.items[i], &msg_id)) {
+                _ = list.orderedRemove(i);
+                break;
+            }
+        }
+    }
+    if (app.log) |log| {
+        var buf: [19]u8 = undefined;
+        buf[0] = 6;
+        std.mem.writeInt(u16, buf[1..3], @intCast(cid), .little);
+        @memcpy(buf[3..19], &msg_id);
+        _ = log.append(.set, &buf) catch {};
+    }
+    return .OK;
+}
+
+/// GET_PINNED_MESSAGES (32): [cid u32] → [count u32] × {[msg_id 16]}
+/// в порядке закрепления.
+fn apiGetPinnedMessages(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    if (app.eng.contacts.items[cid - 1].deleted) return .NO_CONTACT;
+    const list = app.pinned_msgs.get(@intCast(cid)) orelse {
+        w.putU32(0) catch return .INTERNAL;
+        return .OK;
+    };
+    w.putU32(@intCast(list.items.len)) catch return .INTERNAL;
+    for (list.items) |m| {
+        w.putBytes(&m) catch return .INTERNAL;
     }
     return .OK;
 }
@@ -1889,14 +2237,17 @@ fn persistOutboxAdd(app: *App) void {
     _ = log.append(.outbox, buf[0..n]) catch {};
 }
 
-/// Записать в лог погашение (ACK) записи outbox.
+/// Записать в лог погашение (ACK) записи outbox — заодно это отметка
+/// delivered для истории: при загрузке ACK-записи ставят бит1 записям
+/// kind msg (рассинхрон «доставлено, но в истории 0» после рестарта).
+/// Кэш истории гасится сразу. Вызывается ПОД app.mu.
 fn persistOutboxAck(app: *App, cid: i64, msg_id: [16]u8) void {
-    const log = app.log orelse return;
     var buf: [3 + 16]u8 = undefined;
     buf[0] = 0;
     std.mem.writeInt(u16, buf[1..3], @intCast(cid), .little);
     @memcpy(buf[3 .. 3 + 16], &msg_id);
-    _ = log.append(.outbox, &buf) catch {};
+    if (app.log) |log| _ = log.append(.outbox, &buf) catch {};
+    histDelivered(app, msg_id);
 }
 
 /// Записать реакцию в лог (kind react: [cid u16][flags u8][msg_id 16]
@@ -1931,21 +2282,66 @@ fn recEntityTail(rec: []const u8, blen: usize) ?[]const u8 {
 /// хвост entities (канонический формат; пустые ents -> счётчик 0). Чтение
 /// толерантно к старым записям без хвоста (история переживает апгрейд).
 /// ts — реальное локальное время (мс), метка в конверте остаётся приватной.
+/// Запись попадает и в лог, и в кэш истории (GET_HISTORY/GET_MESSAGE/SEARCH
+/// читают только кэш). Вызывается ПОД app.mu.
 fn persistMsg(app: *App, cid: i64, mine: bool, msg_id: [16]u8, delivered: bool, ts_ms: i64, body: []const u8, ents: []const envelope.TextEntity) void {
-    const log = app.log orelse return;
     if (body.len == 0 or body.len > 4096) return;
     var tail_buf: [envelope.max_text_tail]u8 = undefined;
     const tail = envelope.encodeEntitiesTail(&tail_buf, ents, body.len) catch return;
     var buf: [3 + 16 + 8 + 2 + 4096 + envelope.max_text_tail]u8 = undefined;
     std.mem.writeInt(u16, buf[0..2], @intCast(cid), .little);
-    // бит0 = mine, бит1 = delivered
+    // бит0 = mine, бит1 = delivered (мой текст: 0 до ACK — погашение
+    // пишется записью kind outbox в persistOutboxAck)
     buf[2] = @as(u8, @intFromBool(mine)) | (@as(u8, @intFromBool(delivered)) << 1);
     @memcpy(buf[3 .. 3 + 16], &msg_id);
     std.mem.writeInt(u64, buf[19..27], @intCast(ts_ms), .little);
     std.mem.writeInt(u16, buf[27..29], @intCast(body.len), .little);
     @memcpy(buf[29 .. 29 + body.len], body);
     @memcpy(buf[29 + body.len ..][0..tail.len], tail);
-    _ = log.append(.msg, buf[0 .. 29 + body.len + tail.len]) catch {};
+    const rec = buf[0 .. 29 + body.len + tail.len];
+    if (app.log) |log| _ = log.append(.msg, rec) catch {};
+    histAppend(app, rec, msg_id);
+}
+
+/// Положить копию записи kind msg в кэш истории (+ индекс по msg_id).
+/// Вызывается ПОД app.mu.
+fn histAppend(app: *App, rec: []const u8, msg_id: [16]u8) void {
+    const copy = app.alloc.dupe(u8, rec) catch return;
+    app.hist.append(app.alloc, copy) catch {
+        app.alloc.free(copy);
+        return;
+    };
+    app.hist_idx.put(app.alloc, msg_id, app.hist.items.len - 1) catch {};
+}
+
+/// Погасить delivered в кэше истории (ACK дошёл). Вызывается ПОД app.mu.
+fn histDelivered(app: *App, msg_id: [16]u8) void {
+    const i = app.hist_idx.get(msg_id) orelse return;
+    const rec = app.hist.items[i];
+    if (rec.len >= 3) rec[2] |= 0b10; // бит1 = delivered
+}
+
+/// Выкинуть из кэша истории все записи чата (DELETE_CHAT). Полная
+/// перекомпоновка: индексы msg_id смещаются. Вызывается ПОД app.mu.
+fn histPurgeFor(app: *App, cid: i64) void {
+    var keep: std.ArrayListUnmanaged([]u8) = .empty;
+    for (app.hist.items) |rec| {
+        if (rec.len >= 2 and std.mem.readInt(u16, rec[0..2], .little) == cid) {
+            app.alloc.free(rec);
+        } else {
+            keep.append(app.alloc, rec) catch {
+                // OOM: запись теряем — лучше потерять кэш-строку, чем упасть
+                app.alloc.free(rec);
+            };
+        }
+    }
+    app.hist.deinit(app.alloc);
+    app.hist = keep;
+    app.hist_idx.clearRetainingCapacity();
+    for (app.hist.items, 0..) |rec, i| {
+        if (rec.len < 29) continue;
+        app.hist_idx.put(app.alloc, rec[3 .. 3 + 16].*, i) catch {};
+    }
 }
 
 /// Записать принятый файл в лог (kind file): переживает рестарты.
@@ -2098,8 +2494,9 @@ fn apiGetAvatarId(app: *App, payload: []const u8, w: *api.Writer) api.Status {
 /// Ответ: [total u32][count u32] × {[flags u8 bit0 mine bit1 delivered]
 /// [msg_id 16][ts_ms u64][body str16][ent_count u8] × {entity}} — записи
 /// старые → новые. Окно режется и бюджетом payload (≤ 1 МиБ): count может
-/// быть меньше limit для entity-тяжёлой истории.
-/// Лога нет — пустой список (OK).
+/// быть меньше limit для entity-тяжёлой истории. bit1 delivered ставится
+/// только ACK-ом (не фактом записи в сокет). Источние данных — кэш
+/// истории в памяти (лог читается один раз при старте).
 fn apiGetHistory(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     var r = api.Reader.init(payload);
     const cid = r.readU32() catch return .BAD_FRAME;
@@ -2107,22 +2504,13 @@ fn apiGetHistory(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     if (r.hasMore()) return .BAD_FRAME;
     if (limit == 0) limit = 50;
     if (limit > 200) return .TOO_BIG;
-    {
-        app.lock();
-        defer app.unlock();
-        if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
-    }
-    const log = app.log orelse {
-        w.putU32(0) catch return .INTERNAL;
-        w.putU32(0) catch return .INTERNAL;
-        return .OK;
-    };
+    // под локом: кэш истории живут мутации (persist/ACK/DELETE_CHAT)
+    app.lock();
+    defer app.unlock();
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    if (app.eng.contacts.items[cid - 1].deleted) return .NO_CONTACT;
     // записи: [cid u16][flags u8][msg_id 16][ts u64][len u16][body][ents]
-    const recs = log.readAll(.msg, app.alloc) catch return .INTERNAL;
-    defer {
-        for (recs) |rec| app.alloc.free(rec);
-        app.alloc.free(recs);
-    }
+    const recs = app.hist.items;
     var total: usize = 0;
     var start: usize = recs.len; // индекс первой записи окна
     {
@@ -2192,18 +2580,11 @@ fn apiGetMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     const want: [16]u8 = (r.readBytes(16) catch return .BAD_FRAME)[0..16].*;
     if (r.hasMore()) return .BAD_FRAME;
     const log = app.log orelse return .NOT_FOUND;
-    const recs = log.readAll(.msg, app.alloc) catch return .INTERNAL;
-    defer {
-        for (recs) |rec| app.alloc.free(rec);
-        app.alloc.free(recs);
-    }
-    var last: ?[]u8 = null;
-    for (recs) |rec| {
-        if (rec.len < 29) continue;
-        if (!std.mem.eql(u8, rec[3 .. 3 + 16], &want)) continue;
-        last = rec;
-    }
-    const rec = last orelse return .NOT_FOUND;
+    // под локом: кэш истории живут мутации (persist/DELETE_CHAT)
+    app.lock();
+    defer app.unlock();
+    const i = app.hist_idx.get(want) orelse return .NOT_FOUND;
+    const rec = app.hist.items[i];
     const flags = rec[2];
     const cid = std.mem.readInt(u16, rec[0..2], .little);
     const ts_ms = std.mem.readInt(u64, rec[19..27], .little);
@@ -2238,6 +2619,81 @@ fn apiGetMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
         w.putU64(rts) catch return .INTERNAL;
     }
     return .OK;
+}
+
+/// Общая часть SEARCH_MESSAGE / GLOBAL_SEARCH_MESSAGE: чтение лога,
+/// разбор записей и сборка ответа (семантика поиска — search.zig).
+/// Лога нет — пустой список.
+fn searchRun(app: *App, args: search_mod.Args, w: *api.Writer) api.Status {
+    // под локом: кэш истории живут мутации (persist/ACK/DELETE_CHAT)
+    app.lock();
+    defer app.unlock();
+    const raw = app.hist.items;
+    // записи kind msg → Rec поиска; битые (обрезанные/битый хвост
+    // entities) и чаты-надгробия пропускаются — как в GET_HISTORY
+    const recs = app.alloc.alloc(search_mod.Rec, raw.len) catch return .INTERNAL;
+    defer app.alloc.free(recs);
+    var n: usize = 0;
+    for (raw) |rec| {
+        if (!chatAlive(app, std.mem.readInt(u16, rec[0..2], .little))) continue;
+        if (msgRecView(rec)) |v| {
+            recs[n] = v;
+            n += 1;
+        }
+    }
+    return search_mod.writeResponse(app.alloc, w, recs[0..n], args, api.max_payload);
+}
+
+/// Жив ли чат cid (в пределах списка, не удалён). 0 — нет.
+fn chatAlive(app: *App, cid: u16) bool {
+    if (cid < 1 or cid > app.eng.contacts.items.len) return false;
+    return !app.eng.contacts.items[cid - 1].deleted;
+}
+
+/// Запись лога kind msg → Rec поиска (срезы указывают в rec):
+/// `[cid u16][flags u8][msg_id 16][ts u64][len u16][body][ents]`.
+fn msgRecView(rec: []const u8) ?search_mod.Rec {
+    if (rec.len < 29) return null;
+    const blen: usize = std.mem.readInt(u16, rec[27..29], .little);
+    if (rec.len < 29 + blen) return null;
+    const tail = recEntityTail(rec, blen) orelse return null;
+    return .{
+        .cid = std.mem.readInt(u16, rec[0..2], .little),
+        .flags = rec[2],
+        .msg_id = rec[3..19].*,
+        .ts_ms = std.mem.readInt(u64, rec[19..27], .little),
+        .body = rec[29 .. 29 + blen],
+        .tail = tail,
+        .size = 1 + 16 + 8 + 2 + blen + tail.len,
+    };
+}
+
+/// SEARCH_MESSAGE: payload [cid u32][query str16][limit u32][offset u32].
+/// Ответ: [total u32][count u32] × {[flags u8 bit0 mine bit1 delivered
+/// bit2 fuzzy][msg_id 16][ts_ms u64][body str16][ent_count u8] × {entity}}
+/// — сначала точные совпадения (новые → старые), затем нечёткие; окно
+/// режут offset/limit и бюджет 1 МиБ. Матчинг и формат — search.zig.
+/// Ошибки: NO_CONTACT, BAD_ARGS (пустой query), TOO_BIG (limit/query).
+fn apiSearchMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var args = search_mod.parseArgs(payload, false) orelse return .BAD_FRAME;
+    if (search_mod.validate(&args)) |st| return st;
+    {
+        const cid = args.cid orelse return .BAD_FRAME;
+        app.lock();
+        defer app.unlock();
+        if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+        if (app.eng.contacts.items[cid - 1].deleted) return .NO_CONTACT;
+    }
+    return searchRun(app, args, w);
+}
+
+/// GLOBAL_SEARCH_MESSAGE: payload [query str16][limit u32][offset u32] —
+/// поиск по всем чатам; записи ответа те же, но начинаются с [cid u32].
+/// Ошибки: BAD_ARGS (пустой query), TOO_BIG (limit/query).
+fn apiGlobalSearchMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var args = search_mod.parseArgs(payload, true) orelse return .BAD_FRAME;
+    if (search_mod.validate(&args)) |st| return st;
+    return searchRun(app, args, w);
 }
 
 fn loadContacts(app: *App) void {
@@ -2280,7 +2736,74 @@ fn loadContacts(app: *App) void {
             }
         }
     }
-    // outbox: добавление/погашение в порядке записи лога
+    // настройки ДО истории и outbox: надгробия (set:7) должны закрыть слоты
+    // раньше, чем записи начнут фильтроваться по deleted
+    //   set:1 [1][avatar_id 16] — мой avatar_id
+    //   set:2 [2][имя]          — моё имя профиля
+    //   set:3 [3][cid u16]      — закрепить чат
+    //   set:4 [4]               — снять закрепление чата
+    //   set:5 [5][cid u16][msg_id 16] — закрепить сообщение
+    //   set:6 [6][cid u16][msg_id 16] — открепить сообщение
+    //   set:7 [7][cid u16]      — надгробие удалённого чата (слот невидим)
+    const sets = log.readAll(.set, app.alloc) catch return;
+    defer {
+        for (sets) |r| app.alloc.free(r);
+        app.alloc.free(sets);
+    }
+    for (sets) |rec| {
+        if (rec.len == 17 and rec[0] == 1) app.eng.my_avatar_id = rec[1..17].*;
+        if (rec.len >= 2 and rec[0] == 2) app.eng.setMyProfile(rec[1..rec.len], app.eng.my_avatar_id);
+        if (rec.len == 3 and rec[0] == 3) {
+            const cid = std.mem.readInt(u16, rec[1..3], .little);
+            if (cid >= 1 and cid <= app.eng.contacts.items.len) app.pinned_chat = cid;
+        }
+        if (rec.len == 1 and rec[0] == 4) app.pinned_chat = 0;
+        if (rec.len == 19 and rec[0] == 5) {
+            const cid: i64 = @intCast(std.mem.readInt(u16, rec[1..3], .little));
+            const msg_id: [16]u8 = rec[3..19].*;
+            if (cid >= 1 and cid <= app.eng.contacts.items.len) {
+                const list = app.pinned_msgs.getOrPut(app.alloc, cid) catch continue;
+                if (!list.found_existing) list.value_ptr.* = .empty;
+                if (list.value_ptr.items.len < max_pinned_msgs)
+                    list.value_ptr.append(app.alloc, msg_id) catch {};
+            }
+        }
+        if (rec.len == 19 and rec[0] == 6) {
+            const cid: i64 = @intCast(std.mem.readInt(u16, rec[1..3], .little));
+            const msg_id: [16]u8 = rec[3..19].*;
+            if (app.pinned_msgs.getPtr(cid)) |list| {
+                var i: usize = 0;
+                while (i < list.items.len) : (i += 1) {
+                    if (std.mem.eql(u8, &list.items[i], &msg_id)) {
+                        _ = list.orderedRemove(i);
+                        break;
+                    }
+                }
+            }
+        }
+        if (rec.len == 3 and rec[0] == 7) {
+            const cid = std.mem.readInt(u16, rec[1..3], .little);
+            if (cid >= 1 and cid <= app.eng.contacts.items.len) {
+                app.eng.contacts.items[cid - 1].deleted = true;
+                app.eng.contacts.items[cid - 1].online = false;
+            }
+        }
+    }
+    // история: кэш записей kind msg в памяти (GET_HISTORY/GET_MESSAGE/SEARCH
+    // больше не читают лог); чаты-надгробия в кэш не попадают
+    const msgs = log.readAll(.msg, app.alloc) catch return;
+    defer {
+        for (msgs) |r| app.alloc.free(r);
+        app.alloc.free(msgs);
+    }
+    for (msgs) |rec| {
+        if (rec.len < 29) continue;
+        const cid = std.mem.readInt(u16, rec[0..2], .little);
+        if (!chatAlive(app, cid)) continue;
+        histAppend(app, rec, rec[3 .. 3 + 16].*);
+    }
+    // outbox: добавление/погашение в порядке записи лога; ACK заодно
+    // гасит delivered в кэше истории (правда о доставке после рестарта)
     const obs = log.readAll(.outbox, app.alloc) catch return;
     defer {
         for (obs) |r| app.alloc.free(r);
@@ -2301,8 +2824,10 @@ fn loadContacts(app: *App) void {
                     app.alloc.free(old.ents_tail);
                 } else i += 1;
             }
+            histDelivered(app, msg_id);
             continue;
         }
+        if (app.eng.contacts.items[@intCast(cid - 1)].deleted) continue;
         if (rec.len < 3 + 16 + 8 + 2) continue;
         const msg_id: [16]u8 = rec[3 .. 3 + 16].*;
         const ts_ms = std.mem.readInt(u64, rec[19..27], .little);
@@ -2341,16 +2866,6 @@ fn loadContacts(app: *App) void {
         app.avatars.put(app.alloc, id, copy) catch {
             app.alloc.free(copy);
         };
-    }
-    // свой профиль: set:1 = avatar_id
-    const sets = log.readAll(.set, app.alloc) catch return;
-    defer {
-        for (sets) |r| app.alloc.free(r);
-        app.alloc.free(sets);
-    }
-    for (sets) |rec| {
-        if (rec.len == 17 and rec[0] == 1) app.eng.my_avatar_id = rec[1..17].*;
-        if (rec.len >= 2 and rec[0] == 2) app.eng.setMyProfile(rec[1..rec.len], app.eng.my_avatar_id);
     }
     // блокировки поверх загруженных контактов
     const blocks = log.readAll(.block, app.alloc) catch return;
@@ -2424,6 +2939,16 @@ pub fn dispatchApi(app: *App, conn: *api_srv.Conn, req: ApiRequest) bool {
         .REMOVE_REACTION => respond(conn, req, apiReaction(app, req.payload, false), w.items()),
         .GET_HISTORY => respond(conn, req, apiGetHistory(app, req.payload, &w), w.items()),
         .GET_MESSAGE => respond(conn, req, apiGetMessage(app, req.payload, &w), w.items()),
+        .SEARCH_MESSAGE => respond(conn, req, apiSearchMessage(app, req.payload, &w), w.items()),
+        .GLOBAL_SEARCH_MESSAGE => respond(conn, req, apiGlobalSearchMessage(app, req.payload, &w), w.items()),
+        .PIN_CHAT => respond(conn, req, apiPinChat(app, req.payload, &w), w.items()),
+        .GET_PINNED_CHAT => respond(conn, req, apiGetPinnedChat(app, req.payload, &w), w.items()),
+        .UNPIN_CHAT => respond(conn, req, apiUnpinChat(app, req.payload, &w), w.items()),
+        .DELETE_CHAT => respond(conn, req, apiDeleteChat(app, req.payload, &w), w.items()),
+        .SEND_CONTACT => respond(conn, req, apiSendContact(app, req.payload, &w), w.items()),
+        .PIN_MESSAGE => respond(conn, req, apiPinMessage(app, req.payload, &w), w.items()),
+        .UNPIN_MESSAGE => respond(conn, req, apiUnpinMessage(app, req.payload, &w), w.items()),
+        .GET_PINNED_MESSAGES => respond(conn, req, apiGetPinnedMessages(app, req.payload, &w), w.items()),
         .SET_NAME => respond(conn, req, apiSetName(app, req.payload, &w), w.items()),
         .SET_AVATAR => respond(conn, req, apiSetAvatar(app, req.payload, &w), w.items()),
         .GET_AVATAR_ID => respond(conn, req, apiGetAvatarId(app, req.payload, &w), w.items()),
@@ -2621,6 +3146,13 @@ pub fn main(start: std.process.Init) !void {
         }
 
         eng.deinit();
+        // новая память приложения: кэш истории и закрепления
+        for (app.hist.items) |rec| app.alloc.free(rec);
+        app.hist.deinit(app.alloc);
+        app.hist_idx.deinit(app.alloc);
+        var pit = app.pinned_msgs.valueIterator();
+        while (pit.next()) |list| list.deinit(app.alloc);
+        app.pinned_msgs.deinit(app.alloc);
         return;
     }
 

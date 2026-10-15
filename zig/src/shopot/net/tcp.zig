@@ -7,8 +7,21 @@ const interfaces = @import("../core/interfaces.zig");
 
 pub const TcpConn = struct {
     fd: posix.socket_t,
+    /// fd уже закрыт: close идемпотентен — rx-поток сессии и внешний
+    /// close/shutdown гасят транспорт конкурентно, повторный close(fd)
+    /// мог бы закрыть ЧУЖОЙ переиспользованный дескриптор.
+    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn deinit(self: *TcpConn) void {
+        self.closeFd();
+    }
+
+    /// Однократный shutdown+close (safe при гонке закрытий).
+    fn closeFd(self: *TcpConn) void {
+        if (self.closed.swap(true, .acq_rel)) return;
+        // shutdown, не close: заблокированный в read() поток (rx-поток
+        // сессии) просыпается по EOF — close(fd) его не будит (Linux)
+        _ = std.os.linux.shutdown(self.fd, std.os.linux.SHUT.RDWR);
         _ = std.os.linux.close(self.fd);
     }
 
@@ -35,11 +48,7 @@ pub const TcpConn = struct {
 
     fn closeImpl(ptr: *anyopaque) void {
         const self: *TcpConn = @ptrCast(@alignCast(ptr));
-        // shutdown, не close: заблокированный в read() поток другой стороны
-        // (rx-поток сессии) просыпается по EOF — close(fd) его НЕ будит
-        // (Linux), а rx-поток затем закрывает fd сам
-        _ = std.os.linux.shutdown(self.fd, std.os.linux.SHUT.RDWR);
-        _ = std.os.linux.close(self.fd);
+        self.closeFd();
     }
 
     const vtable = interfaces.Conn.VTable{

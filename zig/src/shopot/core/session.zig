@@ -532,13 +532,23 @@ pub const Session = struct {
         self.conn.writeAll(buf[0 .. 2 + plain.len]) catch return SessionError.Closed;
     }
 
+    /// Закрыть транспорт и ДОЖДАТЬСЯ rx-потока (join). onClosed срабатывает
+    /// ровно один раз — в rxLoop: внешний close будит rx shutdown-ом
+    /// транспорта, тот выходит и сам рапортует смерть. Вызывать ВНЕ app.mu
+    /// (join под спин-локом — deadlock); чистку карты делает onClosed.
     pub fn close(self: *Session) void {
-        if (self.running.swap(false, .seq_cst)) {
-            self.conn.close();
-            if (self.rx_thread) |t| t.join();
-            self.rx_thread = null;
-            self.ev.onClosed(self.ev.ctx);
-        }
+        _ = self.running.swap(false, .seq_cst);
+        self.conn.close();
+        if (self.rx_thread) |t| t.join();
+        self.rx_thread = null;
+    }
+
+    /// Погасить транспорт БЕЗ join: rx-поток проснётся по shutdown и выйдет
+    /// (его onClosed снимет сессию с карты; join и destroy сделает drain).
+    /// Идемпотентно, безопасно под app.mu.
+    pub fn shutdown(self: *Session) void {
+        _ = self.running.swap(false, .seq_cst);
+        self.conn.close();
     }
 
     fn rxLoop(self: *Session) void {
@@ -566,6 +576,9 @@ pub const Session = struct {
             self.ev.onEnvelope(self.ev.ctx, env);
         }
         self.running.store(false, .seq_cst);
+        // fd не течёт: rx-поток сам закрывает транспорт на выходе
+        // (идемпотентно с внешним close/shutdown); смерть рапортуем ровно один раз
+        self.conn.close();
         self.ev.onClosed(self.ev.ctx);
     }
 

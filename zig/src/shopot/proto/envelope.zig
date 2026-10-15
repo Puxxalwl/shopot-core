@@ -18,6 +18,8 @@
 //!   JOIN          0x40: bundle: [64]u8, name: u8 + байты (≤ 32),
 //!                       sig: [64]u8, hmac: [32]u8
 //!   PROFILE       0x42: name: u8 + байты (≤ 32), avatar_id: [16]u8
+//!   CONTACT_CARD  0x43: name: u8 + байты (≤ 32), bundle: [64]u8,
+//!                       addr: u16 + байты (≤ 64, пусто = неизвестен)
 //!   RATCHET_KEY   0x44: epoch: u16, dh_pub: [32]u8 (PCS-ротация рэтчета)
 //!   AVATAR        0x50: avatar_id: [16]u8, data: u16 + байты (≤ 16000)
 //!   AVATAR_ACK   0x51: avatar_id: [16]u8
@@ -50,6 +52,10 @@ pub const Tag = enum(u8) {
     /// PROFILE: имя и текущий avatar_id отправителя (эхо при каждом
     /// установлении сессии).
     profile = 0x42,
+    /// CONTACT_CARD: визитная карточка третьего лица (имя + bundle +
+    /// известный адрес) — SEND_CONTACT. Неизвестный тег на приёме
+    /// отбрасывается: старые ядра просто пропускают карточку.
+    contact_card = 0x43,
     /// RATCHET_KEY: свежий публичный X25519-ключ отправителя для DH-шага
     /// рэтчета. Обрабатывается сессией (до движка): обмен пабликами обеих
     /// сторон завершается совместным dhStep — новые цепочки, эпоха +1.
@@ -103,6 +109,10 @@ pub const max_audio_data = 1024;
 pub const max_avatar_data = 16000;
 pub const max_file_chunk = 16000;
 pub const max_file_name = 64;
+/// Максимум длины имени в CONTACT_CARD.
+pub const max_card_name = 32;
+/// Максимум длины адреса в CONTACT_CARD (host:port).
+pub const max_card_addr = 64;
 
 /// Максимальная длина закодированного кадра (AVATAR с телом 16000).
 pub const max_encoded_len = 1 + id_len + 4 + 2 + max_file_chunk;
@@ -359,6 +369,19 @@ pub const FileData = struct {
     data: []const u8,
 };
 
+/// CONTACT_CARD (0x43): визитная карточка контакта, пересланная третьей
+/// стороной (метод SEND_CONTACT). Получатель видит имя, bundle и (если
+/// отправителю известен) адрес; чтобы ДОБАВИТЬ этого человека, нужен его
+/// собственный инвайт-код — карточка знакомит, не подключает.
+pub const ContactCard = struct {
+    /// Отображаемое имя карточки, ≤ 32 байтов; срез входного буфера после decode.
+    name: []const u8,
+    /// Полный bundle владельца карточки: enc_pk || sign_pk.
+    bundle: [64]u8,
+    /// Последний известный адрес host:port, ≤ 64 байтов; пусто — неизвестен.
+    addr: []const u8,
+};
+
 /// RATCHET_KEY (0x44): PCS-ротация рэтчета. Отправитель сгенерировал свежую
 /// X25519-пару для следующей эпохи и предъявляет публичную часть; получив
 /// паблики ОБЕИХ сторон, каждая выполняет dhStep (свежий секрет свой,
@@ -418,6 +441,8 @@ pub const Envelope = union(enum) {
     join: Join,
     /// PROFILE (0x42).
     profile: Profile,
+    /// CONTACT_CARD (0x43).
+    contact_card: ContactCard,
     /// RATCHET_KEY (0x44).
     ratchet_key: RatchetKey,
     /// AVATAR (0x50).
@@ -447,6 +472,7 @@ pub fn encodedLen(e: Envelope) usize {
         .call_audio => |m| 1 + 4 + 2 + m.data.len,
         .join => |m| 1 + 64 + 1 + m.name.len + join_sig_len + join_hmac_len,
         .profile => |m| 1 + 1 + m.name.len + id_len,
+        .contact_card => |m| 1 + 1 + m.name.len + 64 + 2 + m.addr.len,
         .ratchet_key => 1 + 2 + 32,
         .avatar => |m| 1 + id_len + 2 + m.data.len,
         .file_meta => |m| 1 + id_len + 1 + m.name.len + 4 + 32,
@@ -532,6 +558,15 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
             try w.put(@intCast(m.name.len));
             try w.putFixed(m.name);
             try w.putFixed(&m.avatar_id);
+        },
+        .contact_card => |m| {
+            if (m.name.len > max_card_name) return error.TooBig;
+            if (m.addr.len > max_card_addr) return error.TooBig;
+            try w.put(@backingInt(Tag.contact_card));
+            try w.put(@intCast(m.name.len));
+            try w.putFixed(m.name);
+            try w.putFixed(&m.bundle);
+            try w.putBytes(m.addr);
         },
         .ratchet_key => |m| {
             try w.put(@backingInt(Tag.ratchet_key));
@@ -665,6 +700,19 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
                 .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
             },
         },
+        @backingInt(Tag.contact_card) => .{ .contact_card = .{
+            .name = blk: {
+                const nl = try r.getU8();
+                if (nl > max_card_name) return error.BadLen;
+                break :blk try r.getFixed(nl);
+            },
+            .bundle = (try r.getFixed(64))[0..64].*,
+            .addr = blk: {
+                const addr = try r.getBytes();
+                if (addr.len > max_card_addr) return error.BadLen;
+                break :blk addr;
+            },
+        } },
         @backingInt(Tag.ratchet_key) => .{ .ratchet_key = .{
             .epoch = try r.getInt(u16),
             .dh_pub = (try r.getFixed(32))[0..32].*,
@@ -1126,6 +1174,41 @@ test "envelope: RATCHET_KEY roundtrip" {
     @memcpy(with_tail[0..bytes.len], bytes);
     with_tail[bytes.len] = 0;
     try testing.expectError(error.BadLen, decode(with_tail[0 .. bytes.len + 1]));
+}
+
+test "envelope: CONTACT_CARD roundtrip" {
+    var buf: [max_encoded_len]u8 = undefined;
+    const e = Envelope{ .contact_card = .{
+        .name = "алиса",
+        .bundle = filled(64, 0x3B),
+        .addr = "10.0.0.7:7779",
+    } };
+    const bytes = try encode(&buf, e);
+    // тег 0x43, имя u8+байты, bundle 64, адрес u16+байты
+    try testing.expectEqual(@as(u8, 0x43), bytes[0]);
+    try testing.expectEqual(@as(usize, 1 + 1 + "алиса".len + 64 + 2 + "10.0.0.7:7779".len), bytes.len);
+
+    const back = try decode(bytes);
+    try testing.expectEqualStrings("алиса", back.contact_card.name);
+    try testing.expectEqualSlices(u8, &filled(64, 0x3B), &back.contact_card.bundle);
+    try testing.expectEqualStrings("10.0.0.7:7779", back.contact_card.addr);
+
+    // обрезанный/с хвостом (до перезаписи буфера вторым конвертом)
+    try testing.expectError(error.Truncated, decode(bytes[0 .. bytes.len - 1]));
+    var with_tail: [128]u8 = undefined;
+    @memcpy(with_tail[0..bytes.len], bytes);
+    with_tail[bytes.len] = 0;
+    try testing.expectError(error.BadLen, decode(with_tail[0 .. bytes.len + 1]));
+
+    // пустой адрес валиден (адрес неизвестен)
+    const e2 = Envelope{ .contact_card = .{
+        .name = "б",
+        .bundle = filled(64, 1),
+        .addr = "",
+    } };
+    const b2 = try encode(&buf, e2);
+    const back2 = try decode(b2);
+    try testing.expectEqual(@as(usize, 0), back2.contact_card.addr.len);
 }
 
 test "envelope: ACK roundtrip" {

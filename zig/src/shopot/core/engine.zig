@@ -26,6 +26,9 @@ pub const Contact = struct {
     bundle: [64]u8 = @splat(0), // enc_pk || sign_pk
     online: bool = false,
     blocked: bool = false,
+    /// Чат удалён (DELETE_CHAT): слот остаётся в массиве (cid стабильны
+    /// до рестарта), но контакт невидим и мёртв для всех операций.
+    deleted: bool = false,
     /// Последний известный адрес host:port (для автодозвона офлайн-контактов).
     addr_buf: [64]u8 = @splat(0),
     addr_len: u8 = 0,
@@ -73,6 +76,8 @@ pub const Events = struct {
     onPresence: ?*const fn (ctx: *anyopaque, from: *const Contact, online: bool, last_seen_ms: i64) void = null,
     /// Профиль пира обновился (эхо PROFILE: имя и avatar_id).
     onProfile: ?*const fn (ctx: *anyopaque, from: *const Contact, name: []const u8, avatar_id: [16]u8) void = null,
+    /// Пир переслал визитную карточку третьего лица (CONTACT_CARD).
+    onContactCard: ?*const fn (ctx: *anyopaque, from: *const Contact, name: []const u8, bundle: [64]u8, addr: []const u8) void = null,
     onCallSignal: ?*const fn (ctx: *anyopaque, from: *const Contact, op: u8, call_id: [16]u8) void = null,
     onCallAudio: ?*const fn (ctx: *anyopaque, from: *const Contact, seq: u32, data: []const u8) void = null,
     onBlockedNotice: ?*const fn (ctx: *anyopaque, from: *const Contact) void = null,
@@ -150,6 +155,11 @@ pub const Engine = struct {
 
     sessions: std.AutoHashMap(i64, *session_mod.Session),
 
+    /// Снятые с карты сессии (мертвы или заменены): close+join+destroy
+    /// делает drainRetired приложения ВНЕ app.mu (join rx-потока под
+    /// спин-локом — deadlock). Сессия сюда попадает ровно один раз.
+    retired: std.ArrayListUnmanaged(*session_mod.Session) = .empty,
+
     // presence: millisecond precision, passive
     last_seen_ms: std.AutoHashMap(i64, i64),
 
@@ -179,10 +189,14 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         var it = self.sessions.valueIterator();
-        while (it.next()) |s| {
-            s.*.close();
-        }
+        while (it.next()) |s| s.*.close();
         self.sessions.deinit();
+        // снятые сессии — собственность движка (никто вне их не держит)
+        for (self.retired.items) |s| {
+            s.close();
+            self.alloc.destroy(s);
+        }
+        self.retired.deinit(self.alloc);
         self.contacts.deinit(self.alloc);
         self.contact_ids.deinit(self.alloc);
         self.last_seen_ms.deinit();
@@ -200,6 +214,22 @@ pub const Engine = struct {
         var sit = self.seen.valueIterator();
         while (sit.next()) |list| list.deinit(self.alloc);
         self.seen.deinit();
+    }
+
+    /// Снять сессию с карты контакта в retired (вызывается ПОД локом
+    /// приложения): транспорт гасится сразу (rx-поток просыпается по
+    /// shutdown и выходит), а close+join+destroy делает drainRetired
+    /// позже — ВНЕ лока. Идемпотентна: чужая/уже снятая сессия игнорируется
+    /// (сравнение указателя — ребинд мог поставить новую).
+    pub fn retireSession(self: *Engine, cid: i64, s: *session_mod.Session) void {
+        const cur = self.sessions.get(cid) orelse return;
+        if (cur != s) return;
+        _ = self.sessions.remove(cid);
+        s.shutdown();
+        self.retired.append(self.alloc, s) catch {
+            // OOM под локом: памяти нет, join запрещён — структурная утечка
+            // лучше зависшего указателя в карте; rx уже разбужден shutdown-ом
+        };
     }
 
     pub fn addContact(self: *Engine, name: []const u8, bundle: [64]u8) !usize {
@@ -529,8 +559,7 @@ pub const Engine = struct {
         self.contacts.items[idx].blocked = true;
         if (self.sessions.get(contact_id)) |s| {
             s.sendEnvelope(.{ .block_notice = .{ .reason = 0 } }) catch {};
-            s.close();
-            _ = self.sessions.remove(contact_id);
+            self.retireSession(contact_id, s);
         }
     }
 
@@ -607,6 +636,12 @@ pub const Engine = struct {
             },
             .ack => |a| {
                 self.outboxAcked(contact_id, a.msg_id, c);
+            },
+            .contact_card => |cc| {
+                // визитная карточка третьего лица: движок только поднимает
+                // событие; добавить этого человека может лишь его инвайт
+                if (self.ev.onContactCard) |cb|
+                    cb(self.ev.ctx, c, cc.name, cc.bundle, cc.addr);
             },
             .profile => |pr| {
                 // эхо: обновляем имя и запоминаемый avatar_id пир-а;

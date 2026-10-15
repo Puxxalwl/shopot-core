@@ -22,7 +22,14 @@ pub const header_len = 16;
 /// Major меняется на несовместимых изменениях провода.
 /// 2.0.0: entities форматирования в SEND_MESSAGE/GET_HISTORY/GET_MESSAGE
 /// и событии MESSAGE_RECEIVED (хвост после body, см. CORE-API.md).
-pub const api_version = [3]u16{ 2, 0, 0 };
+/// 2.1.0: SEARCH_MESSAGE (23) и GLOBAL_SEARCH_MESSAGE (24) — поиск по
+/// истории (регистронезависимый, точные + нечёткие совпадения).
+/// 2.2.0: закрепления и удаление чатов (PIN_CHAT/GET_PINNED_CHAT/UNPIN_CHAT/
+/// DELETE_CHAT/PIN_MESSAGE/UNPIN_MESSAGE/GET_PINNED_MESSAGES), пересылка
+/// визитки (SEND_CONTACT + событие CONTACT_CARD); bit1 delivered в истории
+/// теперь ставится только ACK-ом; GET_HISTORY/GET_MESSAGE/SEARCH читают
+/// кэш истории в памяти.
+pub const api_version = [3]u16{ 2, 2, 0 };
 
 /// Тип кадра.
 pub const Kind = enum(u8) {
@@ -80,6 +87,30 @@ pub const Method = enum(u16) {
     CONNECT = 21,
     /// Слушать входящие подключения для контакта (обычно не нужно).
     LISTEN = 22,
+    /// Поиск сообщений контакта по подстроке (без учёта регистра;
+    /// точные и нечёткие совпадения, см. CORE-API.md).
+    SEARCH_MESSAGE = 23,
+    /// То же, но по всем чатам (записи ответа несут cid).
+    GLOBAL_SEARCH_MESSAGE = 24,
+    /// Закрепить чат (один закреплённый чат на ядро): [cid u32].
+    PIN_CHAT = 25,
+    /// Закреплённый чат: ответ [cid u32] (0 — не закреплено).
+    GET_PINNED_CHAT = 26,
+    /// Снять закрепление чата (идемпотентно).
+    UNPIN_CHAT = 27,
+    /// Удалить чат: контакт, история, очередь — всё. Ответ пуст.
+    /// Повторное знакомство (новый инвайт) создаст чат заново с чистой историей.
+    DELETE_CHAT = 28,
+    /// Переслать контакту визитную карточку: [to_cid u32][contact_cid u32
+    /// (0 = моя собственная)]. Получателю уходит событие CONTACT_CARD.
+    SEND_CONTACT = 29,
+    /// Закрепить сообщение в чате: [cid u32][msg_id 16] (≤ 16 на чат).
+    PIN_MESSAGE = 30,
+    /// Открепить сообщение: [cid u32][msg_id 16] (идемпотентно).
+    UNPIN_MESSAGE = 31,
+    /// Закреплённые сообщения чата: [cid u32] → [count u32] × {[msg_id 16]}
+    /// в порядке закрепления.
+    GET_PINNED_MESSAGES = 32,
 };
 
 /// Коды статуса ответа (u16 на проводе, имена SCREAMING_SNAKE — контракт;
@@ -149,6 +180,10 @@ pub const Event = enum(u16) {
     /// Файл передан целиком (все чанки подтверждены FILE_ACK):
     /// [cid u32][file_id 16][size u32][name str16].
     FILE_SENT = 11,
+    /// Пир переслал визитную карточку третьего лица (SEND_CONTACT у него):
+    /// [cid u32 (кто прислал)][name str16][bundle 64][addr str16
+    /// (пусто = неизвестен)].
+    CONTACT_CARD = 12,
 };
 
 /// Состояние звонка для события CALL_STATE.
@@ -350,6 +385,24 @@ test "header rejects bad magic and version" {
     encodeHeader(&buf, .{ .kind = .request, .id = 1, .request_id = 0, .status = .OK, .payload_len = 0 });
     buf[2] = 9;
     try std.testing.expect(decodeHeader(&buf) == null);
+}
+
+test "method ids стабильны (контракт провода)" {
+    // SEARCH_MESSAGE/GLOBAL_SEARCH_MESSAGE — добавлены в 2.1.0; id
+    // зафиксированы навсегда (как и остальные методы).
+    try std.testing.expectEqual(@as(u16, 23), @backingInt(Method.SEARCH_MESSAGE));
+    try std.testing.expectEqual(@as(u16, 24), @backingInt(Method.GLOBAL_SEARCH_MESSAGE));
+    // закрепления/удаление/визитки — 2.2.0
+    try std.testing.expectEqual(@as(u16, 25), @backingInt(Method.PIN_CHAT));
+    try std.testing.expectEqual(@as(u16, 26), @backingInt(Method.GET_PINNED_CHAT));
+    try std.testing.expectEqual(@as(u16, 27), @backingInt(Method.UNPIN_CHAT));
+    try std.testing.expectEqual(@as(u16, 28), @backingInt(Method.DELETE_CHAT));
+    try std.testing.expectEqual(@as(u16, 29), @backingInt(Method.SEND_CONTACT));
+    try std.testing.expectEqual(@as(u16, 30), @backingInt(Method.PIN_MESSAGE));
+    try std.testing.expectEqual(@as(u16, 31), @backingInt(Method.UNPIN_MESSAGE));
+    try std.testing.expectEqual(@as(u16, 32), @backingInt(Method.GET_PINNED_MESSAGES));
+    // событие CONTACT_CARD — 2.2.0
+    try std.testing.expectEqual(@as(u16, 12), @backingInt(Event.CONTACT_CARD));
 }
 
 test "reader/writer round-trip" {
