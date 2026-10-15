@@ -15,19 +15,18 @@ const store_mod = shopot.store.log;
 const interfaces = shopot.core.interfaces;
 const invite_mod = @import("invite.zig");
 const discover_mod = @import("discover.zig");
-const tui_mod = @import("tui.zig");
 const audio_mod = @import("audio.zig");
 const adpcm_mod = @import("adpcm.zig");
-const cli_srv = @import("cli_server.zig");
-const cli_mod = cli_srv;
+const api_srv = @import("api_server.zig");
+const api = @import("api.zig");
 
 const usage =
     \\shopot-zig — ядро шифрованного мессенджера (std-only Zig).
-    \\Клиенты подключаются через UDS-апи ($HOME/.shopot/api.sock),
-    \\интерактивного CLI нет. Справка по API — docs/CORE-API.md.
+    \\Клиенты (GUI) подключаются через бинарное UDS-апи
+    \\($HOME/.shopot/api.sock). Спецификация — docs/CORE-API.md.
     \\
     \\  init    создать личность (~/.shopot/zig-seed, 0600)
-    \\  id      показать bundle и отпечаток
+    \\  relay   режим IP-скрывающего релея (для сервера)
     \\  serve   демон: ядро + UDS-апи (см. docs/CORE-API.md)
 ;
 const app_home_max = 512;
@@ -76,20 +75,6 @@ pub fn toHex(out: []u8, bytes: []const u8) ![]u8 {
     return out[0..n];
 }
 
-fn parseHex16(hex: []const u8) ![16]u8 {
-    if (hex.len != 32) return error.BadHex;
-    var out: [16]u8 = undefined;
-    for (0..16) |i| out[i] = try std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 2], 16);
-    return out;
-}
-
-fn parseHex64(hex: []const u8) ![64]u8 {
-    if (hex.len != 128) return error.BadHex;
-    var out: [64]u8 = undefined;
-    for (0..64) |i| out[i] = try std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 2], 16);
-    return out;
-}
-
 // ------------------------------------------------------------------ call
 /// Активный звонок: одна линия на процесс (v1), состояние под app.mu.
 const CallState = struct {
@@ -134,15 +119,8 @@ pub const App = struct {
     call: ?*CallState = null,
     call_pcm_dir: ?[]const u8 = null,
     listen_port: u16 = 7777,
-    // переписки по контактам (TUI): threads[cid-1], heap-массив
-    threads: []tui_mod.Thread = &.{},
-    sel: usize = 0, // выбранный чат (индекс контакта)
-    tz: i32 = 0, // смещение локальной TZ, сек
-    tui: bool = false,
-    // ---- UDS-апи (единственный интерфейс для клиентов) ----
-    cli: ?*cli_srv.Server = null, // сервер (включён, когда != null)
-    cli_out: ?*cli_srv.Conn = null, // кому fb отдаёт ответы команд (под cli_mu)
-    cli_mu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // приёмник fb-ответов
+    // ---- UDS-апи (единственный интерфейс для GUI-клиента) ----
+    cli: ?*api_srv.Server = null, // сервер (включён, когда != null)
 
     // ---- Односторонние инвайты (v2) ----
     /// Выданные приглашения: секрет ждёт предъявителя JOIN-конвертом.
@@ -169,14 +147,6 @@ pub const App = struct {
         self.mu.store(false, .release);
     }
 
-    /// Спин-лок cli_mu — приёмника ответов fb (тот же паттерн, что у mu).
-    pub fn cliLock(self: *App) void {
-        while (self.cli_mu.swap(true, .acquire)) std.Thread.yield() catch {};
-    }
-    pub fn cliUnlock(self: *App) void {
-        self.cli_mu.store(false, .release);
-    }
-
     /// Время — прямой syscall: НЕ трогаем io, чтобы не конкурировать
     /// с сетевыми операциями из других потоков (Threaded io).
     fn nowMs(self: *App) i64 {
@@ -184,21 +154,6 @@ pub const App = struct {
         var ts: std.os.linux.timespec = undefined;
         _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
         return @as(i64, @intCast(ts.sec)) * 1000 + @as(i64, @intCast(@divTrunc(ts.nsec, std.time.ns_per_ms)));
-    }
-
-    /// Добавить строку переписки контакта idx (ВЫЗЫВАТЬ ПОД локом).
-    fn msgLineLocked(self: *App, idx: usize, kind: tui_mod.Kind, name: []const u8, txt: []const u8) void {
-        if (idx >= self.threads.len) return;
-        self.threads[idx].push(self.nowMs(), kind, name, txt);
-        if (idx != self.sel) self.threads[idx].unread += 1;
-    }
-
-    /// Служебная строка в чат контакта idx (ВЫЗЫВАТЬ ПОД локом).
-    fn sysLineLocked(self: *App, idx: ?usize, txt: []const u8) void {
-        const i = idx orelse self.sel;
-        if (i >= self.threads.len) return;
-        self.threads[i].push(self.nowMs(), .sys, "", txt);
-        if (i != self.sel) self.threads[i].unread += 1;
     }
 
     /// Привязать сессию к контакту. sc — контекст событий, уже создан и
@@ -229,9 +184,114 @@ pub const App = struct {
     }
 
     fn events(self: *App) engine_mod.Events {
-        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv, .onAvatar = onAvatarEv, .onAvatarReq = onAvatarReqEv, .onFileMeta = onFileMetaEv, .onFileData = onFileDataEv };
+        return .{ .ctx = self, .onText = onTextEv, .onReaction = onReactionEv, .onPresence = onPresenceEv, .onProfile = onProfileEv, .onBlockedNotice = onBlockedEv, .onCallSignal = onCallSignalEv, .onCallAudio = onCallAudioEv, .onDelivered = onDeliveredEv, .onAvatar = onAvatarEv, .onAvatarReq = onAvatarReqEv, .onFileMeta = onFileMetaEv, .onFileData = onFileDataEv };
     }
 };
+
+// ------------------------------------------------- события API (клиентам)
+// Все evXxx собирают бинарный payload и рассылают его всем подключённым
+// GUI-клиентам. ВЫЗЫВАТЬ ПОД app.mu: список conns живёт под этим локом.
+
+/// MESSAGE_RECEIVED: входящее сообщение контакта.
+fn evMessageReceived(app: *App, cid: i64, msg_id: [16]u8, ts_ms: i64, name: []const u8, body: []const u8) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putBytes(&msg_id) catch return;
+    w.putU64(@intCast(ts_ms)) catch return;
+    w.putStr16(name) catch return;
+    w.putStr16(body) catch return;
+    api_srv.fanoutEventLocked(app, .MESSAGE_RECEIVED, w.items());
+}
+
+/// MESSAGE_DELIVERED: ACK — сообщение дошло до устройства пира.
+fn evMessageDelivered(app: *App, cid: i64, msg_id: [16]u8) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putBytes(&msg_id) catch return;
+    api_srv.fanoutEventLocked(app, .MESSAGE_DELIVERED, w.items());
+}
+
+/// PRESENCE: контакт на связи / пропал.
+fn evPresence(app: *App, cid: i64, online: bool, last_seen_ms: i64) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putU8(@intFromBool(online)) catch return;
+    w.putI64(last_seen_ms) catch return;
+    api_srv.fanoutEventLocked(app, .PRESENCE, w.items());
+}
+
+/// REACTION: реакция пира на сообщение (op: react_add/react_remove).
+fn evReaction(app: *App, cid: i64, msg_id: [16]u8, op: u8, code: u32, ts_ms: i64) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putBytes(&msg_id) catch return;
+    w.putU8(op) catch return;
+    w.putU32(code) catch return;
+    w.putU64(@intCast(ts_ms)) catch return;
+    api_srv.fanoutEventLocked(app, .REACTION, w.items());
+}
+
+/// CALL_STATE: перемена состояния звонка.
+fn evCallState(app: *App, cid: i64, call_id: [16]u8, state: api.CallState) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putBytes(&call_id) catch return;
+    w.putU8(@backingInt(state)) catch return;
+    api_srv.fanoutEventLocked(app, .CALL_STATE, w.items());
+}
+
+/// AVATAR_RECEIVED: байты аватара пира (клиент кэширует по avatar_id).
+fn evAvatarReceived(app: *App, cid: i64, avatar_id: [16]u8, data: []const u8) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putBytes(&avatar_id) catch return;
+    w.putStr16(data) catch return;
+    api_srv.fanoutEventLocked(app, .AVATAR_RECEIVED, w.items());
+}
+
+/// FILE_RECEIVED: файл принят целиком (байты в ~/.shopot/files).
+fn evFileReceived(app: *App, cid: i64, file_id: [16]u8, size: u32, name: []const u8) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putBytes(&file_id) catch return;
+    w.putU32(size) catch return;
+    w.putStr16(name) catch return;
+    api_srv.fanoutEventLocked(app, .FILE_RECEIVED, w.items());
+}
+
+/// CONTACT_JOINED: держатель кода погасил наш инвайт.
+fn evContactJoined(app: *App, cid: i64, name: []const u8) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putStr16(name) catch return;
+    api_srv.fanoutEventLocked(app, .CONTACT_JOINED, w.items());
+}
+
+/// CONTACT_PROFILE: имя/avatar_id контакта обновились (эхо PROFILE).
+fn evContactProfile(app: *App, cid: i64, name: []const u8, avatar_id: [16]u8) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putStr16(name) catch return;
+    w.putBytes(&avatar_id) catch return;
+    api_srv.fanoutEventLocked(app, .CONTACT_PROFILE, w.items());
+}
+
+/// BLOCKED_BY_PEER: пир заблокировал нас.
+fn evBlockedByPeer(app: *App, cid: i64) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    api_srv.fanoutEventLocked(app, .BLOCKED_BY_PEER, w.items());
+}
 
 /// Выданное одностороннее приглашение (реестр в App.invites).
 const InviteReg = struct {
@@ -346,17 +406,11 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
         sess.close();
         return;
     }
-    var msg: [96]u8 = undefined;
     app.lock();
     defer app.unlock();
-    const line = std.fmt.bufPrint(&msg, "контакт {s} подключился по инвайту (id {d})", .{ app.eng.contacts.items[@intCast(cid - 1)].getName(), cid }) catch return;
-    if (app.tui) {
-        app.sysLineLocked(@intCast(cid - 1), line);
-    } else {
-        std.debug.print("\n<< {s}\n> ", .{line});
-    }
-    cli_srv.fanoutSysLocked(app, cid, "", line);
-    cli_srv.fanoutPresenceLocked(app, cid, "", true);
+    const name = app.eng.contacts.items[@intCast(cid - 1)].getName();
+    evContactJoined(app, cid, name);
+    evPresence(app, cid, true, app.nowMs());
 }
 
 fn onClosed(ctx: *anyopaque) void {
@@ -372,25 +426,14 @@ fn contactIndexOf(app: *App, from: *const engine_mod.Contact) ?usize {
 }
 
 fn onTextEv(ctx: *anyopaque, from: *const engine_mod.Contact, msg_id: [16]u8, _: i64, body: []const u8) void {
-    var hex_buf: [32]u8 = undefined;
-    var hx: []const u8 = "?";
-    _ = toHex(&hex_buf, &msg_id) catch {};
-    hx = hex_buf[0..];
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
     const now = app.nowMs();
     persistMsg(app, @intCast(idx + 1), false, msg_id, true, now, body);
-    // машиночитаемое событие: imsg <cid> <имя> <msg_id_hex> <ts> <текст>
-    cli_srv.fanoutImsgLocked(app, @intCast(idx + 1), from.getName(), msg_id, now, body);
-    if (app.tui) {
-        app.msgLineLocked(idx, .theirs, from.getName(), body);
-    } else {
-        std.debug.print("\n<< [{s}] {s}  (msg {s})\n> ", .{ from.getName(), body, hx });
-    }
-    cli_srv.fanoutMsgLocked(app, @intCast(idx + 1), from.getName(), body);
+    evMessageReceived(app, @intCast(idx + 1), msg_id, now, from.getName(), body);
 }
 
-/// Получен аватар: кэш (память + лог), фанаут события avatar <cid> <id_hex>.
+/// Получен аватар: кэш (память + лог) + событие AVATAR_RECEIVED.
 fn onAvatarEv(ctx: *anyopaque, from: *const engine_mod.Contact, avatar_id: [16]u8, data: []const u8) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
@@ -409,18 +452,7 @@ fn onAvatarEv(ctx: *anyopaque, from: *const engine_mod.Contact, avatar_id: [16]u
             _ = log.append(.avatar, buf[0 .. 18 + data.len]) catch {};
         }
     }
-    var hxb: [32]u8 = undefined;
-    const hx = toHex(&hxb, &avatar_id) catch return;
-    var line: [96]u8 = undefined;
-    const t = std.fmt.bufPrint(&line, "аватар {s}: {d} байт", .{ from.getName(), data.len }) catch return;
-    if (app.tui) {
-        app.sysLineLocked(idx, t);
-    } else {
-        std.debug.print("\n<< {s}\n> ", .{t});
-    }
-    var ml: [64]u8 = undefined;
-    const mt = std.fmt.bufPrint(&ml, "avatar {s}", .{hx}) catch return;
-    cli_srv.fanoutSysLocked(app, @intCast(idx + 1), from.getName(), mt);
+    evAvatarReceived(app, @intCast(idx + 1), avatar_id, data);
 }
 
 /// FILE_META: начать приём файла (состояние под app.mu).
@@ -469,18 +501,8 @@ fn onFileDataEv(ctx: *anyopaque, from: *const engine_mod.Contact, data: envelope
     }
     // лог kind FILE — перезапрос после рестарта не нужен
     persistFileMeta(app, @intCast(cid), data.file_id, rx.size, rx.name());
-    var hxb: [32]u8 = undefined;
-    const hx = toHex(&hxb, &data.file_id) catch {
-        dropRxFile(app, data.file_id);
-        return;
-    };
-    var line: [192]u8 = undefined;
-    const t = std.fmt.bufPrint(&line, "file {d} {s} {d} {s}", .{ cid, hx, rx.size, rx.name() }) catch {
-        dropRxFile(app, data.file_id);
-        return;
-    };
+    evFileReceived(app, cid, data.file_id, rx.size, rx.name());
     dropRxFile(app, data.file_id);
-    cli_srv.fanoutSysLocked(app, cid, "file", t);
 }
 
 fn dropRxFile(app: *App, file_id: [16]u8) void {
@@ -548,56 +570,34 @@ fn onAvatarReqEv(ctx: *anyopaque, from: *const engine_mod.Contact, avatar_id: [1
 fn onDeliveredEv(ctx: *anyopaque, from: *const engine_mod.Contact, msg_id: [16]u8) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
-    var hex_buf: [32]u8 = undefined;
-    const hx = toHex(&hex_buf, &msg_id) catch return;
-    var line: [64]u8 = undefined;
-    const t = std.fmt.bufPrint(&line, "доставлено: {s}", .{hx}) catch return;
-    if (app.tui) {
-        app.sysLineLocked(idx, t);
-    } else {
-        std.debug.print("\n<< {s}\n> ", .{t});
-    }
     const cid: i64 = @intCast(idx + 1);
     persistOutboxAck(app, cid, msg_id);
-    cli_srv.fanoutSysLocked(app, cid, from.getName(), t);
+    evMessageDelivered(app, cid, msg_id);
 }
 
 fn onReactionEv(ctx: *anyopaque, from: *const engine_mod.Contact, r: engine_mod.Reaction) void {
-    var hex_buf: [32]u8 = undefined;
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
-    var glyph: [4]u8 = undefined;
-    const glyph_len = std.unicode.utf8Encode(@intCast(r.code), &glyph) catch 0;
-    var line: [160]u8 = undefined;
-    const t = std.fmt.bufPrint(&line, "реакция {s} (U+{X:0>4}) на {s}", .{ glyph[0..glyph_len], r.code, toHex(&hex_buf, &r.msg_id) catch "?" }) catch return;
-    if (app.tui) {
-        app.sysLineLocked(idx, t);
-    } else {
-        std.debug.print("\n<< [{s}] {s}\n> ", .{ from.getName(), t });
-    }
     persistReact(app, @intCast(idx + 1), false, r.msg_id, r.code, app.nowMs());
-    // машиночитаемое событие для UDS-клиентов: react <msg_id_hex> <codepoint>
-    var ml: [64]u8 = undefined;
-    const mt = std.fmt.bufPrint(&ml, "react {s} {d}", .{ toHex(&hex_buf, &r.msg_id) catch "?", r.code }) catch return;
-    cli_srv.fanoutSysLocked(app, @intCast(idx + 1), from.getName(), mt);
+    evReaction(app, @intCast(idx + 1), r.msg_id, r.op, r.code, app.nowMs());
 }
 
-fn onPresenceEv(ctx: *anyopaque, from: *const engine_mod.Contact, online: bool, _: i64) void {
+fn onPresenceEv(ctx: *anyopaque, from: *const engine_mod.Contact, online: bool, last_seen_ms: i64) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
-    if (app.tui) {
-        app.sysLineLocked(idx, if (online) "• online" else "• offline");
-    } else {
-        std.debug.print("\n<< [{s}] {s}\n> ", .{ from.getName(), if (online) "online" else "offline" });
-    }
-    cli_srv.fanoutPresenceLocked(app, @intCast(idx + 1), from.getName(), online);
+    evPresence(app, @intCast(idx + 1), online, last_seen_ms);
+}
+
+fn onProfileEv(ctx: *anyopaque, from: *const engine_mod.Contact, name: []const u8, avatar_id: [16]u8) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const idx = contactIndexOf(app, from) orelse return;
+    evContactProfile(app, @intCast(idx + 1), name, avatar_id);
 }
 
 fn onBlockedEv(ctx: *anyopaque, from: *const engine_mod.Contact) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
-    std.debug.print("\n<< [{s}] заблокировал вас\n> ", .{from.getName()});
-    cli_srv.fanoutSysLocked(app, @intCast(idx + 1), from.getName(), "заблокировал вас");
+    evBlockedByPeer(app, @intCast(idx + 1));
 }
 
 // ------------------------------------------------------------- звонки
@@ -605,7 +605,6 @@ fn onBlockedEv(ctx: *anyopaque, from: *const engine_mod.Contact) void {
 fn onCallSignalEv(ctx: *anyopaque, from: *const engine_mod.Contact, op: u8, call_id: [16]u8) void {
     // ВЫЗЫВАЕТСЯ ПОД app.mu (из envIn) — второго захвата быть не должно.
     const app: *App = @ptrCast(@alignCast(ctx));
-    const idx = contactIndexOf(app, from);
     switch (op) {
         audio_mod.CallOp.offer => {
             if (app.call) |c| {
@@ -619,40 +618,24 @@ fn onCallSignalEv(ctx: *anyopaque, from: *const engine_mod.Contact, op: u8, call
             const secret = if (app.eng.sessions.get(cid)) |sess| sess.callSecret(call_id) else zero_secret;
             c.* = .{ .cid = cid, .call_id = call_id, .secret = secret };
             app.call = c;
-            cli_srv.fanoutCallLocked(app, cid, "offer", call_id);
-            if (app.tui) {
-                var line: [128]u8 = undefined;
-                const t = std.fmt.bufPrint(&line, "входящий звонок — a: принять, h: отклонить", .{}) catch return;
-                app.sysLineLocked(idx, t);
-            } else {
-                std.debug.print("\n<< входящий звонок от {s}: answer {d} — принять, hangup — отклонить\n> ", .{ from.getName(), cid });
-            }
-            cli_srv.fanoutSysLocked(app, cid, from.getName(), "входящий звонок — answer принять, hangup отклонить");
+            evCallState(app, cid, call_id, .offer);
         },
         audio_mod.CallOp.accept => {
             const c = app.call orelse return;
             if (!std.mem.eql(u8, &c.call_id, &call_id)) return;
             startCallAudio(app, c);
-            cli_srv.fanoutCallLocked(app, c.cid, "accept", call_id);
-            if (app.tui) {
-                var line: [96]u8 = undefined;
-                const t = std.fmt.bufPrint(&line, "линия открыта", .{}) catch return;
-                app.sysLineLocked(idx, t);
-            } else {
-                std.debug.print("\n<< {s} ответил, линия открыта\n> ", .{from.getName()});
-            }
-            cli_srv.fanoutSysLocked(app, c.cid, from.getName(), "линия открыта");
+            evCallState(app, c.cid, call_id, .accept);
         },
         audio_mod.CallOp.reject => {
             const c = app.call orelse return;
             if (!std.mem.eql(u8, &c.call_id, &call_id)) return;
-            cli_srv.fanoutCallLocked(app, c.cid, "reject", call_id);
-            endCallLocked(app, "отклонён", call_id);
+            evCallState(app, c.cid, call_id, .reject);
+            endCallLocked(app, call_id);
         },
         audio_mod.CallOp.hangup => {
             const c = app.call orelse return;
             if (!std.mem.eql(u8, &c.call_id, &call_id)) return;
-            endCallLocked(app, "повесил трубку", call_id);
+            endCallLocked(app, call_id);
         },
         else => {},
     }
@@ -707,9 +690,6 @@ fn contactIdByBundle(app: *App, bundle: [64]u8) ?i64 {
 
 /// Открыть аудио (fifo) и запустить поток захвата микрофона.
 fn startCallAudio(app: *App, c: *CallState) void {
-    if (app.tui) {
-        app.sysLineLocked(@intCast(c.cid - 1), "звук: aplay < ~/.shopot/pcm/spk · arecord > ~/.shopot/pcm/mic");
-    }
     if (c.pcm != null) return;
     c.up = true;
     // fifo в ~/.shopot/pcm — файл создаётся при старте чата
@@ -746,7 +726,7 @@ fn micLoop(app: *App) void {
         // seq u32 в кадре CALL_AUDIO: на максимуме ключ/nonce кадра начали бы
         // повторяться — обрываем звонок раньше (практически недостижимо: ~99 суток)
         if (frame_seq == std.math.maxInt(u32)) {
-            endCallLocked(app, "достигнут предел длины звонка", c.call_id);
+            endCallLocked(app, c.call_id);
             continue;
         }
         // DTX: тишину не шлём (каждый 25-й кадр — keepalive, чтобы пир знал:
@@ -818,7 +798,7 @@ fn isZero(b: []const u8) bool {
 }
 
 /// Завершить звонок: остановить поток, закрыть аудио, освободить состояние.
-fn endCallLocked(app: *App, why: []const u8, call_id: [16]u8) void {
+fn endCallLocked(app: *App, call_id: [16]u8) void {
     const c = app.call orelse return;
     app.call = null; // micLoop видит null и выходит без обращений к c
     c.stop_flag.store(true, .release);
@@ -831,17 +811,7 @@ fn endCallLocked(app: *App, why: []const u8, call_id: [16]u8) void {
     if (c.pcm) |*p| p.deinit();
     const cid = c.cid;
     app.alloc.destroy(c);
-    if (app.tui) {
-        app.sysLineLocked(@intCast(cid - 1), why);
-    } else {
-        std.debug.print("\n<< звонок: {s}\n> ", .{why});
-    }
-    const cname = if (app.eng.contacts.items.len >= @as(usize, @intCast(cid)))
-        app.eng.contacts.items[@intCast(cid - 1)].getName()
-    else
-        "?";
-    cli_srv.fanoutSysLocked(app, cid, cname, why);
-    cli_srv.fanoutCallLocked(app, cid, "end", call_id);
+    evCallState(app, cid, call_id, .end);
 }
 
 fn wrapConn(ctx: *anyopaque, raw: interfaces.Conn, keys: shopot.crypto.handshake.SessionKeys, alloc: std.mem.Allocator) anyerror!interfaces.Conn {
@@ -885,58 +855,57 @@ fn tickerLoop(app: *App) void {
     }
 }
 
-fn cmdCall(app: *App, args: []const u8) !void {
-    const cid = try std.fmt.parseInt(i64, std.mem.trim(u8, args, " "), 10);
+/// START_CALL: инициировать звонок. Ответ: [call_id 16].
+fn apiStartCall(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME; // лишние байты запрещены
     app.lock();
-    if (app.call != null) return error.Busy;
-    const sess = app.eng.sessions.get(cid) orelse {
-        app.unlock();
-        return error.NoSession;
-    };
+    defer app.unlock();
+    if (app.call != null) return .BUSY;
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    const sess = app.eng.sessions.get(@intCast(cid)) orelse return .NO_SESSION;
     var call_id: [16]u8 = undefined;
     app.io.random(&call_id);
-    const c = try app.alloc.create(CallState);
-    c.* = .{ .cid = cid, .call_id = call_id, .secret = sess.callSecret(call_id), .start_ms = app.nowMs() };
+    const c = app.alloc.create(CallState) catch return .INTERNAL;
+    c.* = .{ .cid = @intCast(cid), .call_id = call_id, .secret = sess.callSecret(call_id), .start_ms = app.nowMs() };
     app.call = c;
-    _ = app.eng.callSignal(cid, audio_mod.CallOp.offer, call_id) catch {
+    _ = app.eng.callSignal(@intCast(cid), audio_mod.CallOp.offer, call_id) catch {
         app.alloc.destroy(c);
         app.call = null;
-        app.unlock();
-        return error.NoSession;
+        return .NO_SESSION;
     };
-    cli_srv.fanoutCallLocked(app, cid, "offer", call_id);
-    app.unlock();
-    if (app.tui) {
-        app.lock();
-        app.sysLineLocked(@intCast(cid - 1), "вызываю... (h — отмена)");
-        app.unlock();
-    } else {
-        std.debug.print("<< вызываю... (answer после ответа, hangup — отмена)\n> ", .{});
-    }
+    evCallState(app, @intCast(cid), call_id, .offer);
+    w.putBytes(&call_id) catch return .INTERNAL;
+    return .OK;
 }
 
-fn cmdAnswer(app: *App) !void {
+/// ANSWER_CALL: принять входящий. Payload пуст, ответ пуст.
+fn apiAnswerCall(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    if (payload.len != 0) return .BAD_FRAME;
     app.lock();
     defer app.unlock();
-    const c = app.call orelse return error.NoCall;
-    if (c.up) return;
+    const c = app.call orelse return .NO_CALL;
+    if (c.up) return .OK; // уже в разговоре — идемпотентно
     if (c.start_ms == 0) c.start_ms = app.nowMs();
-    _ = app.eng.callSignal(c.cid, audio_mod.CallOp.accept, c.call_id) catch return error.NoSession;
+    _ = app.eng.callSignal(c.cid, audio_mod.CallOp.accept, c.call_id) catch return .NO_SESSION;
     startCallAudio(app, c);
-    cli_srv.fanoutCallLocked(app, c.cid, "accept", c.call_id);
-    if (app.tui) {
-        app.sysLineLocked(@intCast(c.cid - 1), "линия открыта");
-    } else {
-        std.debug.print("<< линия открыта\n> ", .{});
-    }
+    evCallState(app, c.cid, c.call_id, .accept);
+    return .OK;
 }
 
-fn cmdHangup(app: *App) !void {
+/// END_CALL: завершить/отклонить. Payload пуст, ответ пуст.
+fn apiEndCall(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    if (payload.len != 0) return .BAD_FRAME;
     app.lock();
     defer app.unlock();
-    const c = app.call orelse return error.NoCall;
-    _ = app.eng.callSignal(c.cid, audio_mod.CallOp.hangup, c.call_id) catch {};
-    endCallLocked(app, "вы повесили трубку", c.call_id);
+    const c = app.call orelse return .NO_CALL;
+    const call_id = c.call_id;
+    _ = app.eng.callSignal(c.cid, audio_mod.CallOp.hangup, call_id) catch {};
+    endCallLocked(app, call_id);
+    return .OK;
 }
 
 // ------------------------------------------------- автоподключение (LAN)
@@ -1250,21 +1219,20 @@ fn relayLinkerLoop(app: *App, secret: [16]u8, addr: []const u8) void {
     }
 }
 
-fn cmdInvite(app: *App, args: []const u8) !void {
-    var it = std.mem.tokenizeAny(u8, args, " ");
-    const name = it.next() orelse "shopot";
-    var addr = it.next();
-    // relay-форма: invite <имя> relay <host:port> — держатель держит
-    // регистрацию на релее, подключающийся не видит наш IP
-    var is_relay = false;
-    if (addr) |a| {
-        if (std.mem.eql(u8, a, "relay")) {
-            addr = it.next();
-            if (addr == null) return error.BadArgs;
-            is_relay = true;
-        }
-    }
-    // односторонний v2-код: держатель добавляется ONE add-ом
+/// CREATE_INVITE: payload [flags u8 (bit0 = relay)][name str16][addr str16].
+/// Ответ: [code str16] — односторонний инвайт-код (URL shopot://i/...).
+fn apiCreateInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const flags = r.readU8() catch return .BAD_FRAME;
+    const is_relay = flags & 1 != 0;
+    const name_in = r.readStr16() catch return .BAD_FRAME;
+    const addr_in = r.readStr16() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (name_in.len > invite_mod.max_name) return .BAD_ARGS;
+    if (is_relay and addr_in.len == 0) return .BAD_ARGS;
+    if (addr_in.len > 64) return .BAD_ARGS;
+    const name: []const u8 = if (name_in.len == 0) "shopot" else name_in;
+    // односторонний v2-код: держатель добавляется ONE accept-ом
     var secret: [invite_mod.secret_len]u8 = undefined;
     app.io.random(&secret);
     {
@@ -1277,59 +1245,56 @@ fn cmdInvite(app: *App, args: []const u8) !void {
                 break;
             }
         }
-        const i = slot orelse return error.TooManyInvites;
+        const i = slot orelse return .TOO_MANY_INVITES;
         app.invites[i] = .{ .secret = secret, .created_ms = app.nowMs(), .used = false };
     }
     var out: [256]u8 = undefined;
     var rbuf: [80]u8 = undefined;
     const code_addr: ?[]const u8 = if (is_relay) blk: {
-        if (addr == null) return error.BadArgs;
-        const r = std.fmt.bufPrint(&rbuf, "r/{s}", .{addr.?}) catch return error.BadArgs;
-        break :blk r;
-    } else addr;
-    const code = try invite_mod.encode2(&out, app.id.bundle(), secret, name, code_addr);
-    fb(app, null, code);
-    fb(app, null, "односторонний код: отдай его — держатель сделает add, больше ничего не нужно");
+        const s = std.fmt.bufPrint(&rbuf, "r/{s}", .{addr_in}) catch return .BAD_ARGS;
+        break :blk s;
+    } else if (addr_in.len > 0) addr_in else null;
+    const code = invite_mod.encode2(&out, app.id.bundle(), secret, name, code_addr) catch return .BAD_ARGS;
+    w.putStr16(code) catch return .INTERNAL;
     if (is_relay) {
-        if (addr) |a| {
-            if (std.Thread.spawn(.{}, relayLinkerLoop, .{ app, secret, a })) |t| {
-                t.detach();
-            } else |_| {}
+        const addr_copy = app.alloc.dupe(u8, addr_in) catch return .INTERNAL;
+        if (std.Thread.spawn(.{}, relayLinkerLoop, .{ app, secret, addr_copy })) |t| {
+            t.detach();
+        } else |_| {
+            app.alloc.free(addr_copy);
         }
     }
+    return .OK;
 }
 
-fn cmdAdd(app: *App, args: []const u8) !void {
-    var trimmed = std.mem.trim(u8, args, " ");
-    var name: []const u8 = "";
-    var bundle: [64]u8 = undefined;
+/// ACCEPT_INVITE: payload [code str16][my_name str16]. Единственное действие
+/// держателя кода. Ответ: [cid u32]. Подключение (если адрес в коде) —
+/// асинхронно: статус виден по событиям PRESENCE.
+fn apiAcceptInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const code = r.readStr16() catch return .BAD_FRAME;
+    const my_name_in = r.readStr16() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (code.len == 0) return .BAD_INVITE_CODE;
+    if (my_name_in.len > invite_mod.max_name) return .BAD_ARGS;
+    const my_name: []const u8 = if (my_name_in.len == 0) "друг" else my_name_in;
+    if (!std.mem.startsWith(u8, code, invite_mod.v2_prefix) and
+        !std.mem.startsWith(u8, code, "shopot1.")) return .BAD_INVITE_CODE;
+    const inv = invite_mod.decode(code) catch return .BAD_INVITE_CODE;
+    const name = inv.name();
+    const bundle = inv.bundle;
     var addr_buf: [80]u8 = undefined;
     var addr: ?[]const u8 = null;
-    // моё имя для JOIN (видит приглашающий): хвост после кода
-    var my_name: []const u8 = "друг";
-    var join_after: ?JoinInfo = null;
-    // v2+relay: адрес в коде — релей, диал через marker-спаривание
-    var relay_secret: ?[16]u8 = null;
-    if (std.mem.indexOfScalar(u8, trimmed, ' ')) |sp| {
-        if (std.mem.startsWith(u8, trimmed, invite_mod.v2_prefix)) {
-            my_name = std.mem.trim(u8, trimmed[sp + 1 ..], " ");
-            if (my_name.len == 0 or my_name.len > 32) return error.BadArgs;
-            trimmed = trimmed[0..sp];
-        }
+    // inv.addr() — только хост: порт живёт отдельно, собираем "host:port"
+    if (inv.host_len > 0) {
+        addr = std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ inv.addr().?, inv.port }) catch return .BAD_ARGS;
     }
-    if (std.mem.startsWith(u8, trimmed, invite_mod.v2_prefix) or std.mem.startsWith(u8, trimmed, "shopot1.")) {
-        const inv = try invite_mod.decode(trimmed);
-        name = inv.name();
-        bundle = inv.bundle;
-        // inv.addr() — только хост: порт живёт отдельно, собираем "host:port"
-        if (inv.host_len > 0) {
-            addr = std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ inv.addr().?, inv.port }) catch return error.BadArgs;
-        }
-        // v2: держатель кода — JOIN первым конвертом после рукопожатия
-        if (inv.v2) {
-            if (inv.relay) relay_secret = inv.secret;
-        }
-        if (inv.v2) join_after = .{
+    // v2: держатель кода — JOIN первым конвертом после рукопожатия
+    var join_after: ?JoinInfo = null;
+    var relay_secret: ?[16]u8 = null;
+    if (inv.v2) {
+        if (inv.relay) relay_secret = inv.secret;
+        join_after = .{
             .secret = inv.secret,
             .name_len = @intCast(my_name.len),
             .name_buf = blk: {
@@ -1338,122 +1303,74 @@ fn cmdAdd(app: *App, args: []const u8) !void {
                 break :blk nb;
             },
         };
-    } else {
-        var it = std.mem.tokenizeAny(u8, trimmed, " ");
-        name = it.next() orelse return error.BadArgs;
-        const hex = it.next() orelse return error.BadArgs;
-        bundle = try parseHex64(hex);
     }
     // мутации движка/хешмапы — строго под локом (ticker и рендер итерируют)
     var cid: i64 = 0;
     {
         app.lock();
         defer app.unlock();
-        const idx = try app.eng.addContact(name, bundle);
+        const idx = app.eng.addContact(name, bundle) catch return .INTERNAL;
         cid = @intCast(idx + 1);
-        try app.hb.put(cid, .{});
+        app.hb.put(cid, .{}) catch {};
         if (addr) |a| saveContactAddr(app, cid, a);
         if (app.log) |log| {
             logContact(app, log, name, bundle, addr);
         }
     }
-    var msg: [96]u8 = undefined;
-    const t = std.fmt.bufPrint(&msg, "контакт {s} = id {d}", .{ name, cid }) catch "контакт добавлен";
-    fb(app, @intCast(cid - 1), t);
+    w.putU32(@intCast(cid)) catch return .INTERNAL;
     // v2: запомнить JOIN-данные — отправим первым конвертом после рукопожатия
     if (join_after) |ji| {
         app.join_map.put(app.alloc, cid, ji) catch {};
     }
-    // Если код содержит адрес — подключение происходит сразу, без connect/id.
+    // Если код содержит адрес — подключение происходит сразу, без connect.
     // Без адреса — LAN-захват: linkerLoop дозвонится до анонса приглашающего.
     if (addr) |a| {
         if (relay_secret) |sec| {
-            establishToRelay(app, a, cid, .initiator, sec) catch |e| {
-                var eb: [64]u8 = undefined;
-                const et = std.fmt.bufPrint(&eb, "автоподключение: {s}", .{@errorName(e)}) catch "!";
-                fb(app, @intCast(cid - 1), et);
-            };
+            establishToRelay(app, a, cid, .initiator, sec) catch {};
         } else {
-            establishTo(app, a, cid, .initiator) catch |e| {
-                var eb: [64]u8 = undefined;
-                const et = std.fmt.bufPrint(&eb, "автоподключение: {s}", .{@errorName(e)}) catch "!";
-                fb(app, @intCast(cid - 1), et);
-            };
+            establishTo(app, a, cid, .initiator) catch {};
         }
     }
+    return .OK;
 }
 
-/// id: свой bundle и отпечаток (сверка голосом/QR между пользователями).
-fn cmdId(app: *App) void {
+/// GET_IDENTITY: свои публичные данные (сверка отпечатка голосом/QR).
+/// Ответ: [bundle 64][fingerprint 32].
+fn apiGetIdentity(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    if (payload.len != 0) return .BAD_FRAME;
     app.lock();
     defer app.unlock();
     const bundle = app.id.bundle();
-    var hex_buf: [130]u8 = undefined;
-    const hx = toHex(&hex_buf, &bundle) catch return;
-    var fp_buf: [96]u8 = undefined;
-    const fp = app.id.fingerprintTo(&fp_buf) catch return;
-    var lb: [160]u8 = undefined;
-    const l1 = std.fmt.bufPrint(&lb, "bundle {s}", .{hx}) catch return;
-    fb(app, null, l1);
-    var lb2: [128]u8 = undefined;
-    const l2 = std.fmt.bufPrint(&lb2, "fingerprint {s}", .{fp}) catch return;
-    fb(app, null, l2);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.blake2.Blake2s256.hash(&bundle, &digest, .{});
+    w.putBytes(&bundle) catch return .INTERNAL;
+    w.putBytes(&digest) catch return .INTERNAL;
+    return .OK;
 }
 
-fn cmdContacts(app: *App, rest: []const u8) void {
-    // contacts -m: машиночитаемо — c <cid> <online|offline> <blocked> <имя>
-    const machine = std.mem.startsWith(u8, std.mem.trim(u8, rest, " "), "-m");
-    var lines_buf: [16][128]u8 = undefined;
-    var lens: [16]usize = @splat(0);
-    var n: usize = 0;
-    {
-        app.lock();
-        defer app.unlock();
-        const now = app.nowMs();
-        for (app.eng.contacts.items, 0..) |c, i| {
-            if (n >= lines_buf.len) break;
-            const cid: i64 = @intCast(i + 1);
-            if (machine) {
-                const t = std.fmt.bufPrint(&lines_buf[n], "c {d} {s} {d} {s}", .{
-                    cid,
-                    if (c.online) "online" else "offline",
-                    @intFromBool(c.blocked),
-                    c.getName(),
-                }) catch continue;
-                lens[n] = t.len;
-                n += 1;
-                continue;
-            }
-            const seen: ?i64 = app.eng.lastSeen(cid);
-            const ago = if (seen) |sv| now - sv else -1;
-            var q: usize = 0;
-            for (app.eng.outbox.items) |*e| {
-                if (e.cid == cid) q += 1;
-            }
-            const t = std.fmt.bufPrint(&lines_buf[n], "id {d}: {s} {s}{s} (last seen: {d} мс назад){s}", .{
-                cid,
-                c.getName(),
-                if (c.online) "[online]" else "[offline]",
-                if (c.blocked) " [BLOCKED]" else "",
-                ago,
-                if (q > 0) " [в очереди]" else "",
-            }) catch continue;
-            lens[n] = t.len;
-            n += 1;
-        }
+/// LIST_CONTACTS: все контакты. Ответ:
+/// [count u32] × {[cid u32][flags u8 bit0 online bit1 blocked]
+/// [last_seen_ms i64 (0 = неизвестно)][name str16]}.
+fn apiListContacts(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    if (payload.len != 0) return .BAD_FRAME;
+    const max_contacts = 10000;
+    app.lock();
+    defer app.unlock();
+    const n = @min(app.eng.contacts.items.len, max_contacts);
+    if (app.eng.contacts.items.len > max_contacts) return .TOO_BIG;
+    w.putU32(@intCast(n)) catch return .INTERNAL;
+    for (app.eng.contacts.items[0..n], 0..) |c, i| {
+        const cid: i64 = @intCast(i + 1);
+        var flags: u8 = 0;
+        if (c.online) flags |= 1;
+        if (c.blocked) flags |= 2;
+        const seen: i64 = app.eng.lastSeen(cid) orelse 0;
+        w.putU32(@intCast(cid)) catch return .INTERNAL;
+        w.putU8(flags) catch return .INTERNAL;
+        w.putI64(seen) catch return .INTERNAL;
+        w.putStr16(c.getName()) catch return .INTERNAL;
     }
-    if (n == 0) {
-        fb(app, null, if (machine) "c_end 0" else "нет контактов");
-        return;
-    }
-    for (lines_buf[0..n], lens[0..n]) |*line, l| {
-        fb(app, null, line[0..l]);
-    }
-    if (machine) {
-        var fb2: [24]u8 = undefined;
-        const t = std.fmt.bufPrint(&fb2, "c_end {d}", .{n}) catch return;
-        fb(app, null, t);
-    }
+    return .OK;
 }
 
 /// Состояние приёма одного файла (FILE_META + чанки FILE_DATA).
@@ -1603,90 +1520,69 @@ fn acceptLoop(app: *App, listener: *tcp.Listener, cid: i64) void {
             app.io,
         ) catch {
             app.alloc.destroy(sc);
-            fb(app, null, "рукопожатие не удалось");
             continue;
         };
         app.bindSession(cid, s, sc) catch {};
-        var sm: [64]u8 = undefined;
-        const st = std.fmt.bufPrint(&sm, "сессия установлена", .{}) catch "сессия";
-        fb(app, @intCast(idx), st);
     }
 }
 
-fn cmdMsg(app: *App, args: []const u8) !void {
-    var it = std.mem.tokenizeAny(u8, args, " ");
-    const id_str = it.next() orelse return error.BadArgs;
-    const body = it.rest();
-    if (body.len == 0) return error.BadArgs;
-    const cid = try std.fmt.parseInt(i64, id_str, 10);
+/// SEND_MESSAGE: payload [cid u32][body str16 ≤4096].
+/// Ответ: [msg_id 16][flags u8 (bit0 = queued)]. Отправка офлайн — НЕ ошибка.
+fn apiSendMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    const body = r.readStr16() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (body.len == 0 or body.len > envelope.max_text_body) return .BAD_ARGS;
     app.lock();
     defer app.unlock();
-    const oc = try app.eng.sendText(cid, body);
-    persistMsg(app, cid, true, oc.msg_id, oc.result == .sent, app.nowMs(), body);
-    if (oc.result == .queued) {
-        persistOutboxAdd(app);
-        var qb: [80]u8 = undefined;
-        const t = std.fmt.bufPrint(&qb, "в очереди: доставлю, когда {s} появится", .{app.eng.contacts.items[@intCast(cid - 1)].getName()}) catch "в очереди";
-        fb(app, @intCast(cid - 1), t);
-    }
-    var hxb: [32]u8 = undefined;
-    const hx = toHex(&hxb, &oc.msg_id) catch return;
-    var lb: [64]u8 = undefined;
-    const mt = std.fmt.bufPrint(&lb, "msg_id {s}", .{hx}) catch return;
-    fb(app, @intCast(cid - 1), mt);
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    const oc = app.eng.sendText(@intCast(cid), body) catch |e| return statusOf(e);
+    persistMsg(app, @intCast(cid), true, oc.msg_id, oc.result == .sent, app.nowMs(), body);
+    if (oc.result == .queued) persistOutboxAdd(app);
+    w.putBytes(&oc.msg_id) catch return .INTERNAL;
+    w.putU8(if (oc.result == .queued) 1 else 0) catch return .INTERNAL;
+    return .OK;
 }
 
-fn cmdReact(app: *App, args: []const u8) !void {
-    var it = std.mem.tokenizeAny(u8, args, " ");
-    const id_str = it.next() orelse return error.BadArgs;
-    const mid_hex = it.next() orelse return error.BadArgs;
-    const code_str = it.next() orelse return error.BadArgs;
-    const cid = try std.fmt.parseInt(i64, id_str, 10);
-    const mid = try parseHex16(mid_hex);
-    const code = try parseCodepoint(code_str);
-    if (code > 0x10FFFF) return error.BadArgs;
+/// SET_REACTION / REMOVE_REACTION: payload [cid u32][msg_id 16][codepoint u32].
+/// codepoint вне U+0000..U+10FFFF — UNSUPPORTED_REACTION. Ответ пуст.
+fn apiReaction(app: *App, payload: []const u8, add: bool) api.Status {
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    const mid: [16]u8 = (r.readBytes(16) catch return .BAD_FRAME)[0..16].*;
+    const code = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (code > 0x10FFFF) return .UNSUPPORTED_REACTION;
     app.lock();
     defer app.unlock();
-    try app.eng.react(cid, mid, envelope.react_add, code);
-    persistReact(app, cid, true, mid, code, app.nowMs());
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    const op: u8 = if (add) envelope.react_add else envelope.react_remove;
+    app.eng.react(@intCast(cid), mid, op, code) catch |e| return statusOf(e);
+    if (add) persistReact(app, @intCast(cid), true, mid, code, app.nowMs());
+    return .OK;
 }
 
-/// Unicode code point из аргумента: 100, 0x2764, U+2764, ❤ (сам глиф).
-fn parseCodepoint(arg: []const u8) !u32 {
-    if (arg.len == 0) return error.BadArgs;
-    if (arg.len >= 2 and (std.mem.startsWith(u8, arg, "0x") or std.mem.startsWith(u8, arg, "0X")))
-        return std.fmt.parseInt(u32, arg[2..], 16);
-    if (arg.len >= 2 and (std.mem.startsWith(u8, arg, "U+") or std.mem.startsWith(u8, arg, "u+")))
-        return std.fmt.parseInt(u32, arg[2..], 16);
-    // односимвольная UTF-8 последовательность — её кодпоинт
-    const len = std.unicode.utf8ByteSequenceLength(arg[0]) catch return std.fmt.parseInt(u32, arg, 10);
-    if (len == arg.len) {
-        return std.unicode.utf8Decode(arg) catch return error.BadArgs;
-    }
-    return std.fmt.parseInt(u32, arg, 10);
-}
-
-fn cmdBlock(app: *App, args: []const u8, flag: bool) !void {
-    const cid = try std.fmt.parseInt(i64, std.mem.trim(u8, args, " "), 10);
+/// BLOCK_CONTACT / UNBLOCK_CONTACT: payload [cid u32]. Ответ пуст.
+fn apiBlock(app: *App, payload: []const u8, flag: bool) api.Status {
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
     app.lock();
     defer app.unlock();
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
     if (flag) {
-        try app.eng.block(cid);
-        if (app.log) |log| {
-            var buf: [65]u8 = undefined;
-            @memcpy(buf[0..64], &app.eng.contacts.items[@intCast(cid - 1)].bundle);
-            buf[64] = 1;
-            _ = log.append(.block, &buf) catch {};
-        }
+        app.eng.block(@intCast(cid)) catch |e| return statusOf(e);
     } else {
-        try app.eng.unblock(cid);
-        if (app.log) |log| {
-            var buf: [65]u8 = undefined;
-            @memcpy(buf[0..64], &app.eng.contacts.items[@intCast(cid - 1)].bundle);
-            buf[64] = 0;
-            _ = log.append(.block, &buf) catch {};
-        }
+        app.eng.unblock(@intCast(cid)) catch |e| return statusOf(e);
     }
+    if (app.log) |log| {
+        var buf: [65]u8 = undefined;
+        @memcpy(buf[0..64], &app.eng.contacts.items[cid - 1].bundle);
+        buf[64] = @intFromBool(flag);
+        _ = log.append(.block, &buf) catch {};
+    }
+    return .OK;
 }
 
 /// Записать контакт в лог (с адресом, если известен).
@@ -1811,10 +1707,13 @@ fn persistFileMeta(app: *App, cid: i64, file_id: [16]u8, size: u32, name: []cons
     _ = log.append(.file, buf[0 .. 23 + n]) catch {};
 }
 
-/// setname <имя>: моё отображаемое имя (лог set:2 + PROFILE пир-ам онлайн).
-fn cmdSetName(app: *App, args: []const u8) !void {
-    const name = std.mem.trim(u8, args, " ");
-    if (name.len == 0 or name.len > 32) return error.BadArgs;
+/// SET_NAME: payload [name str16 1..32]. Ответ пуст.
+fn apiSetName(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    var r = api.Reader.init(payload);
+    const name = r.readStr16() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (name.len == 0 or name.len > invite_mod.max_name) return .BAD_ARGS;
     app.lock();
     defer app.unlock();
     app.eng.setMyProfile(name, app.eng.my_avatar_id);
@@ -1830,21 +1729,16 @@ fn cmdSetName(app: *App, args: []const u8) !void {
             app.eng.sendProfile(cid) catch {};
         }
     }
-    fb(app, null, "имя задано");
+    return .OK;
 }
 
-/// setavatar <путь>: задать мой аватар (кэш + лог set:1 + PROFILE пир-ам онлайн).
-fn cmdSetAvatar(app: *App, args: []const u8) !void {
-    const path = std.mem.trim(u8, args, " ");
-    if (path.len == 0) return error.BadArgs;
-    const f = std.Io.Dir.openFileAbsolute(app.io, path, .{ .mode = .read_only }) catch
-        return error.FileNotFound;
-    defer f.close(app.io);
-    const data = app.alloc.alloc(u8, envelope.max_avatar_data) catch return error.OutOfMemory;
-    defer app.alloc.free(data);
-    const n = f.readPositionalAll(app.io, data, 0) catch return error.FileNotFound;
-    const bytes = data[0..n];
-    if (bytes.len == 0) return error.TooBig;
+/// SET_AVATAR: payload [data str32 1..16000] — байты картинки inline.
+/// Ответ: [avatar_id 16][size u32].
+fn apiSetAvatar(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const bytes = r.readStr32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (bytes.len == 0 or bytes.len > envelope.max_avatar_data) return .TOO_BIG;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     const id = digest[0..16].*;
@@ -1852,8 +1746,11 @@ fn cmdSetAvatar(app: *App, args: []const u8) !void {
         app.lock();
         defer app.unlock();
         if (!app.avatars.contains(id)) {
-            const copy = app.alloc.dupe(u8, bytes) catch return error.OutOfMemory;
-            app.avatars.put(app.alloc, id, copy) catch return error.OutOfMemory;
+            const copy = app.alloc.dupe(u8, bytes) catch return .INTERNAL;
+            app.avatars.put(app.alloc, id, copy) catch {
+                app.alloc.free(copy);
+                return .INTERNAL;
+            };
         }
         app.eng.setMyProfile(app.eng.myName(), id);
         if (app.log) |log| {
@@ -1866,7 +1763,7 @@ fn cmdSetAvatar(app: *App, args: []const u8) !void {
         if (app.log) |log| {
             var ab: [18 + 16000]u8 = undefined;
             @memcpy(ab[0..16], &id);
-            std.mem.writeInt(u16, ab[16..18], @intCast(data.len), .little);
+            std.mem.writeInt(u16, ab[16..18], @intCast(bytes.len), .little);
             @memcpy(ab[18 .. 18 + bytes.len], bytes);
             _ = log.append(.avatar, ab[0 .. 18 + bytes.len]) catch {};
         }
@@ -1878,33 +1775,32 @@ fn cmdSetAvatar(app: *App, args: []const u8) !void {
             }
         }
     }
-    var hxb: [32]u8 = undefined;
-    const hx = toHex(&hxb, &id) catch return;
-    var line: [96]u8 = undefined;
-    const t = std.fmt.bufPrint(&line, "аватар задан: {s} ({d} байт)", .{ hx, bytes.len }) catch return;
-    fb(app, null, t);
+    w.putBytes(&id) catch return .INTERNAL;
+    w.putU32(@intCast(bytes.len)) catch return .INTERNAL;
+    return .OK;
 }
 
-/// sendfile <cid> <путь>: передача файла чанками FILE_META + FILE_DATA.
-/// Чанк 16000 байт = один obf-кадр; file_id = SHA-256(файла)[0..16].
-fn cmdSendFile(app: *App, args: []const u8) !void {
-    var it = std.mem.tokenizeAny(u8, args, " ");
-    const id_str = it.next() orelse return error.BadArgs;
-    const path = std.mem.trim(u8, it.rest(), " ");
-    if (path.len == 0) return error.BadArgs;
-    const cid = try std.fmt.parseInt(i64, id_str, 10);
+/// SEND_FILE: payload [cid u32][path str16] — путь в ФС пользователя демона.
+/// Ответ: [file_id 16][size u32][chunks u32].
+/// Требует живой сессии (файлы не ставятся в outbox); file_id = SHA-256[0..16].
+fn apiSendFile(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    const path = r.readStr16() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (path.len == 0) return .BAD_ARGS;
     // только имя файла, без каталогов
     const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
-    if (base.len == 0 or base.len > envelope.max_file_name) return error.BadArgs;
+    if (base.len == 0 or base.len > envelope.max_file_name) return .BAD_ARGS;
     const f = std.Io.Dir.openFileAbsolute(app.io, path, .{ .mode = .read_only }) catch
-        return error.FileNotFound;
+        return .FILE_NOT_FOUND;
     defer f.close(app.io);
     // лимит: 64 МБ (u32 размер + разумный таймаут перекачки)
     const max_file_total = 64 * 1024 * 1024;
-    const data = app.alloc.alloc(u8, max_file_total) catch return error.OutOfMemory;
+    const data = app.alloc.alloc(u8, max_file_total) catch return .INTERNAL;
     defer app.alloc.free(data);
-    const n = f.readPositionalAll(app.io, data, 0) catch return error.FileNotFound;
-    if (n == 0 or n > std.math.maxInt(u32)) return error.TooBig;
+    const n = f.readPositionalAll(app.io, data, 0) catch return .FILE_NOT_FOUND;
+    if (n == 0 or n > std.math.maxInt(u32)) return .TOO_BIG;
     const bytes = data[0..n];
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -1912,57 +1808,61 @@ fn cmdSendFile(app: *App, args: []const u8) !void {
     {
         app.lock();
         defer app.unlock();
-        try app.eng.sendFileMeta(cid, file_id, base, @intCast(n), digest);
+        if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+        app.eng.sendFileMeta(@intCast(cid), file_id, base, @intCast(n), digest) catch |e| return statusOf(e);
         var seq: u32 = 0;
         var off: usize = 0;
         while (off < bytes.len) {
             const chunk_len = @min(bytes.len - off, envelope.max_file_chunk);
-            try app.eng.sendFileChunk(cid, file_id, seq, bytes[off .. off + chunk_len]);
+            app.eng.sendFileChunk(@intCast(cid), file_id, seq, bytes[off .. off + chunk_len]) catch |e| return statusOf(e);
             off += chunk_len;
             seq += 1;
         }
     }
-    var hxb: [32]u8 = undefined;
-    const hx = toHex(&hxb, &file_id) catch return;
-    var line: [128]u8 = undefined;
-    const t = std.fmt.bufPrint(&line, "файл отправлен: {s} ({d} байт, {d} чанк.)", .{ hx, n, @divTrunc(n + envelope.max_file_chunk - 1, envelope.max_file_chunk) }) catch return;
-    fb(app, null, t);
+    w.putBytes(&file_id) catch return .INTERNAL;
+    w.putU32(@intCast(n)) catch return .INTERNAL;
+    w.putU32(@intCast(@divTrunc(n + envelope.max_file_chunk - 1, envelope.max_file_chunk))) catch return .INTERNAL;
+    return .OK;
 }
 
-/// avatar <cid>: id текущего аватара контакта (или "нет").
-fn cmdAvatar(app: *App, args: []const u8) !void {
-    const cid = try std.fmt.parseInt(i64, std.mem.trim(u8, args, " "), 10);
+/// GET_AVATAR_ID: payload [cid u32]. Ответ: [avatar_id 16] (нули — аватара нет).
+fn apiGetAvatarId(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
     app.lock();
     defer app.unlock();
-    if (cid < 1 or cid > app.eng.contacts.items.len) return error.NoContact;
-    const c = &app.eng.contacts.items[@intCast(cid - 1)];
-    if (std.mem.eql(u8, &c.avatar_id, &@as([16]u8, @splat(0)))) {
-        fb(app, @intCast(cid - 1), "нет аватара");
-        return;
-    }
-    var hxb: [32]u8 = undefined;
-    const hx = toHex(&hxb, &c.avatar_id) catch return;
-    var line: [64]u8 = undefined;
-    const t = std.fmt.bufPrint(&line, "avatar {s}", .{hx}) catch return;
-    fb(app, @intCast(cid - 1), t);
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    const c = &app.eng.contacts.items[cid - 1];
+    w.putBytes(&c.avatar_id) catch return .INTERNAL;
+    return .OK;
 }
 
-/// history <cid> [limit]: последние N сообщений контакта (по логу).
-fn cmdGetHistory(app: *App, args: []const u8) !void {
-    var it = std.mem.tokenizeAny(u8, args, " ");
-    const cid = try std.fmt.parseInt(i64, it.next() orelse return error.BadArgs, 10);
-    const limit = it.next() orelse "50";
-    const n = try std.fmt.parseInt(u32, limit, 10);
+/// GET_HISTORY: payload [cid u32][limit u32] (0 → 50, максимум 200).
+/// Ответ: [total u32][count u32] × {[flags u8 bit0 mine bit1 delivered]
+/// [msg_id 16][ts_ms u64][body str16]} — записи старые → новые.
+/// Лога нет — пустой список (OK).
+fn apiGetHistory(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    var limit = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (limit == 0) limit = 50;
+    if (limit > 200) return .TOO_BIG;
     {
         app.lock();
         defer app.unlock();
-        if (cid < 1 or cid > app.eng.contacts.items.len) return error.NoContact;
+        if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
     }
-    const log = app.log orelse return;
+    const log = app.log orelse {
+        w.putU32(0) catch return .INTERNAL;
+        w.putU32(0) catch return .INTERNAL;
+        return .OK;
+    };
     // записи: [cid u16][flags u8][msg_id 16][ts u64][len u16][body]
-    const recs = log.readAll(.msg, app.alloc) catch return;
+    const recs = log.readAll(.msg, app.alloc) catch return .INTERNAL;
     defer {
-        for (recs) |r| app.alloc.free(r);
+        for (recs) |rec| app.alloc.free(rec);
         app.alloc.free(recs);
     }
     var total: usize = 0;
@@ -1977,14 +1877,27 @@ fn cmdGetHistory(app: *App, args: []const u8) !void {
             if (std.mem.readInt(u16, rec[0..2], .little) != cid) continue;
             total += 1;
             count += 1;
-            if (count == n) {
+            if (count == limit) {
                 start = i;
                 break;
             }
         }
         if (i == 0 and start == recs.len) start = 0;
     }
+    // две фазы: посчитать записи окна, потом записать (payload один кадр)
+    var in_window: usize = 0;
     var idx2 = start;
+    while (idx2 < recs.len) : (idx2 += 1) {
+        const rec = recs[idx2];
+        if (rec.len < 29) continue;
+        if (std.mem.readInt(u16, rec[0..2], .little) != cid) continue;
+        const blen = std.mem.readInt(u16, rec[27..29], .little);
+        if (rec.len < 29 + blen) continue;
+        in_window += 1;
+    }
+    w.putU32(@intCast(total)) catch return .INTERNAL;
+    w.putU32(@intCast(in_window)) catch return .INTERNAL;
+    idx2 = start;
     while (idx2 < recs.len) : (idx2 += 1) {
         const rec = recs[idx2];
         if (rec.len < 29) continue;
@@ -1994,31 +1907,26 @@ fn cmdGetHistory(app: *App, args: []const u8) !void {
         const ts_ms = std.mem.readInt(u64, rec[19..27], .little);
         const blen = std.mem.readInt(u16, rec[27..29], .little);
         if (rec.len < 29 + blen) continue;
-        var hxb: [32]u8 = undefined;
-        const hx = toHex(&hxb, &msg_id) catch continue;
-        var line: [256]u8 = undefined;
-        const t = std.fmt.bufPrint(&line, "msg {s} {s} {d} {s}", .{
-            if (flags & 1 != 0) "mine" else "theirs",
-            hx,
-            ts_ms,
-            rec[29 .. 29 + blen],
-        }) catch continue;
-        fb(app, @intCast(cid - 1), t);
+        w.putU8(flags) catch return .INTERNAL;
+        w.putBytes(&msg_id) catch return .INTERNAL;
+        w.putU64(ts_ms) catch return .INTERNAL;
+        w.putStr16(rec[29 .. 29 + blen]) catch return .INTERNAL;
     }
-    var fin: [48]u8 = undefined;
-    const f = std.fmt.bufPrint(&fin, "hist_end {d} {d}", .{ cid, total }) catch return;
-    fb(app, null, f);
+    return .OK;
 }
 
-/// getmessage <msg_id_hex>: одно сообщение по идентификатору.
-fn cmdGetMessage(app: *App, args: []const u8) !void {
-    const trimmed = std.mem.trim(u8, args, " ");
-    if (trimmed.len == 0) return error.BadArgs;
-    const want = try parseHex16(trimmed);
-    const log = app.log orelse return;
-    const recs = log.readAll(.msg, app.alloc) catch return;
+/// GET_MESSAGE: payload [msg_id 16]. Ответ:
+/// [cid u32][flags u8 bit0 mine bit1 delivered][ts_ms u64][body str16]
+/// [react_count u32] × {[flags u8 bit0 mine][codepoint u32][ts_ms u64]}.
+/// Нет записи — NOT_FOUND.
+fn apiGetMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const want: [16]u8 = (r.readBytes(16) catch return .BAD_FRAME)[0..16].*;
+    if (r.hasMore()) return .BAD_FRAME;
+    const log = app.log orelse return .NOT_FOUND;
+    const recs = log.readAll(.msg, app.alloc) catch return .INTERNAL;
     defer {
-        for (recs) |r| app.alloc.free(r);
+        for (recs) |rec| app.alloc.free(rec);
         app.alloc.free(recs);
     }
     var last: ?[]u8 = null;
@@ -2027,46 +1935,39 @@ fn cmdGetMessage(app: *App, args: []const u8) !void {
         if (!std.mem.eql(u8, rec[3 .. 3 + 16], &want)) continue;
         last = rec;
     }
-    const rec = last orelse {
-        // "!" — маркер ошибки: тег @<n> ответит err
-        fb(app, null, "! не найдено");
-        return;
-    };
+    const rec = last orelse return .NOT_FOUND;
     const flags = rec[2];
     const cid = std.mem.readInt(u16, rec[0..2], .little);
     const ts_ms = std.mem.readInt(u64, rec[19..27], .little);
     const blen = std.mem.readInt(u16, rec[27..29], .little);
-    var hxb: [32]u8 = undefined;
-    const hx = toHex(&hxb, &want) catch return;
-    var line: [256]u8 = undefined;
-    const t = std.fmt.bufPrint(&line, "msg {s} {d} {s} {d} {s}", .{
-        if (flags & 1 != 0) "mine" else "theirs",
-        cid,
-        hx,
-        ts_ms,
-        rec[29..@min(29 + blen, rec.len)],
-    }) catch return;
-    fb(app, null, t);
-    // реакции на это сообщение: react <mine|theirs> <codepoint> <ts_ms>
-    const rrecs = log.readAll(.react, app.alloc) catch return;
+    w.putU32(cid) catch return .INTERNAL;
+    w.putU8(flags) catch return .INTERNAL;
+    w.putU64(ts_ms) catch return .INTERNAL;
+    w.putStr16(rec[29..@min(29 + blen, rec.len)]) catch return .INTERNAL;
+    // реакции на это сообщение
+    const rrecs = log.readAll(.react, app.alloc) catch return .INTERNAL;
     defer {
         for (rrecs) |rr| app.alloc.free(rr);
         app.alloc.free(rrecs);
     }
+    var rcount: usize = 0;
+    for (rrecs) |rr| {
+        if (rr.len < 31) continue;
+        if (!std.mem.eql(u8, rr[3 .. 3 + 16], &want)) continue;
+        rcount += 1;
+    }
+    w.putU32(@intCast(rcount)) catch return .INTERNAL;
     for (rrecs) |rr| {
         if (rr.len < 31) continue;
         if (!std.mem.eql(u8, rr[3 .. 3 + 16], &want)) continue;
         const rflags = rr[2];
         const rcode = std.mem.readInt(u32, rr[19..23], .little);
         const rts = std.mem.readInt(u64, rr[23..31], .little);
-        var rl: [64]u8 = undefined;
-        const rt = std.fmt.bufPrint(&rl, "react {s} {d} {d}", .{
-            if (rflags & 1 != 0) "mine" else "theirs",
-            rcode,
-            rts,
-        }) catch continue;
-        fb(app, null, rt);
+        w.putU8(rflags) catch return .INTERNAL;
+        w.putU32(rcode) catch return .INTERNAL;
+        w.putU64(rts) catch return .INTERNAL;
     }
+    return .OK;
 }
 
 fn loadContacts(app: *App) void {
@@ -2169,104 +2070,131 @@ fn loadContacts(app: *App) void {
     }
 }
 
-/// Ответ на команду: уходит подключённому UDS-клиенту (cli_out), иначе — в лог демона.
-fn fb(app: *App, idx: ?usize, txt: []const u8) void {
-    // UDS-клиент ждёт ответа команды — отдаём ему, а не в лог демона
-    {
-        app.cliLock();
-        defer app.cliUnlock();
-        if (app.cli_out) |c| {
-            c.writeText(txt);
-            return;
-        }
-    }
-    if (app.tui) {
-        app.lock();
-        app.sysLineLocked(idx, txt);
-        app.unlock();
-    } else {
-        std.debug.print("{s}\n", .{txt});
-    }
+// ------------------------------------------------------------- диспетчер
+
+/// Запрос API, собранный сервером из кадра.
+pub const ApiRequest = struct {
+    method: api.Method,
+    request_id: u32,
+    payload: []const u8,
+};
+
+/// Маппинг error set'ов ядра на статусы API.
+fn statusOf(e: anyerror) api.Status {
+    return switch (e) {
+        error.Blocked => .CONTACT_BLOCKED,
+        error.NoSession => .NO_SESSION,
+        error.NoContact => .NO_CONTACT,
+        error.TooBig => .TOO_BIG,
+        error.TooManyInvites => .TOO_MANY_INVITES,
+        error.FileNotFound => .FILE_NOT_FOUND,
+        error.NoRelay => .NO_RELAY,
+        error.BadArgs, error.BadHex, error.BadCode, error.BadName, error.BadAddr => .BAD_ARGS,
+        error.Busy => .BUSY,
+        error.NoCall => .NO_CALL,
+        else => .INTERNAL,
+    };
 }
 
-fn fmtErr(buf: []u8, what: []const u8, e: anyerror) []const u8 {
-    return std.fmt.bufPrint(buf, "! {s}: {s}", .{ what, @errorName(e) }) catch "!";
-}
-
-/// Исполнение команды UDS-апи (возвращает false для выхода).
-pub fn execCmd(app: *App, trimmed: []const u8) bool {
-    var errbuf: [96]u8 = undefined;
-    var it = std.mem.tokenizeAny(u8, trimmed, " ");
-    const cmd = it.next() orelse return true;
-    const rest = std.mem.trim(u8, trimmed[cmd.len..], " ");
-
-    if (std.mem.eql(u8, cmd, "help")) {
-        fb(app, null, "invite <имя> · add <код|hex> · msg <id> <текст> · react <id> <msg_id> <U+код> · block/unblock <id>");
-        fb(app, null, "sendfile <id> <путь> · gethistory <id> [n] · getmessage <msg_id> · call <id> · answer · hangup · contacts · connect · listen · quit");
-    } else if (std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "q")) {
-        app.running = false;
-    } else if (std.mem.eql(u8, cmd, "contacts")) {
-        cmdContacts(app, rest);
-    } else if (std.mem.eql(u8, cmd, "id")) {
-        cmdId(app);
-    } else if (std.mem.eql(u8, cmd, "invite")) {
-        cmdInvite(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "приглашение", e));
-    } else if (std.mem.eql(u8, cmd, "add")) {
-        cmdAdd(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "add", e));
-    } else if (std.mem.eql(u8, cmd, "msg")) {
-        cmdMsg(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "msg", e));
-    } else if (std.mem.eql(u8, cmd, "react")) {
-        cmdReact(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "react", e));
-    } else if (std.mem.eql(u8, cmd, "setname")) {
-        cmdSetName(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "setname", e));
-    } else if (std.mem.eql(u8, cmd, "setavatar")) {
-        cmdSetAvatar(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "setavatar", e));
-    } else if (std.mem.eql(u8, cmd, "sendfile")) {
-        cmdSendFile(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "sendfile", e));
-    } else if (std.mem.eql(u8, cmd, "avatar")) {
-        cmdAvatar(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "avatar", e));
-    } else if (std.mem.eql(u8, cmd, "gethistory") or std.mem.eql(u8, cmd, "history")) {
-        cmdGetHistory(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "gethistory", e));
-    } else if (std.mem.eql(u8, cmd, "getmessage")) {
-        cmdGetMessage(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "getmessage", e));
-    } else if (std.mem.eql(u8, cmd, "block")) {
-        cmdBlock(app, rest, true) catch |e| fb(app, null, fmtErr(&errbuf, "block", e));
-    } else if (std.mem.eql(u8, cmd, "unblock")) {
-        cmdBlock(app, rest, false) catch |e| fb(app, null, fmtErr(&errbuf, "unblock", e));
-    } else if (std.mem.eql(u8, cmd, "call")) {
-        cmdCall(app, rest) catch |e| fb(app, null, fmtErr(&errbuf, "звонок", e));
-    } else if (std.mem.eql(u8, cmd, "answer")) {
-        cmdAnswer(app) catch |e| fb(app, null, fmtErr(&errbuf, "звонок", e));
-    } else if (std.mem.eql(u8, cmd, "hangup")) {
-        cmdHangup(app) catch |e| fb(app, null, fmtErr(&errbuf, "звонок", e));
-    } else if (std.mem.eql(u8, cmd, "connect")) {
-        var ait = std.mem.tokenizeAny(u8, rest, " ");
-        const addr = ait.next() orelse return true;
-        const cid = std.fmt.parseInt(i64, ait.next() orelse return true, 10) catch return true;
-        establishTo(app, addr, cid, .initiator) catch |e|
-            fb(app, null, fmtErr(&errbuf, "connect", e));
-    } else if (std.mem.eql(u8, cmd, "listen")) {
-        var ait = std.mem.tokenizeAny(u8, rest, " ");
-        const addr = ait.next() orelse return true;
-        const cid = std.fmt.parseInt(i64, ait.next() orelse return true, 10) catch return true;
-        const lsn = tcp.listen(addr) catch |e| {
-            fb(app, null, fmtErr(&errbuf, "listen", e));
-            return true;
-        };
-        const lp = app.alloc.create(tcp.Listener) catch return true;
-        lp.* = lsn;
-        const th = std.Thread.spawn(.{}, struct {
-            fn go(a: *App, l: *tcp.Listener, c: i64) void {
-                acceptLoop(a, l, c);
+/// Диспетчер API-методов: разбирает payload, исполняет, шлёт ровно один
+/// ответ. Возвращает false — сервер закрывает соединение (CLOSE).
+pub fn dispatchApi(app: *App, conn: *api_srv.Conn, req: ApiRequest) bool {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    switch (req.method) {
+        .CLOSE => {
+            // ответ и разрыв — без обработки payload
+            conn.sendResponse(@intFromEnum(req.method), req.request_id, .OK, &.{});
+            return false;
+        },
+        .GET_VERSION => {
+            if (req.payload.len != 0) {
+                respond(conn, req, .BAD_FRAME, &.{});
+                return true;
             }
-        }.go, .{ app, lp, cid }) catch return true;
-        th.detach();
-        std.debug.print("слушаю {s} для id {d}\n", .{ addr, cid });
-    } else {
-        fb(app, null, "не знаю команду — /help для списка");
+            w.putU16(api.api_version[0]) catch return internal(conn, req);
+            w.putU16(api.api_version[1]) catch return internal(conn, req);
+            w.putU16(api.api_version[2]) catch return internal(conn, req);
+            respond(conn, req, .OK, w.items());
+        },
+        .GET_IDENTITY => respond(conn, req, apiGetIdentity(app, req.payload, &w), w.items()),
+        .CREATE_INVITE => respond(conn, req, apiCreateInvite(app, req.payload, &w), w.items()),
+        .ACCEPT_INVITE => respond(conn, req, apiAcceptInvite(app, req.payload, &w), w.items()),
+        .LIST_CONTACTS => respond(conn, req, apiListContacts(app, req.payload, &w), w.items()),
+        .SEND_MESSAGE => respond(conn, req, apiSendMessage(app, req.payload, &w), w.items()),
+        .SET_REACTION => respond(conn, req, apiReaction(app, req.payload, true), w.items()),
+        .REMOVE_REACTION => respond(conn, req, apiReaction(app, req.payload, false), w.items()),
+        .GET_HISTORY => respond(conn, req, apiGetHistory(app, req.payload, &w), w.items()),
+        .GET_MESSAGE => respond(conn, req, apiGetMessage(app, req.payload, &w), w.items()),
+        .SET_NAME => respond(conn, req, apiSetName(app, req.payload, &w), w.items()),
+        .SET_AVATAR => respond(conn, req, apiSetAvatar(app, req.payload, &w), w.items()),
+        .GET_AVATAR_ID => respond(conn, req, apiGetAvatarId(app, req.payload, &w), w.items()),
+        .SEND_FILE => respond(conn, req, apiSendFile(app, req.payload, &w), w.items()),
+        .START_CALL => respond(conn, req, apiStartCall(app, req.payload, &w), w.items()),
+        .ANSWER_CALL => respond(conn, req, apiAnswerCall(app, req.payload, &w), w.items()),
+        .END_CALL => respond(conn, req, apiEndCall(app, req.payload, &w), w.items()),
+        .BLOCK_CONTACT => respond(conn, req, apiBlock(app, req.payload, true), w.items()),
+        .UNBLOCK_CONTACT => respond(conn, req, apiBlock(app, req.payload, false), w.items()),
+        .CONNECT => respond(conn, req, apiConnect(app, req.payload, &w), w.items()),
+        .LISTEN => respond(conn, req, apiListen(app, req.payload, &w), w.items()),
     }
     return true;
 }
+
+/// Отправить ответ метода (единая точка).
+fn respond(conn: *api_srv.Conn, req: ApiRequest, status: api.Status, payload: []const u8) void {
+    conn.sendResponse(@intFromEnum(req.method), req.request_id, status, payload);
+}
+
+/// INTERNAL при переполнении сборщика ответа.
+fn internal(conn: *api_srv.Conn, req: ApiRequest) bool {
+    conn.sendResponse(@intFromEnum(req.method), req.request_id, .INTERNAL, &.{});
+    return true;
+}
+
+/// CONNECT: payload [cid u32][addr str16] — прямое подключение к контакту
+/// (обычно не нужно: автодозвон/LAN сами). Ответ пуст.
+fn apiConnect(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    const addr = r.readStr16() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (addr.len == 0) return .BAD_ARGS;
+    {
+        app.lock();
+        defer app.unlock();
+        if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    }
+    establishTo(app, addr, @intCast(cid), .initiator) catch |e| switch (statusOf(e)) {
+        .NO_CONTACT => return .NO_CONTACT,
+        .NO_RELAY => return .NO_RELAY,
+        else => return .TRANSPORT_FAILED,
+    };
+    return .OK;
+}
+
+/// LISTEN: payload [addr str16][cid u32] — слушать входящие для контакта
+/// (обычно не нужно: автолистенер уже слушает). Ответ пуст.
+fn apiListen(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    _ = w;
+    var r = api.Reader.init(payload);
+    const addr = r.readStr16() catch return .BAD_FRAME;
+    const cid = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (addr.len == 0) return .BAD_ARGS;
+    const lsn = tcp.listen(addr) catch return .TRANSPORT_FAILED;
+    const lp = app.alloc.create(tcp.Listener) catch return .INTERNAL;
+    lp.* = lsn;
+    const th = std.Thread.spawn(.{}, struct {
+        fn go(a: *App, l: *tcp.Listener, c: i64) void {
+            acceptLoop(a, l, c);
+        }
+    }.go, .{ app, lp, @as(i64, @intCast(cid)) }) catch return .INTERNAL;
+    th.detach();
+    return .OK;
+}
+
 fn badUsage() error{BadUsage} {
     std.debug.print("{s}\n", .{usage});
     return error.BadUsage;
@@ -2314,15 +2242,6 @@ pub fn main(start: std.process.Init) !void {
     var id = try identity.Identity.fromSeed(seed);
     defer id.deinit();
 
-    if (std.mem.eql(u8, cmd, "id")) {
-        const bundle = id.bundle();
-        var hex_buf: [130]u8 = undefined;
-        const hx = try toHex(&hex_buf, &bundle);
-        var fp_buf: [96]u8 = undefined;
-        std.debug.print("bundle(hex): {s}\nfingerprint: {s}\n", .{ hx, try id.fingerprintTo(&fp_buf) });
-        return;
-    }
-
     if (std.mem.eql(u8, cmd, "serve")) {
         // потоки: rx-сессий, тикер presence, accept-loop — аллокатор общий
         var dbg_state = std.heap.DebugAllocator(.{ .thread_safe = true }){};
@@ -2348,12 +2267,6 @@ pub fn main(start: std.process.Init) !void {
             pcm_heap = std.fmt.allocPrint(alloc, "{s}/.shopot/pcm", .{home}) catch "";
         }
 
-        // буфер переписки по контактам: heap-массив (стеку 12+ МБ не отдавать)
-        const threads = alloc.alloc(tui_mod.Thread, 256) catch
-            return error.OutOfMemory;
-        // alloc возвращает сырую память (DebugAllocator заполняет 0xAA):
-        // каждый Thread обязан получить значения полей по умолчанию
-        for (threads) |*t| t.* = .{};
         var app = App{
             .alloc = alloc,
             .io = io,
@@ -2364,8 +2277,6 @@ pub fn main(start: std.process.Init) !void {
             .hb = std.AutoHashMap(i64, hb.State).init(alloc),
             .sess_ctx = std.AutoHashMap(i64, *SessCtx).init(alloc),
             .call_pcm_dir = if (pcm_heap.len > 0) pcm_heap else null,
-            .threads = threads,
-            .tz = tui_mod.tzOffset(),
         };
         @memcpy(app.home_buf[0..app.home_len], home[0..app.home_len]);
         eng.ev = app.events();
@@ -2403,8 +2314,8 @@ pub fn main(start: std.process.Init) !void {
             }
         }
 
-        // Единственный интерфейс: UDS-апи для клиентов
-        cli_srv.start(&app, home);
+        // Единственный интерфейс: бинарное UDS-апи для GUI-клиента
+        api_srv.start(&app, home);
         std.debug.print("serve: демон работает, UDS-апи готово\n", .{});
         while (app.running) {
             const req: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };

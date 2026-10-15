@@ -1,5 +1,50 @@
 # Changelog — shopot-zig
 
+## [неизданное] — API 1.0.0: бинарный протокол UDS, CLI/TUI удалены
+
+- **Бинарный кадровый протокол** вместо построчных строк (app/api.zig):
+  16-байтный заголовок (magic 0x5A50, версия, kind, метод/событие,
+  request_id, статус, длина u32) + payload ≤ 1 МиБ. LE, без JSON/varint.
+  Один запрос = один типизированный ответ; корреляция по request_id.
+- **Машинные коды статусов**: `BAD_FRAME, UNKNOWN_METHOD, BAD_ARGS,
+  NO_CONTACT, CONTACT_BLOCKED, NOT_FOUND, TOO_BIG, BAD_INVITE_CODE,
+  TOO_MANY_INVITES, FILE_NOT_FOUND, UNSUPPORTED_REACTION, NO_SESSION,
+  BUSY, NO_CALL, NO_RELAY, TRANSPORT_FAILED, INTERNAL` — человекотекст
+  на проводе больше не существует.
+- **Номенклатура методов**: `GET_VERSION, GET_IDENTITY, CREATE_INVITE,
+  ACCEPT_INVITE, LIST_CONTACTS, SEND_MESSAGE, SET_REACTION,
+  REMOVE_REACTION, GET_HISTORY, GET_MESSAGE, SET_NAME, SET_AVATAR,
+  GET_AVATAR_ID, SEND_FILE, START_CALL, ANSWER_CALL, END_CALL,
+  BLOCK_CONTACT, UNBLOCK_CONTACT, CONNECT, LISTEN, CLOSE`.
+- **Типизированные ответы**: SEND_MESSAGE → [msg_id 16][queued u8];
+  GET_HISTORY → [total][count]×{flags,msg_id,ts,body}; LIST_CONTACTS →
+  count×{cid,flags,last_seen,name}; GET_IDENTITY → bundle+fingerprint
+  (raw 32B). SET_AVATAR теперь принимает байты inline (путь не нужен).
+  REMOVE_REACTION добавлен (конверт REACT op=remove).
+- **События**: `MESSAGE_RECEIVED, MESSAGE_DELIVERED, PRESENCE, REACTION,
+  CALL_STATE, AVATAR_RECEIVED (байты аватара клиенту), FILE_RECEIVED,
+  CONTACT_JOINED, CONTACT_PROFILE (новое: эхо PROFILE), BLOCKED_BY_PEER`.
+  Событие REACTION несёт op (add/remove).
+- **CLI/TUI удалены полностью**: tui.zig и cli_server.zig (строчный
+  протокол, теги @n, `! код: текст`, голый текст в чат) удалены; REPL,
+  fb()/execCmd, подкоманда `id` — тоже. Демон: init/serve/relay; клиент
+  один — GUI через бинарное UDS-апи.
+- **engine**: Reaction.op (add/remove) + событие onProfile (имя/avatar_id
+  пира). Запись в shopot_tests.zig: юнит-тесты api.zig в общем прогоне.
+- **docs**: CORE-API.md переписан как бинарная спецификация (контракт GUI);
+  PROTOCOL.md и BACKEND_ANSWERS.md отмечают замену протокола.
+- Ревизия по внешним практикам: RFC 9457 (problem details) — коды вместо
+  текста; гайды по enum-кодам ошибок — стабильные SCREAMING_SNAKE имена.
+
+## [неизданное] — ответы GUI (BACKEND_ANSWERS) + version
+
+- **BACKEND_ANSWERS.md**: ответы на 14 вопросов GUI-команды (эхо, ts,
+  id 128-бит, очередь офлайн, коды ошибок, block, инвайт, cid).
+- **Команда `version`**: `core 0.5.0` — readyness-проба для GUI при
+  спавне демона.
+- **Формат ошибок закреплён**: `! <код>: <текст>`; getmessage промах
+  теперь `! not_found: не найдено` (было без кода).
+
 ## [неизданное] — P0 из ROADMAP: релей + джиттер-буфер
 
 - **Релей** (net/relay.zig): `shopot relay <host:port>` — само-хостнутый
