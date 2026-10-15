@@ -3,7 +3,7 @@
 Contribution rules (kernel-style: commit format, checklist, sign-off, review
 process) live in the repository root:
 [CONTRIBUTING.md](../CONTRIBUTING.md) /
-[CONTRIBUTING.ru.md](../CONTRIBUTING.ru.md).
+[CONTRIBUTING.md (ru)](../docs/ru/CONTRIBUTING.md).
 
 Local reminders for the `zig/` tree:
 
