@@ -49,5 +49,5 @@ C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из master; арх�
 
 ## Официальный клиент
 
-- Второй разработчик проекта shopot: [EryynIT](https://github.com/EryynIT)
-- Официальный клиент shopot: [shopot](https://github.com/EryynIT/shopot)
+- Второй разработчик проекта shopot: [EryynIT](https://github.com/EryyynIT)
+- Официальный клиент shopot: [shopot](https://github.com/EryyynIT/shopot)
