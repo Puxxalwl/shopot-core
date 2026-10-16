@@ -1,4 +1,4 @@
-# shopot Wire Protocol v4
+# shopot Wire Protocol v5
 
 Normative byte-level specification of the shopot P2P messenger wire protocol.
 Implementation: `shopot-zig` (this repository). Russian version:
@@ -63,20 +63,47 @@ DPI classifier sees noise statistically similar to a compressed binary stream.
 It is traffic **mimicry**, not anonymity: a global observer still sees that two
 IPs are connected (§18, §15).
 
-## 3. Handshake (XX-like, m1 → m2 → m3)
+## 3. Handshake (hybrid XX-like + ML-KEM-768, m1 → m2 → m3)
 
-- `chaining_key = BLAKE2s-256("shopot-hs-v4")`; transcript hash = BLAKE2s-256
+- `chaining_key = BLAKE2s-256("shopot-hs-v5-pq")`; transcript hash = BLAKE2s-256
   over all handshake messages. The domain string **is** the wire protocol
-  version: v4 = entity-carrying TEXT (§7.1). Kernels of different versions
-  derive different chaining keys, so their m2/m3 boxes never open — the
-  connection fails fast instead of silently dropping TEXT frames.
-- **m1** (A → B): `e_pub_A[32] || enc_pk_A[32]` — the initiator's static
-  X25519 public key travels in the clear: the responder needs it to look up
-  the contact before anything is encrypted.
-- **m2** (B → A): `e_pub_B[32]`, `DH(e_A, e_B)`, `enc_pk_B[32]` inside a box,
-  `DH(e_A, static_B)`, `sig_B = Ed25519(transcript)` (responder static
-  signature, covers the transcript as of m2).
-- **m3** (A → B): `DH(static_A, e_B)`, `sig_A = Ed25519(transcript)`.
+  version: v5 = hybrid post-quantum KEX (ephemeral ML-KEM-768, FIPS 203,
+  from `std.crypto`, mixed with the classical X25519 path). Kernels of
+  different versions derive different chaining keys, so their m2/m3 boxes
+  never open — the connection fails fast instead of a silent downgrade.
+- **m1** (A → B, 1248 bytes): `e_pub_A[32] || enc_pk_A[32] || mlkem_pk_A[1184]`
+  — the initiator's static X25519 public key travels in the clear: the
+  responder needs it to look up the contact before anything is encrypted.
+  `mlkem_pk_A` is the initiator's **ephemeral** ML-KEM-768 encapsulation key
+  (not part of the identity bundle).
+- **m2** (B → A, 1232 bytes): `e_pub_B[32] || mlkem_ct[1088] || box`. The
+  responder encapsulates to `mlkem_pk_A` (`mlkem_ct`, 1088 bytes); the
+  KEM shared secret is mixed into the chaining key right after `DH(e_A, e_B)`.
+  The box holds `enc_pk_B[32] || sig_B[64]`; `DH(e_A, static_B)` follows.
+  `sig_B = Ed25519(transcript)` covers the transcript as of m2 — i.e. all of
+  m1 including the initiator's ML-KEM public key.
+- **m3** (A → B, 112 bytes): the initiator decapsulates `mlkem_ct` (its KEM
+  secret key is derived from the same ephemeral seed as its X25519 pair, via a
+  separate HKDF domain), `DH(static_A, e_B)`,
+  `sig_A = Ed25519(transcript)` — the transcript now covers all of m2
+  including the KEM ciphertext.
+- ML-KEM ciphertext authentication: a tampered ciphertext decapsulates to a
+  different secret (ML-KEM implicit rejection), the chaining keys diverge and
+  the m3 box never opens — the KEM output is authenticated by the key
+  schedule itself, plus the transcript signatures above.
+- Key schedule order (identical on both sides): `ee` (X25519 ephemeral-ephemeral)
+  → ML-KEM shared secret → `es` → `se`; the final `(send_key, recv_key)` pair
+  comes from `HKDF-Expand(ck, "shopot-hs-finish-v5")`. Ephemeral ML-KEM seeds
+  are derived from the handshake ephemeral seed via HKDF/BLAKE2s domains
+  `shopot-hs-mlkem-seed-v1` / `shopot-hs-mlkem-encap-v1` — the production
+  seed must come from a CSPRNG.
+- **Hybrid property:** classical security holds if ML-KEM is broken;
+  post-quantum confidentiality (store-now-decrypt-later resistance for
+  recorded traffic) holds if X25519 is broken. Authentication remains
+  Ed25519 (classical): a *quantum* active MITM during the handshake is not
+  covered — PQ signatures would require an identity-bundle change
+  (documented limitation, not silently assumed). Ratchet epoch rotation
+  (§5) likewise stays X25519; only the handshake root is PQ-hybrid.
 - Both sides verify the peer signature against the **known contact bundle**.
   A MITM presenting its own keys fails verification on m2/m3 (`BadSignature`)
   and the connection is dropped.
@@ -502,14 +529,19 @@ live instance by design).
 ## 19. Versioning and compatibility
 
 - The wire protocol is versioned by the **version byte** bound into the
-  handshake transcript (domain `shopot-hs-v4`, i.e. 4) and the storage
+  handshake transcript (domain `shopot-hs-v5-pq`, i.e. 5) and the storage
   header (3, see below).
 - Incompatible changes require bumping the version byte and an entry in
   [CHANGELOG.md](../CHANGELOG.md). No silent redefinition of existing fields.
-- v4 (entities in TEXT, §7.1) is incompatible with v3 on the wire: the
-  handshake domain was bumped, so mixed-version peers never establish a
-  session (fail-fast). The storage header stays 3: the `msg`/`outbox` tail
-  is additive and read tolerantly, history survives an upgrade.
+- v5 (hybrid ML-KEM-768 handshake, §3) is incompatible with v4 on the wire:
+  the handshake domain was bumped and m1/m2 grew to carry the KEM public key
+  (1184 bytes) and ciphertext (1088 bytes), so mixed-version peers never
+  establish a session (fail-fast; v4 kernels reject the 1248-byte m1 frame
+  outright, v5 kernels never open a v4 box). The storage header stays 3:
+  history survives an upgrade.
+- v4 (entities in TEXT, §7.1) was likewise incompatible with v3 on the wire
+  (the handshake domain was bumped). The `msg`/`outbox` storage tail stayed
+  additive and read tolerantly.
 - A major change of the UDS API contract (CORE-API.md) increments the API
   major version returned by `GET_VERSION`.
 - Sealed frames (0xA1 + epoch header) and `RATCHET_KEY` are incompatible with

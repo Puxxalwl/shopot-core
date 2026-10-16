@@ -1237,12 +1237,14 @@ fn handleAcceptedConn(app: *App, tc: *tcp.TcpConn) void {
         tc.deinit();
         return;
     };
+    // длина m1 задаёт crypto/handshake.zig (гибрид X25519+ML-KEM-768);
+    // чужая/старая версия ядра не сходится в длине кадра — закрываем
     const m1_len = std.mem.readInt(u16, &hdr, .little);
-    if (m1_len != 64) {
+    if (m1_len != shopot.crypto.handshake.m1_len) {
         tc.deinit();
         return;
     }
-    var m1: [64]u8 = undefined;
+    var m1: [shopot.crypto.handshake.m1_len]u8 = undefined;
     raw.readAll(&m1) catch {
         tc.deinit();
         return;

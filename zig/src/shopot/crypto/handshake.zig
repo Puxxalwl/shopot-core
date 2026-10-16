@@ -1,21 +1,35 @@
-//! XX-подобный рукопожатие: транскрипт BLAKE2s-256, DH X25519 (ee/es/se),
-//! шифрование статиков и подписей ChaCha20-Poly1305, подписи Ed25519 над
-//! хэшем транскрипта. Ноль аллокаций: все сообщения и состояние — на буферах
-//! и в стеке вызывающего. Эфемеральные ключи задаёт вызывающий сидами.
+//! XX-подобное гибридное рукопожатие: транскрипт BLAKE2s-256, DH X25519
+//! (ee/es/se) и ephemeral ML-KEM-768 для защиты от store-now-decrypt-later.
+//! Статики и подписи шифруются ChaCha20-Poly1305; подписи Ed25519 покрывают
+//! транскрипт. PQ KEM применяется только эфемерно: public key/ciphertext
+//! входят в m1/m2, а общий секрет смешивается в chaining key через HKDF.
+//! Ноль аллокаций: все сообщения и состояние — на буферах и в стеке.
+//! Эфемеральные ключи задаёт вызывающий сидами.
+//!
+//! Это гибридный режим: классическая безопасность сохраняется, если ML-KEM
+//! будет скомпрометирован, а постквантовая конфиденциальность — если X25519
+//! будет взломан. Аутентификация по-прежнему использует существующие Ed25519
+//! identity keys; полноценная PQ-аутентификация требует отдельного изменения
+//! identity bundle и не подменяется этим KEX.
 //!
 //! Раскладка сообщений:
-//!   m1 = e1_pub                                            (32)
-//!   m2 = e2_pub || box(resp_enc_pk || sig_r)               (144)
-//!   m3 = box(init_enc_pk || sig_i)                         (112)
+//!   m1 = e1_pub || init enc_pk || mlkem_pk             (1248)
+//!   m2 = e2_pub || mlkem_ct || box(resp_pk || sig_r)   (1232)
+//!   m3 = box(init_pk || sig_i)                          (112)
 //!
 //! Последовательность MixKey (одинакова у сторон):
-//!   h0 = ck0 = BLAKE2s256("shopot-hs-v4")
-//!   h1 = H(h0||e1);  h2 = H(h1||e2);  ee = X25519(e2,e1) -> k1, ck
-//!   sig_r = Sign_r(h2);  box1 = Seal(k1, n=0, ad=h2);  h3 = H(h2||box1)
-//!   es = X25519(s_r,e1) -> k2, ck
+//!   h0 = ck0 = BLAKE2s256("shopot-hs-v5-pq")
+//!   h1 = H(h0||m1);  h2 = H(h1||e2)
+//!   ee = X25519(e2,e1) -> k1, ck;  pq = ML-KEM(m1_pk) -> ck
+//!   sig_r = Sign_r(h2);  box1 = Seal(k1, n=0, ad=h2)
+//!   h3 = H(h2||mlkem_ct||box1);  es = X25519(s_r,e1) -> k2, ck
 //!   sig_i = Sign_i(h3);  box2 = Seal(k2, n=1, ad=h3);  h4 = H(h3||box2)
 //!   se = X25519(s_i,e2) -> ck
-//!   (send_key, recv_key) = HKDF-Expand(ck, "shopot-hs-finish")
+//!   (send_key, recv_key) = HKDF-Expand(ck, "shopot-hs-finish-v5")
+//!
+//! sig_r покрывает h2 (весь m1, включая mlkem_pk инициатора); sig_i
+//! покрывает h3 (mlkem_ct ответчика + box1). Подмена любого PQ-поля
+//! ломает подпись или ключи — тайп-чекинга «вслепую» нет.
 
 const std = @import("std");
 
@@ -24,29 +38,33 @@ const aead = @import("aead.zig");
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const X25519 = std.crypto.dh.X25519;
+const MlKem768 = std.crypto.kem.ml_kem.MLKem768;
 const Ed25519 = std.crypto.sign.Ed25519;
 const Blake2s256 = std.crypto.hash.blake2.Blake2s256;
 
-/// Домен-версия протокола. v4: TEXT-конверт несёт хвост entities (формат
-/// см. proto/envelope.zig). Домен входит в цепной ключ рукопожатия: ядра
-/// разных версий НЕ сходятся вовсе (боксы m2/m3 не открываются) —
-/// fail-fast вместо молчаливой потери TEXT; несовместимое изменение = новая
-/// версия в домене (PROTOCOL.md).
-const domain = "shopot-hs-v4";
-const mix_info = "shopot-hs-mix";
-const finish_info = "shopot-hs-finish";
+/// Домен-версия протокола. v5-pq: гибрид X25519+ML-KEM-768 (§ PROTOCOL.md).
+/// Домен входит в цепной ключ рукопожатия: ядра разных версий НЕ сходятся
+/// вовсе (боксы m2/m3 не открываются) — fail-fast вместо молчаливого
+/// даунгрейда; несовместимое изменение = новая версия в домене.
+const domain = "shopot-hs-v5-pq";
+const mix_info = "shopot-hs-mix-v5";
+const finish_info = "shopot-hs-finish-v5";
+const kem_seed_domain = "shopot-hs-mlkem-seed-v1";
+const kem_encap_domain = "shopot-hs-mlkem-encap-v1";
 
 const payload_len = 32 + 64; // статический ключ || подпись Ed25519
+const kem_pk_len = MlKem768.PublicKey.encoded_length;
+const kem_ct_len = MlKem768.ciphertext_length;
+const kem_seed_len = MlKem768.seed_length;
 
-/// Длина m1: e1_pub (32) || init enc_pk (32). enc_pk идёт открытым текстом
-/// только для маршрутизации у responder-а; личность доказывается подписью
-/// в m3 (транскрипт покрывает e1_pub, enc_pk проверяется через sig в m3).
-pub const m1_len = 64;
+/// Длина m1: e1_pub (32) || init enc_pk (32) || ML-KEM-768 public key.
+/// enc_pk идёт открытым текстом только для маршрутизации responder-а.
+pub const m1_len = 32 + 32 + kem_pk_len;
 
-/// Длина m2: e2_pub (32) || box (payload_len + tag).
-pub const m2_len = 32 + payload_len + aead.tag_length;
+/// Длина m2: e2_pub (32) || ML-KEM-768 ciphertext || encrypted identity box.
+pub const m2_len = 32 + kem_ct_len + payload_len + aead.tag_length;
 
-/// Длина m3: box (payload_len + tag).
+/// Длина m3: encrypted identity box (payload_len + tag).
 pub const m3_len = payload_len + aead.tag_length;
 
 /// Длина подписи Ed25519.
@@ -64,6 +82,8 @@ pub const Error = error{
     /// контакта (привязка личности к статике; практика libp2p-noise:
     /// приложение обязано проверить remote static после XX).
     KeyMismatch,
+    /// Вырожденный сид ML-KEM (практически недостижим для CSPRNG-сида).
+    KemKeygen,
 };
 
 /// Сессионные ключи; send/recv зеркальны у двух сторон.
@@ -83,6 +103,27 @@ fn hashParts(parts: []const []const u8) [32]u8 {
     var out: [32]u8 = undefined;
     h.final(&out);
     return out;
+}
+
+/// Сид ML-KEM-пар инициатора: HKDF(eph_seed, домен) — отдельный домен,
+/// чтобы X25519-скаляр и ML-KEM-сид не коррелировали.
+fn deriveKemSeed(eph_seed: [32]u8) [kem_seed_len]u8 {
+    var seed: [kem_seed_len]u8 = undefined;
+    HkdfSha256.expand(&seed, kem_seed_domain, eph_seed);
+    return seed;
+}
+
+/// Сид инкапсуляции ответчика: BLAKE2s(домен || eph_seed || m1) — привязка
+/// к конкретному m1 исключает переиспользование рандомности инкапсуляции
+/// между разными инициаторами при одном и том же eph_seed.
+fn deriveEncapSeed(eph_seed: [32]u8, m1: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    var h = Blake2s256.init(.{});
+    h.update(kem_encap_domain);
+    h.update(&eph_seed);
+    h.update(m1);
+    h.final(&digest);
+    return digest;
 }
 
 /// MixKey: (ck, key) = HKDF(ck, ikm); ck обновляется на месте, возвращается
@@ -111,21 +152,29 @@ pub const Initiator = struct {
     h: [32]u8,
     ck: [32]u8,
     eph_secret: [32]u8,
+    kem_secret: MlKem768.SecretKey,
     my_id: *const identity.Identity,
 
-    /// Начинает рукопожатие: пишет m1 (эфемерный X25519 из `eph_seed`).
-    pub fn start(out_m1: *[m1_len]u8, my_id: *const identity.Identity, eph_seed: [32]u8) Initiator {
+    /// Начинает гибридное рукопожатие: m1 содержит X25519-паблик,
+    /// enc_pk и ephemeral ML-KEM-768 public key. Оба эфемерных ключа
+    /// детерминированы из `eph_seed` (для тестов); в проде eph_seed
+    /// обязан приходить из CSPRNG — сид определяет обе пары.
+    pub fn start(out_m1: *[m1_len]u8, my_id: *const identity.Identity, eph_seed: [32]u8) Error!Initiator {
         var h0: [32]u8 = undefined;
         Blake2s256.hash(domain, &h0, .{});
 
         const eph = X25519.KeyPair.generateDeterministic(eph_seed);
+        const kem_seed = deriveKemSeed(eph_seed);
+        const kem = MlKem768.KeyPair.generateDeterministic(kem_seed) catch return error.KemKeygen;
+        const kem_pk = kem.public_key.toBytes();
         out_m1[0..32].* = eph.public_key;
         out_m1[32..64].* = my_id.enc_public;
-
+        @memcpy(out_m1[64..][0..kem_pk_len], &kem_pk);
         return .{
             .h = hashParts(&[_][]const u8{ &h0, out_m1 }),
             .ck = h0,
             .eph_secret = eph.secret_key,
+            .kem_secret = kem.secret_key,
             .my_id = my_id,
         };
     }
@@ -139,7 +188,8 @@ pub const Initiator = struct {
         if (m2.len != m2_len) return error.BadLength;
 
         const e2_public: [32]u8 = m2[0..32].*;
-        const box1: []const u8 = m2[32..];
+        const kem_ct = m2[32..][0..kem_ct_len];
+        const box1: []const u8 = m2[32 + kem_ct_len ..];
 
         // h2 = H(h1||e2)
         self.h = hashParts(&[_][]const u8{ &self.h, &e2_public });
@@ -147,6 +197,13 @@ pub const Initiator = struct {
         // ee = X25519(e_i, e_r) -> k1
         const ee = X25519.scalarmult(self.eph_secret, e2_public) catch return error.Tampered;
         const k1 = mixKey(&self.ck, &ee);
+
+        // pq = ML-KEM-деинкапсуляция в цепной ключ (порядок ee -> pq -> es
+        // -> se одинаков у сторон). Подмена ct даёт другой секрет: ML-KEM
+        // отвечает неявным отказом (псевдослучайный ключ), ключи
+        // расходятся и m3 у ответчика не открывается.
+        const kem_ss = self.kem_secret.decaps(kem_ct) catch return error.Tampered;
+        _ = mixKey(&self.ck, &kem_ss);
 
         // открыть box1: resp_enc_pk || sig_r (ad = h2)
         var payload: [payload_len]u8 = undefined;
@@ -163,8 +220,9 @@ pub const Initiator = struct {
         // подпись ответчика над транскриптом h2
         try identity.Identity.verify(peer_sign_public, &self.h, sig_r);
 
-        // транскрипт после m2
-        self.h = hashParts(&[_][]const u8{ &self.h, box1 });
+        // транскрипт после m2: хвост m2 (mlkem_ct || box1) целиком —
+        // зеркально ответчику, который хэширует out_m2[32..]
+        self.h = hashParts(&[_][]const u8{ &self.h, m2[32..] });
         const h3 = self.h;
 
         // es = X25519(e_i, s_r) -> k2
@@ -197,8 +255,8 @@ pub const Responder = struct {
     e2_secret: [32]u8,
     my_id: *const identity.Identity,
 
-    /// Обрабатывает m1, пишет m2 (эфемерный X25519 из `eph_seed`;
-    /// sig подписывается сидом Ed25519 из `my_id`).
+    /// Обрабатывает m1, пишет m2 (эфемерный X25519 и ML-KEM-инкапсуляцию
+    /// из `eph_seed`; sig подписывается сидом Ed25519 из `my_id`).
     pub fn recv1(out_m2: *[m2_len]u8, my_id: *const identity.Identity, m1: []const u8, eph_seed: [32]u8) Error!Responder {
         if (m1.len != m1_len) return error.BadLength;
 
@@ -206,9 +264,13 @@ pub const Responder = struct {
         Blake2s256.hash(domain, &h0, .{});
 
         const e1_public: [32]u8 = m1[0..32].*;
+        const kem_pk_bytes = m1[64..][0..kem_pk_len];
+        const kem_pk = MlKem768.PublicKey.fromBytes(kem_pk_bytes) catch return error.Tampered;
+        const kem_seed = deriveEncapSeed(eph_seed, m1);
+        const kem = kem_pk.encapsDeterministic(&kem_seed);
 
-        // транскрипт покрывает весь m1 (включая enc_pk инициатора):
-        // подмена любого байта меняет ключи и роняет подпись в m3
+        // транскрипт покрывает весь m1 (включая enc_pk и mlkem_pk
+        // инициатора): подмена любого байта меняет ключи и роняет подпись
         var self = Responder{
             .h = hashParts(&[_][]const u8{ &h0, m1 }),
             .ck = h0,
@@ -227,15 +289,20 @@ pub const Responder = struct {
         const ee = X25519.scalarmult(self.e2_secret, e1_public) catch return error.Tampered;
         const k1 = mixKey(&self.ck, &ee);
 
-        // m2: e2_pub || box(resp_enc_pk || sig_r), ad = h2
+        // pq = ML-KEM-общий секрет в цепной ключ (тот же порядок, что у
+        // инициатора: ee -> pq -> es -> se)
+        _ = mixKey(&self.ck, &kem.shared_secret);
+
+        // m2: e2_pub || mlkem_ct || box(resp_enc_pk || sig_r), ad = h2
         var payload: [payload_len]u8 = undefined;
         payload[0..32].* = my_id.enc_public;
         try signTranscript(my_id, self.h, payload[32..payload_len]);
         out_m2[0..32].* = e2.public_key;
-        aead.seal(out_m2[32..], &payload, k1, aead.nonceFor(0), &self.h);
+        @memcpy(out_m2[32..][0..kem_ct_len], &kem.ciphertext);
+        aead.seal(out_m2[32 + kem_ct_len ..], &payload, k1, aead.nonceFor(0), &self.h);
         @memset(&payload, 0);
 
-        // транскрипт после m2
+        // транскрипт после m2: mlkem_ct + box1 хвостом целиком
         self.h = hashParts(&[_][]const u8{ &self.h, out_m2[32..] });
 
         // es = X25519(s_r, e_i) -> k2 (ключ статики инициатора в m3)
@@ -320,7 +387,7 @@ fn runHandshake() !struct { init_keys: SessionKeys, resp_keys: SessionKeys, m1: 
     var m2: [m2_len]u8 = undefined;
     var m3: [m3_len]u8 = undefined;
 
-    var init = Initiator.start(&m1, &id_i, eph_i_seed);
+    var init = try Initiator.start(&m1, &id_i, eph_i_seed);
     var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
     const init_keys = try init.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public);
     const resp_keys = try resp.recv3(&m3, id_i.sign_public, id_i.enc_public);
@@ -374,12 +441,12 @@ test "handshake: детерминизм при тех же сидах" {
     var m3b: [m3_len]u8 = undefined;
 
     const eph_alt: [32]u8 = @splat(0x33);
-    var ia = Initiator.start(&m1a, &id_i, eph_i_seed);
+    var ia = try Initiator.start(&m1a, &id_i, eph_i_seed);
     var ra = try Responder.recv1(&m2a, &id_r, &m1a, eph_r_seed);
     const ka = try ia.recv2(&m3a, &m2a, id_r.sign_public, id_r.enc_public);
     _ = try ra.recv3(&m3a, id_i.sign_public, id_i.enc_public);
 
-    var ib = Initiator.start(&m1b, &id_i, eph_alt);
+    var ib = try Initiator.start(&m1b, &id_i, eph_alt);
     var rb = try Responder.recv1(&m2b, &id_r, &m1b, eph_alt);
     const kb = try ib.recv2(&m3b, &m2b, id_r.sign_public, id_r.enc_public);
     _ = try rb.recv3(&m3b, id_i.sign_public, id_i.enc_public);
@@ -398,7 +465,7 @@ test "handshake: битый байт в m2 -> Tampered" {
     var m2: [m2_len]u8 = undefined;
     var m3: [m3_len]u8 = undefined;
 
-    var init = Initiator.start(&m1, &id_i, eph_i_seed);
+    var init = try Initiator.start(&m1, &id_i, eph_i_seed);
     var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
     _ = &resp;
 
@@ -424,7 +491,7 @@ test "handshake: чужой sign_pk у инициатора -> BadSignature" {
     var m2: [m2_len]u8 = undefined;
     var m3: [m3_len]u8 = undefined;
 
-    var init = Initiator.start(&m1, &id_i, eph_i_seed);
+    var init = try Initiator.start(&m1, &id_i, eph_i_seed);
     var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
     _ = &resp;
 
@@ -444,7 +511,7 @@ test "handshake: подмена sign_pk у ответчика -> BadSignature" {
     var m2: [m2_len]u8 = undefined;
     var m3: [m3_len]u8 = undefined;
 
-    var init = Initiator.start(&m1, &id_i, eph_i_seed);
+    var init = try Initiator.start(&m1, &id_i, eph_i_seed);
     var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
     const keys = try init.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public);
 
@@ -452,7 +519,7 @@ test "handshake: подмена sign_pk у ответчика -> BadSignature" {
     try std.testing.expectError(error.BadSignature, resp.recv3(&m3, id_x.sign_public, id_i.enc_public));
 
     // контроль: с правильным ключом всё проходит
-    var init2 = Initiator.start(&m1, &id_i, eph_i_seed);
+    var init2 = try Initiator.start(&m1, &id_i, eph_i_seed);
     var resp2 = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
     const keys2 = try init2.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public);
     const keys3 = try resp2.recv3(&m3, id_i.sign_public, id_i.enc_public);
@@ -472,7 +539,7 @@ test "handshake: BadLength" {
 
     try std.testing.expectError(error.BadLength, Responder.recv1(&m2, &id_r, m1[0 .. m1.len - 1], eph_r_seed));
 
-    var init = Initiator.start(&m1, &id_i, eph_i_seed);
+    var init = try Initiator.start(&m1, &id_i, eph_i_seed);
     _ = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
     try std.testing.expectError(error.BadLength, init.recv2(&m3, m2[0 .. m2.len - 1], id_r.sign_public, id_r.enc_public));
 
@@ -493,7 +560,7 @@ test "handshake: чужая статика в боксе -> KeyMismatch" {
     var m2: [m2_len]u8 = undefined;
     var m3: [m3_len]u8 = undefined;
 
-    var init = Initiator.start(&m1, &id_i, eph_i_seed);
+    var init = try Initiator.start(&m1, &id_i, eph_i_seed);
     var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
 
     // инициатор ждёт статику id_x, а пришла id_r
@@ -501,11 +568,55 @@ test "handshake: чужая статика в боксе -> KeyMismatch" {
 
     // контрольный m3 (валидный путь), затем ответчик ждёт статику id_x,
     // а в m3 — id_i
-    var init2 = Initiator.start(&m1, &id_i, eph_i_seed);
+    var init2 = try Initiator.start(&m1, &id_i, eph_i_seed);
     _ = try init2.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public);
     try std.testing.expectError(error.KeyMismatch, resp.recv3(&m3, id_i.sign_public, id_x.enc_public));
 
     // null (pending-join): сверка не делается, всё проходит
     var resp2 = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
     _ = try resp2.recv3(&m3, null, null);
+}
+
+test "handshake: PQ — подмена mlkem_pk в m1 -> Tampered" {
+    var id_i = try testIdentity(seed_i);
+    defer id_i.deinit();
+    var id_r = try testIdentity(seed_r);
+    defer id_r.deinit();
+
+    var m1: [m1_len]u8 = undefined;
+    var m2: [m2_len]u8 = undefined;
+    var m3: [m3_len]u8 = undefined;
+
+    var init = try Initiator.start(&m1, &id_i, eph_i_seed);
+    // подмена последнего байта mlkem_pk (область rho: кодирование
+    // остаётся каноничным, но матрица/шифротекст меняются)
+    m1[m1.len - 1] ^= 0x01;
+    var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
+    _ = &resp;
+
+    // транскрипты сторон уже разошлись (h1 = H(h0||m1)): box1 не открывается
+    try std.testing.expectError(error.Tampered, init.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public));
+}
+
+test "handshake: PQ — подмена mlkem_ct в m2 меняет ключи, m3 не открывается" {
+    var id_i = try testIdentity(seed_i);
+    defer id_i.deinit();
+    var id_r = try testIdentity(seed_r);
+    defer id_r.deinit();
+
+    var m1: [m1_len]u8 = undefined;
+    var m2: [m2_len]u8 = undefined;
+    var m3: [m3_len]u8 = undefined;
+
+    var init = try Initiator.start(&m1, &id_i, eph_i_seed);
+    var resp = try Responder.recv1(&m2, &id_r, &m1, eph_r_seed);
+
+    // подмена байта ВНУТРИ mlkem_ct (box1 не тронут): box1 у инициатора
+    // всё ещё открывается (k1 не зависит от KEM), но ML-KEM-деинкапсуляция
+    // даёт другой секрет -> ck расходится -> k2 другой -> m3 у ответчика
+    // не открывается. Это и есть PQ-аутентификация ciphertext через
+    // расписание ключей.
+    m2[32 + 64] ^= 0x01;
+    _ = try init.recv2(&m3, &m2, id_r.sign_public, id_r.enc_public);
+    try std.testing.expectError(error.Tampered, resp.recv3(&m3, id_i.sign_public, id_i.enc_public));
 }

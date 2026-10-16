@@ -167,7 +167,8 @@ pub const Session = struct {
                 var m3: [handshake.m3_len]u8 = undefined;
                 var m1f: [2 + handshake.m1_len]u8 = undefined;
                 var m3f: [2 + handshake.m3_len]u8 = undefined;
-                var hs = handshake.Initiator.start(&m1, my_id, eph_seed);
+                var hs = handshake.Initiator.start(&m1, my_id, eph_seed) catch
+                    return SessionError.HandshakeFailed;
                 writeFrame(conn, &m1f, &m1) catch return SessionError.Closed;
                 _ = readFrame(conn, &m2) catch return SessionError.Closed;
                 keys = hs.recv2(&m3, &m2, peer_bundle[32..64].*, peer_bundle[0..32].*) catch |e| switch (e) {

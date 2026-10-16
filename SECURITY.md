@@ -27,6 +27,7 @@ availability. We aim to acknowledge within 72 hours.
 | Primitive | Implementation | Used for |
 |---|---|---|
 | X25519 | std.crypto | identity encryption key, ephemeral ECDH, ratchet DH steps |
+| ML-KEM-768 (FIPS 203) | std.crypto | ephemeral hybrid KEM in the handshake (store-now-decrypt-later resistance; mixed into the chaining key next to X25519 `ee`) |
 | Ed25519 | std.crypto | identity signatures (handshake auth, JOIN binding) |
 | ChaCha20-Poly1305 | std.crypto | AEAD for envelopes, frames, at-rest records, call frames |
 | Symmetric ratchet | own code on std HKDF/HMAC | per-message keys (peek/commit per Double Ratchet spec §3.5) |
@@ -39,6 +40,14 @@ The handshake additionally verifies the remote static X25519 key from
 m2/m3 against the known contact bundle (KeyMismatch closes the connection),
 per the noise-libp2p practice of validating the remote static after an XX
 handshake.
+
+Post-quantum scope (v5 handshake): confidentiality of the session root is
+hybrid — it holds as long as X25519 **or** ML-KEM-768 stays unbroken, so
+passively recorded traffic cannot be decrypted later by a quantum attacker.
+Authentication remains Ed25519 (classical): a quantum active MITM during
+the handshake is out of scope and would require PQ signatures in the
+identity bundle. Ratchet epoch rotation also stays X25519; only the
+handshake root is PQ-hybrid.
 
 Design rules enforced in review:
 
