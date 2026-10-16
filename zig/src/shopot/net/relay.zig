@@ -139,7 +139,9 @@ const Spin = struct {
     }
 };
 
-const sleep50: linux.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+/// Частота проверки второго клиента. 1 мс уменьшает время спаривания
+/// (обычно это один RTT), не влияя на пропускную способность уже спаренной пары.
+const sleep1: linux.timespec = .{ .sec = 0, .nsec = 1 * std.time.ns_per_ms };
 
 /// Сервер релея: цикл accept, спаривание, сплит. Блокирует навсегда;
 /// stop (для тестов): флаг + закрытый слушатель выводят из цикла.
@@ -209,7 +211,7 @@ fn relayConn(alloc: std.mem.Allocator, map: *std.AutoHashMap([marker_len]u8, *Pe
             };
             while (!self.paired) {
                 spin.unlock();
-                _ = linux.nanosleep(&sleep50, null);
+                _ = linux.nanosleep(&sleep1, null);
                 spin.lock();
                 // счёт коннекта мог умереть? пира ждём до закрытия fd
             }
@@ -255,9 +257,10 @@ fn closeFd(fd: linux.socket_t) void {
     _ = linux.close(fd);
 }
 
-/// Копирование fd -> peer_fd до обрыва (буфер 16 КБ на стеке потока).
+/// Копирование fd -> peer_fd до обрыва. 64 KiB снижает число read/write
+/// syscall на bulk transfer; память живёт только на стеке relay-потока.
 fn splice(fd: linux.socket_t, peer_fd: linux.socket_t) void {
-    var buf: [16384]u8 = undefined;
+    var buf: [64 * 1024]u8 = undefined;
     while (true) {
         const rc = linux.read(fd, &buf, buf.len);
         if (linux.errno(rc) != .SUCCESS) return;

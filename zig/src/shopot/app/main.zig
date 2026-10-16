@@ -2493,7 +2493,7 @@ fn apiGetAvatarId(app: *App, payload: []const u8, w: *api.Writer) api.Status {
 /// GET_HISTORY: payload [cid u32][limit u32] (0 → 50, максимум 200).
 /// Ответ: [total u32][count u32] × {[flags u8 bit0 mine bit1 delivered]
 /// [msg_id 16][ts_ms u64][body str16][ent_count u8] × {entity}} — записи
-/// старые → новые. Окно режется и бюджетом payload (≤ 1 МиБ): count может
+/// старые → новые. Окно режется и бюджетом payload (≤ 16 МиБ): count может
 /// быть меньше limit для entity-тяжёлой истории. bit1 delivered ставится
 /// только ACK-ом (не фактом записи в сокет). Источние данных — кэш
 /// истории в памяти (лог читается один раз при старте).
@@ -2672,7 +2672,7 @@ fn msgRecView(rec: []const u8) ?search_mod.Rec {
 /// Ответ: [total u32][count u32] × {[flags u8 bit0 mine bit1 delivered
 /// bit2 fuzzy][msg_id 16][ts_ms u64][body str16][ent_count u8] × {entity}}
 /// — сначала точные совпадения (новые → старые), затем нечёткие; окно
-/// режут offset/limit и бюджет 1 МиБ. Матчинг и формат — search.zig.
+/// режут offset/limit и бюджет 16 МиБ. Матчинг и формат — search.zig.
 /// Ошибки: NO_CONTACT, BAD_ARGS (пустой query), TOO_BIG (limit/query).
 fn apiSearchMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     var args = search_mod.parseArgs(payload, false) orelse return .BAD_FRAME;

@@ -14,8 +14,9 @@ const linux = std.os.linux;
 const main = @import("main.zig");
 const api = @import("api.zig");
 
-/// Размер буфера чтения сокета.
-const read_chunk = 4096;
+/// Размер буфера чтения сокета. 64 KiB снижает syscall overhead на больших
+/// ответах, не меняя потоковый формат API.
+const read_chunk = 64 * 1024;
 
 /// Запись в fd (linux-сисколл, как net/tcp.zig). Возвращает записанные байты.
 fn rawWrite(fd: posix.socket_t, bytes: []const u8) usize {

@@ -58,11 +58,11 @@ All integers are little-endian. The header of every frame is exactly 16 bytes:
 | id | u16 | 4..6 | method (REQUEST/RESPONSE) or event (EVENT) |
 | request_id | u32 | 6..10 | correlation: set by the client, echoed by the core in RESPONSE; `0` in EVENT |
 | status | u16 | 10..12 | status code (RESPONSE only; `0` otherwise) |
-| payload_len | u32 | 12..16 | payload length, `0..1048576` (1 MiB) |
+| payload_len | u32 | 12..16 | payload length, `0..16777216` (16 MiB) |
 
 - Exactly one REQUEST yields exactly one RESPONSE with the same `id` and
   `request_id`.
-- Payload over 1 MiB → `TOO_BIG` and the connection is dropped.
+- Payload over 16 MiB → `TOO_BIG` and the connection is dropped.
 - Broken magic/version, or a non-REQUEST frame from a client → `BAD_FRAME`
   and the connection is closed (stream resynchronization is impossible).
 - There are no text fields. Strings are `str16` = `[len u16][bytes]` and
@@ -204,7 +204,7 @@ Response:
 ```
 Records oldest → newest. `ts_ms` is local record time (ms, epoch). Stored in
 the encrypted log, survives restarts. No log → empty list
-(`total=0, count=0`). The window is cut by `limit` **and** the 1 MiB payload
+(`total=0, count=0`). The window is cut by `limit` **and** the 16 MiB payload
 budget: with entity-heavy history `count` may be smaller than `limit`.
 
 #### `GET_MESSAGE` (11)
@@ -358,7 +358,7 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
 
 | Limit | Value |
 |---|---|
-| frame payload | 1 MiB |
+| frame payload | 16 MiB |
 | text body | 4096 bytes |
 | display name | 32 bytes |
 | avatar payload | 16000 bytes (one wire frame); receive rate ≤ 1 per 5 min |

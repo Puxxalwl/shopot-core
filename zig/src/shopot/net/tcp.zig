@@ -71,6 +71,22 @@ pub const DialError = error{
 
 const linux = std.os.linux;
 
+/// Размер очереди accept: переживает всплеск параллельных подключений без
+/// изменения протокола и без искусственного ограничения throughput.
+const listen_backlog: u31 = 1024;
+/// Буферы ядра TCP для high-bandwidth transfer. Linux может скорректировать
+/// фактическое значение согласно sysctl/rmem_max/wmem_max.
+const socket_buffer_size: c_int = 4 * 1024 * 1024;
+
+fn tuneSocket(fd: posix.socket_t) void {
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(socket_buffer_size)) catch {};
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(socket_buffer_size)) catch {};
+    // Linux TCP_QUICKACK=12: request immediate ACKs after reads where supported.
+    const one: c_int = 1;
+    const rc = linux.setsockopt(fd, linux.IPPROTO.TCP, 12, @ptrCast(&one), @sizeOf(c_int));
+    _ = linux.errno(rc);
+}
+
 /// sockaddr.in из IPv4-литерала + порт. Поддержка IPv6-литералов — позже.
 fn parseV4(host: []const u8, port: u16) ?linux.sockaddr.in {
     const ip4 = std.Io.net.Ip4Address.parse(host, port) catch return null;
@@ -94,6 +110,7 @@ pub fn dial(alloc: std.mem.Allocator, addr: []const u8) DialError!*TcpConn {
         if (linux.errno(rc) != .SUCCESS) return error.Network;
         break :blk @as(posix.socket_t, @intCast(rc));
     };
+    tuneSocket(fd);
     setNoDelay(fd);
     const rc = linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
     if (linux.errno(rc) != .SUCCESS) {
@@ -137,6 +154,7 @@ pub const Listener = struct {
         const rc = linux.accept4(self.fd, @ptrCast(&sa), &sl, 0);
         if (linux.errno(rc) != .SUCCESS) return error.Network;
         const cfd: posix.socket_t = @intCast(rc);
+        tuneSocket(cfd);
         setNoDelay(cfd);
         const tc = alloc.create(TcpConn) catch {
             _ = linux.close(cfd);
@@ -179,7 +197,7 @@ pub fn listen(addr: []const u8) ListenError!Listener {
         }
     }
     {
-        const rc = linux.listen(fd, 16);
+        const rc = linux.listen(fd, listen_backlog);
         const e = linux.errno(rc);
         if (e != .SUCCESS) {
             std.debug.print("[listen] listen errno={s}\n", .{@tagName(e)});

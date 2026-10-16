@@ -1,5 +1,16 @@
 # Changelog — shopot-zig
 
+## [неизданное] — transport throughput/latency tuning
+
+### Changed
+- TCP listen backlog увеличен до 1024; для входящих и исходящих сокетов
+  включены увеличенные буферы приёма/передачи (4 MiB, с учётом системных
+  sysctl) и TCP_QUICKACK где поддерживается. Это уменьшает syscall/ACK
+  overhead на bulk transfer и не меняет wire protocol.
+- API UDS read chunk увеличен до 64 KiB; максимальный payload API увеличен до
+  16 MiB. Лимит остаётся конечным, чтобы не превращать длину кадра в
+  неограниченное выделение памяти.
+
 ## [неизданное] — API 2.1.0: поиск по истории (SEARCH_MESSAGE / GLOBAL_SEARCH_MESSAGE)
 
 ### Added
@@ -77,7 +88,7 @@
   bit2 fuzzy)][msg_id 16][ts_ms u64][body str16][хвост entities]}`.
   Порядок: сначала точные совпадения (новые → старые), затем нечёткие
   (новые → старые); `offset/limit` (0 → 50, максимум 200 → `TOO_BIG`)
-  режут объединённый список, бюджет payload 1 МиБ может урезать `count`
+  режут объединённый список, бюджет payload 16 МиБ может урезать `count`
   (`total` — всегда полное число совпадений). Ошибки: `NO_CONTACT`
   (контактный режим), `BAD_ARGS` (пустой query), `TOO_BIG`. Совпадений
   нет — `[total=0][count=0]`, OK. Удалённые чаты (DELETE_CHAT) из поиска
