@@ -228,6 +228,7 @@ shopot://i/<base64url(bundle[64] || secret[16] || name_len u8 || name ≤32)>
 | Tag | Name | Fields (LE unless noted) |
 |---|---|---|
 | 0x10 | TEXT | `msg_id[16], ts_ms u64, body str16 ≤ 4096, ents (§7.1)` |
+| 0x11 | REPLY_TEXT | `msg_id[16], ts_ms u64, reply_to[16], body str16 ≤ 4096, ents (§7.1)` |
 | 0x13 | REACT | `msg_id[16], op u8 (1 add / 2 remove), codepoint u32` |
 | 0x14 | BLOCK_NOTICE | `reason u8` |
 | 0x15 | ACK | `msg_id[16]` |
@@ -245,6 +246,8 @@ shopot://i/<base64url(bundle[64] || secret[16] || name_len u8 || name ≤32)>
 | 0x60 | FILE_META | `file_id[16], name str8 ≤ 64, size u32, sha[32]` |
 | 0x61 | FILE_DATA | `file_id[16], seq u32, data str16 ≤ 16000` |
 | 0x62 | FILE_ACK | `file_id[16], got u32` |
+| 0x45 | SYNC | `batch_id u32, count u8 ≤ 64, recs = count × record (§7.2)` — a device-sync batch; the tail must parse into exactly `count` records |
+| 0x46 | SYNC_ACK | `batch_id u32` — the batch was applied (or deliberately skipped); the sender frees the queue records |
 
 All envelope structs live in `proto/envelope.zig`; the codec performs zero
 allocations (encode/decode into caller buffers).
@@ -279,6 +282,34 @@ TEXT tail: [ent_count u8 ≤ 32]
 The same canonical tail bytes are reused verbatim in the `msg`/`outbox` log
 records (§13) and in the UDS API payloads (SEND_MESSAGE, GET_HISTORY,
 GET_MESSAGE, MESSAGE_RECEIVED) — one encoding across every layer.
+
+### 7.2 Device sync records (SYNC 0x45)
+
+A *device link* is a contact whose bundle equals the sender's own (two
+installs sharing one identity seed). Over that session the core replicates
+encrypted-log records in batches; the queue semantics mirror the outbox
+(bounded queue per device, batch in flight, `SYNC_ACK` frees, a session
+drop returns the batch to the queue head, re-delivery is idempotent on
+the receiver).
+
+```
+recs:  count × { [kind u8][mac[32]][len u16 ≤ 4096][data] }
+mac    = HMAC-SHA256(HKDF(seed, "shopot-device-sync-v1"), kind ‖ data)
+```
+
+- `data` is the log record payload with local `cid` fields translated to
+  the peer's bundle (64 B): msg/react/file records gain a `bundle[64]`
+  prefix in place of `cid u16`; the ack record shrinks to the global
+  `msg_id[16]`; contact/block/cfg/client records pass through unchanged.
+- Record kinds (sync namespace, not log kinds): msg 1, contact 2, block 3,
+  react 4, ack 5, file 6, client 7, cfg 8.
+- The MAC key derives from the identity seed, so only a same-seed device
+  can forge an accepted record; anything else is dropped silently.
+- Apply is idempotent (msg_id dedup, contact existence, client-record MAC
+  set, cfg last-wins) and never re-enqueues the result (no echo loop).
+- Limits: one record ≤ 4034 bytes, ≤ 64 records / 16000 bytes per batch,
+  512 records / 2 MiB per device queue. Avatars and pinned state are not
+  replicated (v1).
 
 ## 8. Offline delivery (outbox)
 
@@ -387,15 +418,17 @@ storage_key    = HKDF-SHA256(Expand(HKDF-Extract("shopot-store-v3", seed), "", 3
 
 | kind | value | payload |
 |---|---|---|
-| msg | 1 | `[cid u16][flags u8 (bit0 mine, bit1 delivered)][msg_id 16][ts u64][len u16][body][ents tail]` |
-| contact | 2 | contact record (bundle, name, addresses) |
+| msg | 1 | `[cid u16][flags u8 (bit0 mine, bit1 delivered, bit2 reply)][msg_id 16][ts u64]` — bit2 inserts `reply_to[16]` before `[len u16][body][ents tail]` |
+| contact | 2 | contact record (bundle, name, addresses; optional device-link role tail byte, §7.2) |
 | block | 3 | blocked contact |
 | react | 4 | reaction record |
 | set | 5 | `[key u8][value]`: 1 = my `avatar_id[16]`, 2 = my name |
 | tombstone | 6 | `u32 LE` seq of the record to delete |
-| outbox | 7 | sub u8: 1 = `[cid u16][msg_id 16][ts u64][len u16][body][ents tail]`, 0 = `[cid u16][msg_id 16]` (delivered, clear on restart) |
+| outbox | 7 | sub u8: 1 = `[cid u16][flags u8 (bit2 reply → reply_to 16)][msg_id 16][ts u64][len u16][body][ents tail]`, 0 = `[cid u16][msg_id 16]` (delivered, clear on restart) |
 | avatar | 8 | `[avatar_id 16][len u16][data ≤ 16000]` |
 | file | 9 | `[cid u16][file_id 16][size u32][len u8][name]` |
+| cfg | 10 | configuration blob `[ver u8][flags u32][server_addr str16][tor_addr str16]` (last record wins; §17) |
+| client | 11 | `[tag u8 ≠ 0xFF][ts u64][len u16][data ≤ 65000]` — the client's own records (UDS WRITE_DB), capped at 16 MiB live |
 
 - A tombstone marks a record dead in the index; compaction rewrites live
   records into a new file with `epoch+1` and drops tombstones and dead
@@ -507,7 +540,7 @@ with first-generation fake-TLS: both ends must run the same core release
 `shopot serve` exposes the UDS socket `$HOME/.shopot/api.sock` (0700) with a
 binary framed protocol — the only interface of the core; GUI clients talk to
 it. Frame layout, methods, machine-readable statuses, events and scenarios:
-**[CORE-API.md](CORE-API.md)** (API version 1.0.0).
+**[CORE-API.md](CORE-API.md)** (API version 2.4.0).
 
 ## 18. What an observer can learn
 

@@ -35,6 +35,11 @@ pub const Contact = struct {
     addr_port: u16 = 0,
     /// Текущий avatar_id собеседника (SHA-256(данных)[0..16]); нули — нет.
     avatar_id: [16]u8 = @splat(0),
+    /// Роль линка устройства (bundle == собственный): 0 — не устройство,
+    /// 1 — «ждущий» (пригласивший, не инициирует), 2 — «держатель» кода
+    /// линка (всегда инициирует подключение). Определяет детерминизм
+    /// дозвона: два одинаковых bundle не сравнить порядком.
+    dev_role: u8 = 0,
 
     /// Запомнить адрес (host без порта + порт). Порт 0 — адрес неизвестен.
     pub fn setAddr(self: *Contact, host: []const u8, port: u16) void {
@@ -72,6 +77,7 @@ pub const Reaction = struct {
 pub const Events = struct {
     ctx: *anyopaque = undefined,
     onText: ?*const fn (ctx: *anyopaque, from: *const Contact, msg_id: [16]u8, ts_ms: i64, body: []const u8, ents: []const envelope.TextEntity) void = null,
+    onReply: ?*const fn (ctx: *anyopaque, from: *const Contact, msg_id: [16]u8, ts_ms: i64, reply_to: [16]u8, body: []const u8, ents: []const envelope.TextEntity) void = null,
     onReaction: ?*const fn (ctx: *anyopaque, from: *const Contact, r: Reaction) void = null,
     onPresence: ?*const fn (ctx: *anyopaque, from: *const Contact, online: bool, last_seen_ms: i64) void = null,
     /// Профиль пира обновился (эхо PROFILE: имя и avatar_id).
@@ -93,6 +99,12 @@ pub const Events = struct {
     onFileData: ?*const fn (ctx: *anyopaque, from: *const Contact, data: envelope.FileData) void = null,
     /// Файл передан целиком: все чанки подтверждены FILE_ACK-ами приёмника.
     onFileSent: ?*const fn (ctx: *anyopaque, from: *const Contact, file_id: [16]u8, size: u32, name: []const u8) void = null,
+    /// SYNC: партия записей БД от устройства-близнеца (device_sync).
+    /// Структура хвоста провалидирована decode'ом; семантику (MAC, kind)
+    /// проверяет приложение. Вызывается из rx-потока сессии.
+    onSync: ?*const fn (ctx: *anyopaque, from: *const Contact, batch_id: u32, recs: []const u8, count: u8) void = null,
+    /// SYNC_ACK: партия применена устройством-близнецом.
+    onSyncAck: ?*const fn (ctx: *anyopaque, from: *const Contact, batch_id: u32) void = null,
 };
 
 /// Запись outbox: TEXT, ждущий сессии/ACK.
@@ -100,6 +112,8 @@ pub const OutboxEntry = struct {
     cid: i64,
     msg_id: [16]u8,
     ts_ms: u64,
+    /// Reply target; null for ordinary TEXT.
+    reply_to: ?[16]u8 = null,
     /// Копия тела (alloc); свободается при ACK/истечении.
     body: []u8,
     /// Копия хвоста entities (alloc, wire-формат; пусто — форматирования
@@ -287,17 +301,51 @@ pub const Engine = struct {
             // и слой рэтчета не задействовался вовсе
             s.sendSealedText(env) catch {
                 // сессия умерла между проверкой и записью — в очередь
-                self.outboxAppend(contact_id, msg_id, ts_ms, body, tail) catch {};
+                self.outboxAppend(contact_id, msg_id, ts_ms, null, body, tail) catch {};
                 return .{ .result = .queued, .msg_id = msg_id };
             };
             return .{ .result = .sent, .msg_id = msg_id };
         }
-        self.outboxAppend(contact_id, msg_id, ts_ms, body, tail) catch return EngineError.OutOfMemory;
+        self.outboxAppend(contact_id, msg_id, ts_ms, null, body, tail) catch return EngineError.OutOfMemory;
+        return .{ .result = .queued, .msg_id = msg_id };
+    }
+
+    /// Send a reply carrying the same text/entity semantics as sendText.
+    /// `reply_to` is the referenced message id; offline delivery uses outbox.
+    pub fn sendReplyText(self: *Engine, contact_id: i64, reply_to: [16]u8, body: []const u8, ents: []const envelope.TextEntity) EngineError!SendOutcome {
+        const idx = self.findIndex(contact_id) orelse return EngineError.NoSession;
+        if (self.contacts.items[idx].blocked) return EngineError.Blocked;
+        var tail_buf: [envelope.max_text_tail]u8 = undefined;
+        const tail = envelope.encodeEntitiesTail(&tail_buf, ents, body.len) catch |e| return switch (e) {
+            error.NoSpace => EngineError.NoSpace,
+            else => EngineError.BadEntities,
+        };
+        if (body.len == 0 or body.len > envelope.max_text_body) return EngineError.TooBig;
+        var msg_id: [16]u8 = undefined;
+        self.io.random(&msg_id);
+        var ts_buf: [8]u8 = undefined;
+        self.io.random(&ts_buf);
+        const ts_ms: u64 = std.mem.readInt(u64, &ts_buf, .little) % 100_000_000_000_000;
+        const env = envelope.Envelope{ .reply_text = .{
+            .msg_id = msg_id,
+            .ts_ms = ts_ms,
+            .reply_to = reply_to,
+            .body = body,
+            .ents_tail = tail,
+        } };
+        if (self.sessions.get(contact_id)) |s| {
+            s.sendSealedText(env) catch {
+                self.outboxAppend(contact_id, msg_id, ts_ms, reply_to, body, tail) catch {};
+                return .{ .result = .queued, .msg_id = msg_id };
+            };
+            return .{ .result = .sent, .msg_id = msg_id };
+        }
+        self.outboxAppend(contact_id, msg_id, ts_ms, reply_to, body, tail) catch return EngineError.OutOfMemory;
         return .{ .result = .queued, .msg_id = msg_id };
     }
 
     /// Положить TEXT в outbox (капа outbox_cap: старое вытесняется).
-    fn outboxAppend(self: *Engine, cid: i64, msg_id: [16]u8, ts_ms: u64, body: []const u8, ents_tail: []const u8) !void {
+    fn outboxAppend(self: *Engine, cid: i64, msg_id: [16]u8, ts_ms: u64, reply_to: ?[16]u8, body: []const u8, ents_tail: []const u8) !void {
         if (body.len == 0 or body.len > envelope.max_text_body) return error.TooBig;
         if (ents_tail.len > envelope.max_text_tail) return error.TooBig;
         if (self.outbox.items.len >= outbox_cap) {
@@ -307,7 +355,7 @@ pub const Engine = struct {
         }
         const copy = try self.alloc.dupe(u8, body);
         const tail_copy = if (ents_tail.len == 0) @as([]u8, &.{}) else try self.alloc.dupe(u8, ents_tail);
-        self.outbox.append(self.alloc, .{ .cid = cid, .msg_id = msg_id, .ts_ms = ts_ms, .body = copy, .ents_tail = tail_copy }) catch {
+        self.outbox.append(self.alloc, .{ .cid = cid, .msg_id = msg_id, .ts_ms = ts_ms, .reply_to = reply_to, .body = copy, .ents_tail = tail_copy }) catch {
             self.alloc.free(copy);
             self.alloc.free(tail_copy);
             return error.OutOfMemory;
@@ -502,7 +550,7 @@ pub const Engine = struct {
             }
             // хвост entities лежит в записи готовым wire-форматом — конверт
             // уходит с форматированием без перепарса
-            batch[n] = .{ .text = .{ .msg_id = e.msg_id, .ts_ms = e.ts_ms, .body = e.body, .ents_tail = e.ents_tail } };
+            batch[n] = if (e.reply_to) |reply_to| .{ .reply_text = .{ .msg_id = e.msg_id, .ts_ms = e.ts_ms, .reply_to = reply_to, .body = e.body, .ents_tail = e.ents_tail } } else .{ .text = .{ .msg_id = e.msg_id, .ts_ms = e.ts_ms, .body = e.body, .ents_tail = e.ents_tail } };
             n += 1;
             i += 1;
             if (n == batch.len) {
@@ -634,6 +682,23 @@ pub const Engine = struct {
                     sess.sendEnvelope(.{ .ack = .{ .msg_id = t.msg_id } }) catch {};
                 }
             },
+            .reply_text => |t| {
+                if (self.seenHas(contact_id, t.msg_id)) {
+                    if (self.sessions.get(contact_id)) |sess| {
+                        sess.sendEnvelope(.{ .ack = .{ .msg_id = t.msg_id } }) catch {};
+                    }
+                    return;
+                }
+                self.seenPut(contact_id, t.msg_id);
+                if (self.ev.onReply) |cb| {
+                    var ents: [envelope.max_text_entities]envelope.TextEntity = undefined;
+                    const n = envelope.parseEntities(t.ents_tail, t.body.len, &ents) catch 0;
+                    cb(self.ev.ctx, c, t.msg_id, @intCast(t.ts_ms), t.reply_to, t.body, ents[0..n]);
+                }
+                if (self.sessions.get(contact_id)) |sess| {
+                    sess.sendEnvelope(.{ .ack = .{ .msg_id = t.msg_id } }) catch {};
+                }
+            },
             .ack => |a| {
                 self.outboxAcked(contact_id, a.msg_id, c);
             },
@@ -710,6 +775,14 @@ pub const Engine = struct {
             // JOIN обрабатывается слоем приложения ДО dispatch (pending-сессии);
             // сюда попадает только повторный кадр на уже промоутнутой сессии
             .join => {},
+            // SYNC/SYNC_ACK — политика приложения (device_sync): движок
+            // только поднимает событие; MAC и семантику проверяет слой выше
+            .sync => |sy| {
+                if (self.ev.onSync) |cb| cb(self.ev.ctx, c, sy.batch_id, sy.recs, sy.count);
+            },
+            .sync_ack => |sa| {
+                if (self.ev.onSyncAck) |cb| cb(self.ev.ctx, c, sa.batch_id);
+            },
         }
     }
 };

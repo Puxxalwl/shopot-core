@@ -14,7 +14,8 @@
 //! `storage_key = HKDF-SHA256-Expand(HKDF-SHA256-Extract("shopot-store-v3", seed), "", 32)`.
 //! Ключ хранится в Log и обнуляется в deinit (std.crypto.secureZero).
 //!
-//! kind: msg=1, contact=2, block=3, react=4, set=5, tombstone=6.
+//! kind: msg=1, contact=2, block=3, react=4, set=5, tombstone=6,
+//! outbox=7, avatar=8, file=9, cfg=10, client=11.
 //! Tombstone (payload = u32 LE — удаляемый seq) помечает запись в индексе
 //! мёртвой; при компакции tombstone и dead-записи исчезают из нового файла.
 //!
@@ -77,6 +78,12 @@ pub const Kind = enum(u8) {
     avatar = 8,
     /// Принятый файл: [cid u16][file_id 16][size u32][len u8][name].
     file = 9,
+    /// Конфигурация ядра (config.zig, blob формата GET_CONFIG).
+    /// Последняя запись побеждает; пустой лог = значения по умолчанию.
+    cfg = 10,
+    /// Клиентская запись БД: [tag u8][ts u64][len u16][data ≤ 65000]
+    /// (см. WRITE_DB). Область данных GUI-клиента в шифрованном хранилище.
+    client = 11,
 };
 
 /// Единая ошибка модуля: файловые операции + память + семантика формата.
@@ -335,6 +342,43 @@ pub const Log = struct {
             if (parsed.kind != e.kind or parsed.seq != e.seq) return error.Corrupt;
             try out.ensureUnusedCapacity(gpa, 1);
             out.appendAssumeCapacity(try gpa.dupe(u8, parsed.payload));
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Живая запись вместе с её seq (rec_id области данных клиента).
+    pub const SeqRec = struct {
+        seq: u32,
+        payload: []u8,
+    };
+
+    /// То же, что readAll, но с seq каждой записи (READ_DB/DELETE_DB
+    /// адресуют клиентские записи rec_id-ом лога). Владение — как у
+    /// readAll: payload-копии и внешний срез освобождает вызывающий.
+    pub fn readAllSeq(log: *const Log, kind: Kind, gpa: Allocator) Error![]SeqRec {
+        var out: std.ArrayList(SeqRec) = .empty;
+        errdefer {
+            for (out.items) |item| gpa.free(item.payload);
+            out.deinit(gpa);
+        }
+        const rbuf = try gpa.alloc(u8, max_record_disk);
+        defer gpa.free(rbuf);
+        const pt = try gpa.alloc(u8, max_payload);
+        defer {
+            std.crypto.secureZero(u8, pt);
+            gpa.free(pt);
+        }
+        for (log.index.items) |e| {
+            if (e.dead or e.kind != kind) continue;
+            const rec = try readRecordAt(log.fd, e.offset, rbuf);
+            const plain = try decryptRecord(rec, log.epoch, &log.key, pt);
+            const parsed = try parsePlain(plain);
+            if (parsed.kind != e.kind or parsed.seq != e.seq) return error.Corrupt;
+            try out.ensureUnusedCapacity(gpa, 1);
+            out.appendAssumeCapacity(.{
+                .seq = e.seq,
+                .payload = try gpa.dupe(u8, parsed.payload),
+            });
         }
         return out.toOwnedSlice(gpa);
     }
@@ -961,4 +1005,30 @@ fn tamperByteAt(fd: posix.fd_t, offset: u64) Error!void {
     if (n != 1) return error.Corrupt;
     b[0] ^= 0x01;
     try pwriteAll(fd, &b, offset);
+}
+
+test "readAllSeq: seq записей и tombstone исключает мёртвую" {
+    const alloc = testing.allocator;
+    const path = try tmpPath(alloc, "seqrec");
+    defer alloc.free(path);
+    defer rmFile(path);
+
+    var log = try Log.open(alloc, path, &test_seed);
+    defer log.deinit();
+    const s1 = try log.append(.client, "one");
+    const s2 = try log.append(.client, "two");
+    _ = try log.append(.cfg, "cfg-blob");
+    const s3 = try log.append(.client, "three");
+    _ = try log.appendTombstone(s2);
+
+    const recs = try log.readAllSeq(.client, alloc);
+    defer {
+        for (recs) |r| alloc.free(r.payload);
+        alloc.free(recs);
+    }
+    try testing.expectEqual(@as(usize, 2), recs.len);
+    try testing.expectEqual(s1, recs[0].seq);
+    try testing.expectEqualStrings("one", recs[0].payload);
+    try testing.expectEqual(s3, recs[1].seq);
+    try testing.expectEqualStrings("three", recs[1].payload);
 }

@@ -21,11 +21,11 @@ Layer and data-flow reference for the `shopot-zig` core. Russian version:
 
 | Layer | Directory | Responsibility |
 |---|---|---|
-| app | `src/shopot/app/` | daemon: UDS API server, invites, LAN discovery, autodial, outbox flushing, call audio loop, file transfers |
+| app | `src/shopot/app/` | daemon: UDS API server, invites, LAN discovery, autodial, outbox flushing, call audio loop, file transfers, configuration (config.zig), device sync (sync.zig), Tor SOCKS5 dialing |
 | core | `src/shopot/core/` | engine (contacts, locks, dispatch, outbox, file Tx state machines), session (handshake + sealed frames) |
 | proto | `src/shopot/proto/` | binary envelopes, allocation-free codec |
 | crypto | `src/shopot/crypto/` | identity, handshake, ratchet, call keys, AEAD, padding |
-| net | `src/shopot/net/` | TCP transport, stream obfuscation (fake-TLS framing), relay, heartbeat |
+| net | `src/shopot/net/` | TCP transport, stream obfuscation (fake-TLS framing), relay, heartbeat, SOCKS5 (Tor) |
 | store | `src/shopot/store/` | encrypted append-only log |
 
 ## 3. Message data flow
@@ -47,6 +47,27 @@ Receive is the mirror: `Conn.readAll` → de-frame (AAD check, seq check) →
 de-obfuscate → AEAD-open + optional inflate → envelope decode →
 `Engine.dispatch` under the engine lock → callbacks into the app layer.
 
+### 3.1 Persistence and device-sync data flow
+
+```
+persist* (app, under app.mu)
+  → store.Log.append (encrypted log record: msg/contact/react/ack/
+    file/block/cfg/client kinds)
+  → sync.enqueue (if device_sync and a device link exists)
+  → syncPumpLocked: takeBatch translates cid → bundle, appends per-record
+    HMAC (HKDF(seed, "shopot-device-sync-v1")) into a stack tail buffer
+  → SYNC envelope over the device session (like an outbox flush)
+  → peer rx thread: parse records, verify MACs, apply idempotently
+    (never re-enqueue), reply SYNC_ACK
+  → onSyncAck / onSessionDown (queue restore, like outbox redelivery)
+```
+
+- The client DB (WRITE_DB records, kind `client`) shares the same path:
+  an in-memory cache serves READ_DB; record MACs dedupe re-delivery.
+- Configuration (kind `cfg`, last record wins) is applied on load and via
+  SET_CONFIG; effects (server_mode presence threads, transport flags for
+  new dials) are documented in CORE-API.md §4.9.
+
 ## 4. Threading model
 
 - One **rx thread per session**; sending is serialized under the session
@@ -60,6 +81,13 @@ de-obfuscate → AEAD-open + optional inflate → envelope decode →
   with the contact-level marker; pairing hands a fresh session to the
   engine. Start points: relay-invite JOIN, contact-log load, unblock.
 - Call audio runs its own loop (FIFO in/out, 20 ms tick).
+- Device sync piggybacks on session rx threads (no thread of its own);
+  queue flushes happen under the app lock at enqueue time, on session
+  bind, and after SET_CONFIG — the same lock ordering as outbox flushes
+  (app.mu → session send mutex, never the reverse).
+- Server-mode presence threads (one per contact when `server_mode` is on)
+  re-read the configuration each iteration; turning the mode off stops
+  them at the next cycle without teardown signalling.
 
 ## 5. Error and memory model
 
@@ -74,8 +102,8 @@ de-obfuscate → AEAD-open + optional inflate → envelope decode →
 
 The engine reports everything through function pointers set by the app:
 `onText`, `onReact`, `onAck`, presence changes, `onProfile`, `onAvatar`,
-`onAvatarReq`, `onFileSent`, call state. The app layer turns them into UDS
-events.
+`onAvatarReq`, `onFileSent`, call state, `onSync`/`onSyncAck` (device-sync
+batches). The app layer turns them into UDS events and DB writes.
 
 ## 7. Testing
 

@@ -1162,3 +1162,223 @@ test "outbox: очередь офлайн, доставка при сессии,
     hb.text_ts.deinit(alloc);
     hb.delivered.deinit(alloc);
 }
+
+// ------------------------------------------------------ device sync (E2E)
+
+/// Rx-сборщик SYNC/SYNC_ACK: копирует хвосты партий (срезы конверта
+/// короткоживущи), защищает списки мьютексом (rx-поток vs тест-поток).
+const SyncHarness = struct {
+    alloc: std.mem.Allocator,
+    mu: std.Io.Mutex = .init,
+    batches: std.ArrayListUnmanaged(struct {
+        batch_id: u32,
+        count: u8,
+        recs: []u8,
+    }) = .empty,
+    acks: std.ArrayListUnmanaged(u32) = .empty,
+
+    fn onEnvelope(ctx: *anyopaque, env: envelope.Envelope) void {
+        const self: *SyncHarness = @ptrCast(@alignCast(ctx));
+        switch (env) {
+            .sync => |s| {
+                const copy = self.alloc.dupe(u8, s.recs) catch return;
+                self.mu.lockUncancelable(io_g.stored);
+                self.batches.append(self.alloc, .{ .batch_id = s.batch_id, .count = s.count, .recs = copy }) catch {
+                    self.mu.unlock(io_g.stored);
+                    self.alloc.free(copy);
+                    return;
+                };
+                self.mu.unlock(io_g.stored);
+            },
+            .sync_ack => |a| {
+                self.mu.lockUncancelable(io_g.stored);
+                self.acks.append(self.alloc, a.batch_id) catch {};
+                self.mu.unlock(io_g.stored);
+            },
+            else => {},
+        }
+    }
+
+    fn onClosed(_: *anyopaque) void {}
+
+    fn deinit(self: *SyncHarness) void {
+        for (self.batches.items) |b| self.alloc.free(b.recs);
+        self.batches.deinit(self.alloc);
+        self.acks.deinit(self.alloc);
+    }
+};
+
+fn establishSyncB(
+    alloc: std.mem.Allocator,
+    conn: interfaces.Conn,
+    id_b: *const identity.Identity,
+    peer_bundle: [64]u8,
+    hb: *SyncHarness,
+    out: *?*session_mod.Session,
+) void {
+    out.* = session_mod.Session.establish(
+        alloc,
+        conn,
+        .responder,
+        id_b,
+        peer_bundle,
+        filled(2),
+        @ptrCast(&wrap_slot),
+        wrapConn,
+        .{ .ctx = hb, .onEnvelope = SyncHarness.onEnvelope, .onClosed = SyncHarness.onClosed },
+        io_g.stored,
+    ) catch null;
+}
+
+fn waitSyncBatch(h: *SyncHarness) !struct { batch_id: u32, count: u8, recs: []u8 } {
+    for (0..200) |_| {
+        h.mu.lockUncancelable(io_g.stored);
+        const got = h.batches.items.len > 0;
+        h.mu.unlock(io_g.stored);
+        if (got) {
+            h.mu.lockUncancelable(io_g.stored);
+            const b = h.batches.items[0];
+            h.mu.unlock(io_g.stored);
+            return .{ .batch_id = b.batch_id, .count = b.count, .recs = b.recs };
+        }
+        std.Io.sleep(io_g.stored, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn waitSyncAck(h: *SyncHarness, batch_id: u32) !void {
+    for (0..200) |_| {
+        h.mu.lockUncancelable(io_g.stored);
+        var got = false;
+        for (h.acks.items) |a| {
+            if (a == batch_id) got = true;
+        }
+        h.mu.unlock(io_g.stored);
+        if (got) return;
+        std.Io.sleep(io_g.stored, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    return error.TestUnexpectedResult;
+}
+
+// Устройство-«близнец»: один сид на обеих сторонах, очередь записей БД
+// уезжает партией SYNC, приёмник верит только записям с верным MAC
+// (HKDF от сида), отправитель гасит очередь по SYNC_ACK. Подделка
+// отбрасывается молча.
+test "device sync: партия SYNC, приём, SYNC_ACK, подделка MAC" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    io_g.stored = io;
+    io_g.alloc = alloc;
+    const sync_mod = shopot.app.sync;
+    obf_idx = 0;
+    obf_tracker = @splat(null);
+
+    const seed = filled(7);
+    const id_a = try identity.Identity.fromSeed(seed);
+    const id_b = try identity.Identity.fromSeed(seed);
+
+    const pair = try pipePair(alloc);
+    var ca = pair[0];
+    var cb = pair[1];
+
+    var ha = SyncHarness{ .alloc = alloc };
+    var hb = SyncHarness{ .alloc = alloc };
+
+    var sb_opt: ?*session_mod.Session = null;
+    const th_b = try std.Thread.spawn(.{}, establishSyncB, .{ alloc, cb.conn(), &id_b, id_a.bundle(), &hb, &sb_opt });
+
+    const sa = try session_mod.Session.establish(
+        alloc,
+        ca.conn(),
+        .initiator,
+        &id_a,
+        id_b.bundle(),
+        filled(1),
+        @ptrCast(&wrap_slot),
+        wrapConn,
+        .{ .ctx = &ha, .onEnvelope = SyncHarness.onEnvelope, .onClosed = SyncHarness.onClosed },
+        io,
+    );
+    th_b.join();
+    const sb = sb_opt orelse return error.ResponderFailed;
+
+    // синхронизаторы: ключ одинаковый (HKDF от общего сида)
+    var sync_a = sync_mod.Sync.init(alloc, &seed);
+    defer sync_a.deinit();
+    var sync_b = sync_mod.Sync.init(alloc, &seed);
+    defer sync_b.deinit();
+    sync_a.addDevice(1);
+
+    // записи: msg ([cid 1][flags 0][msg_id][ts][len 2]["privet"]) и client
+    var msg_rec: [3 + 16 + 8 + 2 + 6]u8 = @splat(0);
+    std.mem.writeInt(u16, msg_rec[0..2], 1, .little);
+    @memset(msg_rec[3..19][0..16], 0x42);
+    std.mem.writeInt(u64, msg_rec[19..27], 1_700_000_000_123, .little);
+    std.mem.writeInt(u16, msg_rec[27..29], 6, .little);
+    @memcpy(msg_rec[29..35], "privet");
+    const client_rec = [_]u8{ 9, 1, 2, 3, 4, 5, 6, 7, 8, 2, 0, 'x', 'y' };
+    sync_a.enqueue(@backingInt(sync_mod.RecKind.msg), &msg_rec);
+    sync_a.enqueue(@backingInt(sync_mod.RecKind.client), &client_rec);
+    try std.testing.expect(sync_a.hasPending());
+
+    // перевод cid→bundle: контакт №1 — пир
+    var tr_bundle: [64]u8 = id_b.bundle();
+    sync_a.tr_ctx = &tr_bundle;
+    sync_a.tr_fn = struct {
+        fn tr(ctx: ?*anyopaque, cid: i64) ?[64]u8 {
+            _ = cid;
+            const b: *[64]u8 = @ptrCast(@alignCast(ctx.?));
+            return b.*;
+        }
+    }.tr;
+
+    // партия уезжает в inflight и по сессии
+    const d = sync_a.devices.get(1) orelse return error.NoDevice;
+    var batch_buf: [envelope.max_sync_tail]u8 = undefined;
+    const batch = sync_a.takeBatch(d, &batch_buf) orelse return error.NoBatch;
+    try std.testing.expectEqual(@as(u8, 2), batch.count);
+    try sa.sendEnvelope(.{ .sync = .{ .batch_id = batch.batch_id, .count = batch.count, .recs = batch.tail } });
+
+    // приёмник: записи разбираются, MAC-и сходятся
+    const got = try waitSyncBatch(&hb);
+    try std.testing.expectEqual(batch.batch_id, got.batch_id);
+    try std.testing.expectEqual(@as(u8, 2), got.count);
+    var views: [envelope.max_sync_recs]envelope.SyncRecView = undefined;
+    const n = try envelope.parseSyncRecs(got.recs, got.count, &views);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(sync_b.verifyRec(views[0].kind, &views[0].mac, views[0].data));
+    try std.testing.expect(sync_b.verifyRec(views[1].kind, &views[1].mac, views[1].data));
+
+    // подделка: инвертированный байт тела — MAC обязан не сойтись
+    // (первая запись: [kind][mac 32][len 2][cid 2][flags])
+    const rec0_off = 1 + envelope.sync_mac_len + 2 + 2;
+    var forged: []u8 = try alloc.dupe(u8, got.recs);
+    defer alloc.free(forged);
+    forged[rec0_off] ^= 0xFF;
+    var fviews: [envelope.max_sync_recs]envelope.SyncRecView = undefined;
+    _ = try envelope.parseSyncRecs(forged, got.count, &fviews);
+    try std.testing.expect(!sync_b.verifyRec(fviews[0].kind, &fviews[0].mac, fviews[0].data));
+
+    // подтверждение: SYNC_ACK гасит очередь отправителя
+    try sb.sendEnvelope(.{ .sync_ack = .{ .batch_id = batch.batch_id } });
+    try waitSyncAck(&ha, batch.batch_id);
+    sync_a.onAck(1, batch.batch_id);
+    try std.testing.expect(!sync_a.hasPending());
+
+    sa.close();
+    sb.close();
+    for (obf_tracker) |oc| {
+        if (oc) |o| {
+            o.deinit();
+            alloc.destroy(o);
+        }
+    }
+    alloc.destroy(sa);
+    alloc.destroy(sb);
+    ca.me.inbox.deinit(alloc);
+    cb.me.inbox.deinit(alloc);
+    alloc.destroy(ca.me);
+    alloc.destroy(cb.me);
+    ha.deinit();
+    hb.deinit();
+}

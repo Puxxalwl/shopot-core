@@ -20,8 +20,11 @@ test {
     _ = @import("shopot/net/relay.zig");
     _ = @import("shopot/net/heartbeat.zig");
     _ = @import("shopot/net/tcp.zig");
+    _ = @import("shopot/net/socks5.zig");
     _ = @import("shopot/app/adpcm.zig");
     _ = @import("shopot/app/api.zig");
+    _ = @import("shopot/app/config.zig");
+    _ = @import("shopot/app/sync.zig");
     _ = @import("shopot/app/search.zig");
     _ = @import("shopot/store/log.zig");
 }
