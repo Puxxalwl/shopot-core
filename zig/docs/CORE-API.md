@@ -9,11 +9,15 @@ renders. The protocol is **binary**: no strings-as-protocol, no JSON, no
 human-readable text on the wire — only typed byte frames and machine-readable
 codes (methods, statuses, events).
 
-- API version: **2.2.0** (returned by `GET_VERSION`, semver). History:
+- API version: **2.4.0** (returned by `GET_VERSION`, semver). History:
   2.0.0 — formatting-entities tail in message payloads (§4.3); 2.1.0 —
   `SEARCH_MESSAGE`/`GLOBAL_SEARCH_MESSAGE` (§4.3); 2.2.0 — chat pinning/
   deletion, message pinning, contact-card sharing (§4.8), the
-  `CONTACT_CARD` event, and the honest `delivered` bit (§7).
+  `CONTACT_CARD` event, and the honest `delivered` bit (§7); 2.3.0 —
+  message replies and reactions (§4.3); 2.4.0 — core configuration
+  (§4.9: `GET_CONFIG`/`SET_CONFIG`, `CONFIG_CHANGED`), the client
+  database (§4.9: `WRITE_DB`/`READ_DB`/`DELETE_DB`), device sync, and
+  the `TOR_UNAVAILABLE` status.
 - Normative wire protocol: [PROTOCOL.md](PROTOCOL.md).
 
 ## 1. Model
@@ -94,6 +98,7 @@ responses.
 | 14 | `NO_CALL` | no active call |
 | 15 | `NO_RELAY` | relay unreachable |
 | 16 | `TRANSPORT_FAILED` | transport did not come up (dial/handshake) |
+| 17 | `TOR_UNAVAILABLE` | Tor SOCKS5 proxy unreachable (`use_tor_mask` on) |
 | 255 | `INTERNAL` | internal core error |
 
 ## 4. Methods (REQUEST)
@@ -185,14 +190,28 @@ Response: `[msg_id 16][flags u8 (bit0 = queued)]`.
 - Errors: `NO_CONTACT`, `CONTACT_BLOCKED`, `BAD_ARGS` (empty body, invalid
   entities).
 
+#### `SEND_REPLY_MESSAGE` (33)
+Payload: `[cid u32][reply_to_msg_hex str16][body str16 ≤ 4096][entity tail]`.
+`reply_to_msg_hex` is exactly 32 ASCII hexadecimal characters (the lowercase
+form returned by clients when rendering `msg_id`). The referenced message must
+exist in the same chat; otherwise `NOT_FOUND`. Response matches `SEND_MESSAGE`:
+`[msg_id 16][flags u8 (bit0 = queued)]`. Replies use a separate authenticated
+`REPLY_TEXT` transport envelope and survive history/outbox restart.
+
 #### `SET_REACTION` (8) / `REMOVE_REACTION` (9)
 Payload: `[cid u32][msg_id 16][codepoint u32]`.
 - The codepoint is a Unicode code point, U+0000..U+10FFFF; outside the range
   → `UNSUPPORTED_REACTION`. A reaction requires a live session.
+- At most three active reaction codepoints are retained per message. Duplicate
+  adds update their timestamp; adding a fourth while three are active is ignored
+  by retrieval but remains a valid wire operation.
 - Response: ∅. Errors: `NO_CONTACT`, `NO_SESSION`, `UNSUPPORTED_REACTION`,
   `CONTACT_BLOCKED`.
-- Local reaction history records only additions (removal is sent to the peer
-  but not logged — v1).
+
+#### `GET_REACTIONS` (34)
+Payload: `[msg_id 16]`. Response: `[react_count u32] × {[flags u8 bit0 mine][codepoint u32][ts_ms u64]}`;
+removals are resolved and the count is capped at 3. `GET_MESSAGE` returns the
+same resolved reaction view.
 
 #### `GET_HISTORY` (10)
 Payload: `[cid u32][limit u32]` (0 → 50; maximum 200 → `TOO_BIG`).
@@ -303,6 +322,8 @@ are normally unnecessary (autodial/LAN handle it); errors — `NO_CONTACT`,
 | `PIN_MESSAGE` | 30 | `[cid u32][msg_id 16]` | ∅ |
 | `UNPIN_MESSAGE` | 31 | `[cid u32][msg_id 16]` | ∅ |
 | `GET_PINNED_MESSAGES` | 32 | `[cid u32]` | `[count u32] × {[msg_id 16]}` |
+| `SEND_REPLY_MESSAGE` | 33 | `[cid u32][reply_to_msg_hex str16][body str16][entity tail]` | `[msg_id 16][flags u8]` |
+| `GET_REACTIONS` | 34 | `[msg_id 16]` | `[count u32] × {[flags u8][codepoint u32][ts_ms u64]}` |
 
 - One pinned chat per daemon (idempotent re-pin). Pins survive restarts
   (encrypted log).
@@ -322,6 +343,79 @@ are normally unnecessary (autodial/LAN handle it); errors — `NO_CONTACT`,
   (`NOT_FOUND`); ≤ 16 pinned messages per chat (`TOO_BIG`). The order of
   `GET_PINNED_MESSAGES` is the pinning order. `UNPIN_MESSAGE` is idempotent.
 
+### 4.9 Configuration and the client database
+
+| Method | id | Payload | Response |
+|---|---|---|---|
+| `GET_CONFIG` | 35 | ∅ | config blob (below) |
+| `SET_CONFIG` | 36 | config blob | ∅ |
+| `WRITE_DB` | 37 | `[tag u8][data str32 ≤ 65000]` | `[rec_id u32][ts_ms u64]` |
+| `READ_DB` | 38 | `[tag u8 (0xFF = any)][limit u32 (0 → 50, ≤ 200)][offset u32]` | `[total u32][count u32] × {[rec_id u32][ts_ms u64][tag u8][data str16]}` |
+| `DELETE_DB` | 39 | `[rec_id u32]` | ∅ |
+
+#### Configuration blob
+
+The configuration is one binary blob, persisted in the encrypted log
+(kind `cfg`, last record wins; a fresh daemon starts with defaults):
+
+```
+[ver u8 = 1][flags u32 LE][server_addr str16][tor_addr str16]
+```
+
+`flags` bits (unknown bits in `SET_CONFIG` are rejected with `BAD_ARGS`):
+bit0 `server_mode`, bit1 `use_fake_tls`, bit2 `use_tor_mask`, bit3
+`device_sync`, bit4 `lan_discovery`, bit5 `autodial`. Addresses are
+`host:port` (≤ 64 bytes; empty = unset). Defaults: all flags on except
+`server_mode` and `use_tor_mask`; `tor_addr` = `127.0.0.1:9050`.
+
+- `server_mode` — all peer traffic flows through the user's **own**
+  self-hosted relay (`server_addr`, `shopot relay`). Requires `server_addr`
+  (`BAD_ARGS` otherwise). Presence threads dial every contact through it.
+- `use_fake_tls` — wrap direct transports as fake-TLS. **Both peers must
+  match**: a mismatched peer fails the handshake (existing sessions are
+  unaffected; new dials follow the flag).
+- `use_tor_mask` — direct dials go through the Tor SOCKS5 proxy
+  (`tor_addr`). Relay connections do not use Tor (the relay already hides
+  the IP). Requires `tor_addr` (`BAD_ARGS`); a dead proxy →
+  `TOR_UNAVAILABLE` from `CONNECT`.
+- `device_sync` — replicate the database to a linked device (below).
+- `lan_discovery` — UDP multicast announcements/search in the LAN.
+- `autodial` — background redialing of offline contacts by saved address.
+
+`SET_CONFIG` validates and applies atomically, persists, broadcasts
+`CONFIG_CHANGED` (payload = the new blob), and — with `device_sync` on —
+replicates the blob to the linked device (see below). Errors: `BAD_FRAME`
+(structure/version), `BAD_ARGS` (unknown flag bits, `server_mode`/
+`use_tor_mask` without an address, malformed addresses), `INTERNAL`.
+
+#### Client database (`WRITE_DB`/`READ_DB`/`DELETE_DB`)
+
+The client's own data (drafts, layout, settings, caches — anything the
+UI wants to survive restarts) lives **inside the encrypted log** under a
+tag namespace owned by the client. Records carry a core timestamp and are
+returned oldest-first. `tag = 0xFF` is the read wildcard (rejected by
+`WRITE_DB` with `BAD_ARGS`); `rec_id` is the log record number returned by
+`WRITE_DB` and accepted by the idempotent `DELETE_DB` (a log tombstone;
+storage is reclaimed at compaction).
+
+Limits: one record's data ≤ 65000 bytes (`TOO_BIG`); the live client area
+is capped at 16 MiB total (`TOO_BIG`); `READ_DB` limit 0 → 50, ≤ 200.
+
+#### Device sync (`device_sync`)
+
+A *device link* is a contact whose bundle equals your own: two installs
+that share the same identity seed (e.g. a phone and a laptop), paired with
+a regular invite code (`ACCEPT_INVITE` — exactly one link per bundle:
+`TOO_BIG` for a second). With `device_sync` on, the core replicates
+records (messages, reactions, acks, contacts, blocks, files, config, and
+client-DB records up to the sync record size) to the linked device over
+the session, in bounded queues with retry semantics like the outbox;
+duplicates are dropped by record MACs/ids. Client-DB records replicate
+with their data; **deletion does not** (`DELETE_DB` is local — a client
+protocol may express deletions as its own records). Avatars and pinned
+state are not synced in v1. The link itself: the invite holder always
+initiates, so exactly one side redials.
+
 ## 5. Events (EVENT)
 
 Broadcast to all connected clients, in any order, `request_id = 0`.
@@ -340,6 +434,8 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
 | `BLOCKED_BY_PEER` | 10 | `[cid u32]` |
 | `FILE_SENT` | 11 | `[cid u32][file_id 16][size u32][name str16]` |
 | `CONTACT_CARD` | 12 | `[cid u32][name str16][bundle 64][addr str16]` |
+| `REPLY_RECEIVED` | 13 | `[cid u32][msg_id 16][reply_to 16][ts_ms u64][name str16][body str16][entity tail]` |
+| `CONFIG_CHANGED` | 14 | config blob (§4.9: `[ver u8][flags u32][server_addr str16][tor_addr str16]`) |
 
 - `MESSAGE_RECEIVED.ts_ms` = local receive time, consistent with GET_HISTORY
   timestamps. The `msg_id` is what reactions address.
@@ -353,6 +449,9 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
   (SEND_CONTACT). The cid is the sender's; `addr` is empty when unknown.
   A card introduces, it does not connect — adding the person requires
   their own invite.
+- `CONFIG_CHANGED`: the configuration changed — locally (`SET_CONFIG`)
+  or applied from a linked device (device sync). The payload is the new
+  blob (§4.9); re-read state that depends on the flags.
 
 ## 6. Limits (canonical table)
 
@@ -373,6 +472,10 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
 | message dedup window | 64 msg_ids per contact |
 | pinned chats | 1 per daemon |
 | pinned messages | 16 per chat |
+| config address fields | 64 bytes each (`host:port`) |
+| client DB: one record's data | 65000 bytes |
+| client DB: live area total | 16 MiB |
+| device sync queue | 512 records / 2 MiB per device; batch ≤ 64 records / 16000 bytes; one record ≤ 4034 bytes |
 | contact card name / address | 32 / 64 bytes |
 | presence | PING after 4 s idle; 5 s interval; 3 misses → offline |
 | direct TCP port range | 7777–7786 (first free wins; all busy → LAN discovery off) |
@@ -431,6 +534,15 @@ IP hiding: A runs `shopot relay host:port` anywhere and issues
 A writes to offline B → `queued=1` → B starts the daemon → the core delivers
 → A: `MESSAGE_DELIVERED`.
 
+### Second device (phone + laptop)
+```
+both:   one identity — copy ~/.shopot/zig-seed between installs (out of band)
+phone:  CREATE_INVITE{}                        → code
+laptop: ACCEPT_INVITE{code}                    → cid (device link)
+both:   SET_CONFIG{device_sync=1}              → history/client DB replicate
+        records flow while the session is up; the link redials by itself
+```
+
 ## 10. Guarantees and boundaries
 
 - Cryptography: XX-like handshake, AEAD transport, double ratchet — see
@@ -442,8 +554,9 @@ A writes to offline B → `queued=1` → B starts the daemon → the core delive
   Everything is local to one OS user.
 - Call jitter buffer: frames play from a queue at an even pace (~40–60 ms
   latency); losses are concealed by skipping seq.
-- The wire is disguised as TLS 1.3 (fake-TLS). The peer sees your IP (P2P);
-  hiding it requires a relay.
+- The wire is disguised as TLS 1.3 (fake-TLS) by default; `use_fake_tls`
+  disables the disguise (both peers must match). The peer sees your IP
+  (P2P); hiding it requires a relay or Tor (`use_tor_mask`).
 - Socket and files belong to `$HOME`; running several daemons on one `$HOME`
   is unsupported (single UDS path).
 

@@ -8,6 +8,8 @@
 //! Раскладка кадров:
 //!   TEXT          0x10: msg_id: [16]u8, ts_ms: u64, body: u16 + байты (≤ 4096),
 //!                       ents: u8-счётчик + записи форматирования (см. TextEntity)
+//!   REPLY_TEXT    0x11: msg_id: [16]u8, ts_ms: u64, reply_to: [16]u8,
+//!                       body: u16 + байты, ents: u8-счётчик + записи
 //!   ACK           0x15: msg_id: [16]u8
 //!   REACT         0x13: msg_id: [16]u8, op: u8, code: u32 (unicode code point)
 //!   BLOCK_NOTICE  0x14: reason: u8
@@ -33,6 +35,8 @@ const codec = @import("codec.zig");
 pub const Tag = enum(u8) {
     /// Текстовое сообщение.
     text = 0x10,
+    /// Ответ на текстовое сообщение.
+    reply_text = 0x11,
     /// Реакция на сообщение.
     react = 0x13,
     /// Уведомление о блокировке.
@@ -66,6 +70,14 @@ pub const Tag = enum(u8) {
     avatar_ack = 0x51,
     /// AVATAR_REQ: просьба переслать аватар с этим id.
     avatar_req = 0x52,
+    /// SYNC: партия записей БД для репликации на устройство того же
+    /// пользователя (device_sync). Каждая запись аутентифицируется
+    /// HMAC-SHA256 над ключом синхронизации (выводится из сида личности);
+    /// чужая сторона подделать записи не может — неизвестные теги на
+    /// приёме отбрасываются, как у CONTACT_CARD.
+    sync = 0x45,
+    /// SYNC_ACK: партия применена (или осознанно пропущена) получателем.
+    sync_ack = 0x46,
     file_meta = 0x60,
     file_data = 0x61,
     /// FILE_ACK: сколько чанков файла уже принято (докачка с этой позиции).
@@ -113,6 +125,15 @@ pub const max_file_name = 64;
 pub const max_card_name = 32;
 /// Максимум длины адреса в CONTACT_CARD (host:port).
 pub const max_card_addr = 64;
+/// Максимум записей в одной партии SYNC.
+pub const max_sync_recs = 64;
+/// Максимум данных одной записи SYNC (payload записи БД).
+pub const max_sync_rec_data = 4096;
+/// Длина HMAC-SHA256 записи SYNC.
+pub const sync_mac_len = 32;
+/// Максимум хвоста записей SYNC (влезает в один кадр с запасом до
+/// max_encoded_len).
+pub const max_sync_tail = 16000;
 
 /// Максимальная длина закодированного кадра (AVATAR с телом 16000).
 pub const max_encoded_len = 1 + id_len + 4 + 2 + max_file_chunk;
@@ -248,6 +269,52 @@ pub fn parseEntities(bytes: []const u8, body_len: usize, out: ?[]TextEntity) Ent
     return count;
 }
 
+/// Одна запись SYNC-партии (срезы указывают во входной буфер).
+pub const SyncRecView = struct {
+    /// Семантика записи — enum u8 модуля app/sync.zig; конверт проверяет
+    /// только структуру, а не значение.
+    kind: u8,
+    /// HMAC-SHA256(sync_key, kind || data).
+    mac: [sync_mac_len]u8,
+    /// Payload записи (переведённый формат лога: cid → bundle).
+    data: []const u8,
+};
+
+/// Ошибки разбора хвоста SYNC.
+pub const SyncRecsError = error{
+    /// Хвост обрезан.
+    Truncated,
+    /// Лишние байты после последней записи.
+    BadLen,
+    /// count > max_sync_recs или data записи > max_sync_rec_data.
+    TooBig,
+};
+
+/// Разобрать и провалидировать хвост SYNC: ровно `count` записей
+/// {[kind u8][mac 32][len u16][data]} с полным потреблением байтов.
+/// Заполняет `out` (если задан); возвращает разобранное число записей.
+pub fn parseSyncRecs(bytes: []const u8, count: usize, out: ?[]SyncRecView) SyncRecsError!usize {
+    if (count > max_sync_recs) return error.TooBig;
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (bytes.len - pos < 1 + sync_mac_len + 2) return error.Truncated;
+        const kind = bytes[pos];
+        var mac: [sync_mac_len]u8 = undefined;
+        @memcpy(&mac, bytes[pos + 1 ..][0..sync_mac_len]);
+        pos += 1 + sync_mac_len;
+        const len = std.mem.readInt(u16, bytes[pos..][0..2], .little);
+        pos += 2;
+        if (len > max_sync_rec_data) return error.TooBig;
+        if (bytes.len - pos < len) return error.Truncated;
+        const data = bytes[pos .. pos + len];
+        pos += len;
+        if (out) |o| o[i] = .{ .kind = kind, .mac = mac, .data = data };
+    }
+    if (pos != bytes.len) return error.BadLen;
+    return count;
+}
+
 /// TEXT (0x10): текстовое сообщение.
 pub const Text = struct {
     /// Идентификатор сообщения.
@@ -261,6 +328,20 @@ pub const Text = struct {
     /// encodeEntitiesTail (encode валидирует его перед отправкой); пустой
     /// срез = форматирования нет (на проводе всё равно уйдёт байт счётчика
     /// ноль). У получателя — срез входного буфера, уже провалидирован decode.
+    ents_tail: []const u8 = &.{},
+};
+
+/// REPLY_TEXT (0x11): ответ на существующее сообщение.
+pub const ReplyText = struct {
+    /// Идентификатор нового сообщения.
+    msg_id: [id_len]u8,
+    /// Метка времени отправителя, мс.
+    ts_ms: u64,
+    /// Идентификатор сообщения, на которое отвечают.
+    reply_to: [id_len]u8,
+    /// Тело ответа, ≤ 4096 байтов.
+    body: []const u8,
+    /// Канонический хвост entities; пустой срез кодируется счётчиком 0.
     ents_tail: []const u8 = &.{},
 };
 
@@ -382,6 +463,28 @@ pub const ContactCard = struct {
     addr: []const u8,
 };
 
+/// SYNC (0x45): партия записей БД устройства-близнеца (device_sync).
+/// Хвост записей: count × {[kind u8][mac 32][len u16][data]}; mac =
+/// HMAC-SHA256(sync_key, kind || record) — проверяет получатель, сверяя
+/// перевод cid → bundle у записей с контактами (см. app/sync.zig).
+/// Отправитель строит хвост готовым (wire-формат записей лога), приём
+/// валидирует структуру decode'ом, семантику — parseSyncRecs.
+pub const Sync = struct {
+    /// Идентификатор парии: уникален в рамках отправителя; SYNC_ACK
+    /// возвращает его же.
+    batch_id: u32,
+    /// Число записей в хвосте, ≤ max_sync_recs.
+    count: u8,
+    /// Хвост записей (готовые байты, ≤ max_sync_tail); срез входного буфера
+    /// после decode / буфера вызывающего до encode.
+    recs: []const u8,
+};
+
+/// SYNC_ACK (0x46): партия batch_id применена получателем.
+pub const SyncAck = struct {
+    batch_id: u32,
+};
+
 /// RATCHET_KEY (0x44): PCS-ротация рэтчета. Отправитель сгенерировал свежую
 /// X25519-пару для следующей эпохи и предъявляет публичную часть; получив
 /// паблики ОБЕИХ сторон, каждая выполняет dhStep (свежий секрет свой,
@@ -423,6 +526,8 @@ pub const Join = struct {
 pub const Envelope = union(enum) {
     /// TEXT (0x10).
     text: Text,
+    /// REPLY_TEXT (0x11).
+    reply_text: ReplyText,
     /// REACT (0x13).
     react: React,
     /// BLOCK_NOTICE (0x14).
@@ -445,6 +550,10 @@ pub const Envelope = union(enum) {
     contact_card: ContactCard,
     /// RATCHET_KEY (0x44).
     ratchet_key: RatchetKey,
+    /// SYNC (0x45).
+    sync: Sync,
+    /// SYNC_ACK (0x46).
+    sync_ack: SyncAck,
     /// AVATAR (0x50).
     avatar: Avatar,
     /// AVATAR_ACK (0x51).
@@ -465,6 +574,7 @@ pub const EncodeError = codec.Writer.Error || error{ TooBig, BadEntities };
 pub fn encodedLen(e: Envelope) usize {
     return switch (e) {
         .text => |m| 1 + id_len + 8 + 2 + m.body.len + tailLen(m.ents_tail),
+        .reply_text => |m| 1 + id_len + 8 + id_len + 2 + m.body.len + tailLen(m.ents_tail),
         .react, .call_signal => 1 + id_len + 1,
         .block_notice => 2,
         .ack => 1 + id_len,
@@ -474,6 +584,8 @@ pub fn encodedLen(e: Envelope) usize {
         .profile => |m| 1 + 1 + m.name.len + id_len,
         .contact_card => |m| 1 + 1 + m.name.len + 64 + 2 + m.addr.len,
         .ratchet_key => 1 + 2 + 32,
+        .sync => |m| 1 + 4 + 1 + m.recs.len,
+        .sync_ack => 1 + 4,
         .avatar => |m| 1 + id_len + 2 + m.data.len,
         .file_meta => |m| 1 + id_len + 1 + m.name.len + 4 + 32,
         .file_data => |m| 1 + id_len + 4 + 2 + m.data.len,
@@ -501,6 +613,20 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
             try w.putBytes(m.body);
             // хвост форматирования: пусто -> счётчик 0; иначе валидация
             // (границы/сортировка/правила value) и дословная запись
+            if (m.ents_tail.len == 0) {
+                try w.put(0);
+            } else {
+                _ = parseEntities(m.ents_tail, m.body.len, null) catch return error.BadEntities;
+                try w.putFixed(m.ents_tail);
+            }
+        },
+        .reply_text => |m| {
+            if (m.body.len > max_text_body) return error.TooBig;
+            try w.put(@backingInt(Tag.reply_text));
+            try w.putFixed(&m.msg_id);
+            try w.putInt(u64, m.ts_ms);
+            try w.putFixed(&m.reply_to);
+            try w.putBytes(m.body);
             if (m.ents_tail.len == 0) {
                 try w.put(0);
             } else {
@@ -572,6 +698,21 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
             try w.put(@backingInt(Tag.ratchet_key));
             try w.putInt(u16, m.epoch);
             try w.putFixed(&m.dh_pub);
+        },
+        .sync => |m| {
+            if (m.recs.len > max_sync_tail) return error.TooBig;
+            if (m.count > max_sync_recs) return error.TooBig;
+            // хвост обязан распарсиваться ровно на count записей: битый
+            // хвост на провод не уходит
+            _ = parseSyncRecs(m.recs, m.count, null) catch return error.TooBig;
+            try w.put(@backingInt(Tag.sync));
+            try w.putInt(u32, m.batch_id);
+            try w.put(m.count);
+            try w.putFixed(m.recs);
+        },
+        .sync_ack => |m| {
+            try w.put(@backingInt(Tag.sync_ack));
+            try w.putInt(u32, m.batch_id);
         },
         .avatar => |m| {
             if (m.data.len > max_avatar_data) return error.TooBig;
@@ -648,6 +789,26 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
                 .ents_tail = tail,
             } };
         },
+        @backingInt(Tag.reply_text) => blk: {
+            const msg_id = try readId(&r);
+            const ts_ms = try r.getInt(u64);
+            const reply_to = try readId(&r);
+            const body = try r.getBytes();
+            if (body.len > max_text_body) return error.BadLen;
+            const tail = r.buf[r.pos..];
+            _ = parseEntities(tail, body.len, null) catch |e| switch (e) {
+                error.Truncated => return error.Truncated,
+                else => return error.BadLen,
+            };
+            r.pos = r.buf.len;
+            break :blk .{ .reply_text = .{
+                .msg_id = msg_id,
+                .ts_ms = ts_ms,
+                .reply_to = reply_to,
+                .body = body,
+                .ents_tail = tail,
+            } };
+        },
         @backingInt(Tag.react) => .{ .react = .{
             .msg_id = try readId(&r),
             .op = try r.getU8(),
@@ -716,6 +877,24 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
         @backingInt(Tag.ratchet_key) => .{ .ratchet_key = .{
             .epoch = try r.getInt(u16),
             .dh_pub = (try r.getFixed(32))[0..32].*,
+        } },
+        @backingInt(Tag.sync) => blk: {
+            const batch_id = try r.getInt(u32);
+            const count = try r.getU8();
+            if (count > max_sync_recs) return error.BadLen;
+            const recs = r.buf[r.pos..];
+            if (recs.len > max_sync_tail) return error.BadLen;
+            // структура записей проверяется здесь; семантику (mac, kind)
+            // проверяет приложение через parseSyncRecs
+            _ = parseSyncRecs(recs, count, null) catch |e| switch (e) {
+                error.Truncated => return error.Truncated,
+                else => return error.BadLen,
+            };
+            r.pos = r.buf.len;
+            break :blk .{ .sync = .{ .batch_id = batch_id, .count = count, .recs = recs } };
+        },
+        @backingInt(Tag.sync_ack) => .{ .sync_ack = .{
+            .batch_id = try r.getInt(u32),
         } },
         @backingInt(Tag.avatar) => .{ .avatar = .{
             .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
@@ -989,6 +1168,54 @@ test "REACT: roundtrip" {
     try testing.expectEqual(react_remove, back_rm.react.op);
 }
 
+test "REPLY_TEXT: roundtrip" {
+    var buf: [max_encoded_len]u8 = undefined;
+    const src: Envelope = .{ .reply_text = .{
+        .msg_id = filled(id_len, 1),
+        .ts_ms = 1_700_000_000_123,
+        .reply_to = filled(id_len, 2),
+        .body = "reply",
+    } };
+    const wire = try encode(&buf, src);
+    try testing.expectEqual(1 + id_len + 8 + id_len + 2 + 5 + 1, wire.len);
+    const back = try decode(wire);
+    try testing.expectEqualSlices(u8, &src.reply_text.msg_id, &back.reply_text.msg_id);
+    try testing.expectEqual(src.reply_text.ts_ms, back.reply_text.ts_ms);
+    try testing.expectEqualSlices(u8, &src.reply_text.reply_to, &back.reply_text.reply_to);
+    try testing.expectEqualStrings(src.reply_text.body, back.reply_text.body);
+    // пустой хвост — один нулевой байт счётчика
+    try testing.expectEqual(@as(usize, 1), back.reply_text.ents_tail.len);
+    try testing.expectEqual(@as(u8, 0), back.reply_text.ents_tail[0]);
+}
+
+test "decode: REPLY_TEXT entities и oversize body" {
+    var buf: [max_encoded_len]u8 = undefined;
+    const tail = [_]u8{ 1, 1, 0, 0, 2, 0, 0 };
+    const src: Envelope = .{ .reply_text = .{
+        .msg_id = filled(id_len, 0),
+        .ts_ms = 0,
+        .reply_to = filled(id_len, 9),
+        .body = "abcd",
+        .ents_tail = &tail,
+    } };
+    const wire = try encode(&buf, src);
+    const back = try decode(wire);
+    try testing.expectEqualSlices(u8, &src.reply_text.reply_to, &back.reply_text.reply_to);
+    var out: [4]TextEntity = undefined;
+    try testing.expectEqual(@as(usize, 1), try parseEntities(back.reply_text.ents_tail, 4, &out));
+    try testing.expectEqual(@as(u8, 1), @backingInt(out[0].kind));
+    // тело > 4096 → BadLen
+    var big_body: [max_text_body + 1]u8 = undefined;
+    @memset(&big_body, 'x');
+    const too_big: Envelope = .{ .reply_text = .{
+        .msg_id = filled(id_len, 0),
+        .ts_ms = 0,
+        .reply_to = filled(id_len, 0),
+        .body = &big_body,
+    } };
+    try testing.expectError(error.TooBig, encode(&buf, too_big));
+}
+
 test "BLOCK_NOTICE: roundtrip" {
     var buf: [8]u8 = undefined;
     const wire = try encode(&buf, .{ .block_notice = .{ .reason = 5 } });
@@ -1061,6 +1288,7 @@ test "decode: любой обрезанный кадр -> Truncated" {
         .{ .presence_pong = .{ .seq = 1, .ts_peer_ms = 1 } },
         .{ .call_signal = .{ .op = call_offer, .call_id = filled(id_len, 2) } },
         .{ .call_audio = .{ .seq = 1, .data = "abc" } },
+        .{ .reply_text = .{ .msg_id = filled(id_len, 1), .ts_ms = 1, .reply_to = filled(id_len, 2), .body = "abc" } },
     };
     for (cases) |case| {
         const wire = try encode(&buf, case);
@@ -1271,4 +1499,99 @@ test "envelope: FILE_META/FILE_DATA roundtrip" {
     @memset(&long_name, 'x');
     const bad: Envelope = .{ .file_meta = .{ .file_id = fid, .name = &long_name, .size = 1, .sha = sha } };
     try testing.expectError(error.TooBig, encode(&buf, bad));
+}
+
+// ------------------------------------------------------------------ SYNC
+
+/// Тестовый хвост SYNC-партии: две записи
+/// ([kind][mac 32][len 2][data] × 2, data = "abc" и ∅).
+fn sampleSyncTail() [73]u8 {
+    var tail: [73]u8 = @splat(0);
+    tail[0] = 7; // kind
+    @memset(tail[1..33][0..sync_mac_len], 0xA5);
+    std.mem.writeInt(u16, tail[33..35], 3, .little);
+    tail[35] = 'a';
+    tail[36] = 'b';
+    tail[37] = 'c';
+    const off = 38; // начало второй записи
+    tail[off + 0] = 8; // kind
+    @memset(tail[off + 1 ..][0..sync_mac_len], 0x3C);
+    // len 0, данных нет
+    return tail;
+}
+
+test "SYNC: roundtrip и раскладка" {
+    const tail = sampleSyncTail();
+    const m: Envelope = .{ .sync = .{
+        .batch_id = 0xDEADBEEF,
+        .count = 2,
+        .recs = &tail,
+    } };
+    var buf: [max_encoded_len]u8 = undefined;
+    const enc = try encode(&buf, m);
+    try testing.expectEqual(@as(usize, 1 + 4 + 1 + tail.len), enc.len);
+    try testing.expectEqual(0x45, enc[0]);
+    try testing.expectEqualSlices(u8, &.{ 0xEF, 0xBE, 0xAD, 0xDE }, enc[1..5]);
+    try testing.expectEqual(@as(u8, 2), enc[5]);
+
+    const back = try decode(enc);
+    try testing.expectEqual(@as(u32, 0xDEADBEEF), back.sync.batch_id);
+    try testing.expectEqual(@as(u8, 2), back.sync.count);
+    try testing.expectEqualSlices(u8, &tail, back.sync.recs);
+
+    var views: [max_sync_recs]SyncRecView = undefined;
+    try testing.expectEqual(@as(usize, 2), try parseSyncRecs(back.sync.recs, back.sync.count, &views));
+    try testing.expectEqual(@as(u8, 7), views[0].kind);
+    try testing.expectEqualStrings("abc", views[0].data);
+    try testing.expectEqual(@as(usize, 0), views[1].data.len);
+}
+
+test "SYNC: битая структура отбрасывается" {
+    const tail = sampleSyncTail();
+    var buf: [max_encoded_len]u8 = undefined;
+    // 1) хвост обрезан
+    {
+        const m: Envelope = .{ .sync = .{ .batch_id = 1, .count = 2, .recs = tail[0 .. tail.len - 1] } };
+        try testing.expectError(error.TooBig, encode(&buf, m));
+    }
+    // 2) count не совпадает с хвостом (записей меньше)
+    {
+        const m: Envelope = .{ .sync = .{ .batch_id = 1, .count = 3, .recs = &tail } };
+        try testing.expectError(error.TooBig, encode(&buf, m));
+    }
+    // 3) лишний хвост после партии: строгий encode отказывает (хвост
+    // обязан разбираться ровно на count записей — приемник не молчит,
+    // отправитель тоже)
+    {
+        var big: [tail.len + 1]u8 = undefined;
+        @memcpy(big[0..tail.len], &tail);
+        big[tail.len] = 0;
+        const m: Envelope = .{ .sync = .{ .batch_id = 1, .count = 2, .recs = &big } };
+        try testing.expectError(error.TooBig, encode(&buf, m));
+    }
+    // 4) count > max_sync_recs
+    {
+        const m: Envelope = .{ .sync = .{ .batch_id = 1, .count = max_sync_recs + 1, .recs = &tail } };
+        try testing.expectError(error.TooBig, encode(&buf, m));
+    }
+}
+
+test "SYNC: payload записи больше max_sync_rec_data" {
+    var data: [max_sync_rec_data + 1]u8 = undefined;
+    @memset(&data, 1);
+    var tail: [1 + sync_mac_len + 2 + max_sync_rec_data + 1]u8 = @splat(0);
+    std.mem.writeInt(u16, tail[33..35], data.len, .little);
+    @memcpy(tail[35..], &data);
+    const m: Envelope = .{ .sync = .{ .batch_id = 1, .count = 1, .recs = &tail } };
+    var buf: [max_encoded_len]u8 = undefined;
+    try testing.expectError(error.TooBig, encode(&buf, m));
+}
+
+test "SYNC_ACK: roundtrip" {
+    const m: Envelope = .{ .sync_ack = .{ .batch_id = 42 } };
+    var buf: [16]u8 = undefined;
+    const enc = try encode(&buf, m);
+    try testing.expectEqualSlices(u8, &.{ 0x46, 42, 0, 0, 0 }, enc);
+    const back = try decode(enc);
+    try testing.expectEqual(@as(u32, 42), back.sync_ack.batch_id);
 }

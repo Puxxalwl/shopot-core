@@ -23,10 +23,18 @@ pub const net = struct {
     pub const obfuscate = @import("shopot/net/obfuscate.zig");
     pub const heartbeat = @import("shopot/net/heartbeat.zig");
     pub const tcp = @import("shopot/net/tcp.zig");
+    pub const socks5 = @import("shopot/net/socks5.zig");
 };
 
 pub const store = struct {
     pub const log = @import("shopot/store/log.zig");
+};
+
+/// Прикладной слой (демон): синхронизация устройств и конфигурация —
+/// части контракта wire, доступные интеграционным тестам.
+pub const app = struct {
+    pub const sync = @import("shopot/app/sync.zig");
+    pub const config = @import("shopot/app/config.zig");
 };
 
 test {

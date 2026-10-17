@@ -26,12 +26,14 @@ pub const header_len = 16;
 /// и событии MESSAGE_RECEIVED (хвост после body, см. CORE-API.md).
 /// 2.1.0: SEARCH_MESSAGE (23) и GLOBAL_SEARCH_MESSAGE (24) — поиск по
 /// истории (регистронезависимый, точные + нечёткие совпадения).
-/// 2.2.0: закрепления и удаление чатов (PIN_CHAT/GET_PINNED_CHAT/UNPIN_CHAT/
-/// DELETE_CHAT/PIN_MESSAGE/UNPIN_MESSAGE/GET_PINNED_MESSAGES), пересылка
-/// визитки (SEND_CONTACT + событие CONTACT_CARD); bit1 delivered в истории
+/// 2.2.0: закрепления и удаление чатов, визитки; bit1 delivered в истории
 /// теперь ставится только ACK-ом; GET_HISTORY/GET_MESSAGE/SEARCH читают
 /// кэш истории в памяти.
-pub const api_version = [3]u16{ 2, 2, 0 };
+/// 2.3.0: SEND_REPLY_MESSAGE и GET_REACTIONS.
+/// 2.4.0: конфигурация ядра (GET_CONFIG/SET_CONFIG, событие
+/// CONFIG_CHANGED) и прямой доступ клиента к БД (WRITE_DB/READ_DB/
+/// DELETE_DB).
+pub const api_version = [3]u16{ 2, 4, 0 };
 
 /// Тип кадра.
 pub const Kind = enum(u8) {
@@ -113,6 +115,29 @@ pub const Method = enum(u16) {
     /// Закреплённые сообщения чата: [cid u32] → [count u32] × {[msg_id 16]}
     /// в порядке закрепления.
     GET_PINNED_MESSAGES = 32,
+    /// Ответить на сообщение: [cid][reply_to_msg_hex str16][body][entities].
+    SEND_REPLY_MESSAGE = 33,
+    /// Получить активные реакции: [msg_id 16] → максимум 3 записи.
+    GET_REACTIONS = 34,
+    /// Конфигурация ядра: ∅ → [ver u8][flags u32][server_addr str16]
+    /// [tor_addr str16] (формат — app/config.zig).
+    GET_CONFIG = 35,
+    /// Записать конфигурацию: [ver u8][flags u32][server_addr str16]
+    /// [tor_addr str16] → ∅. Проверяется семантика (server_mode требует
+    /// адрес и т.п.); удачная запись рассылает CONFIG_CHANGED.
+    SET_CONFIG = 36,
+    /// Дописать клиентскую запись в шифрованную БД:
+    /// [tag u8][data str32 ≤ 65000] → [rec_id u32][ts_ms u64].
+    /// rec_id — номер записи лога (для DELETE_DB); при включённой
+    /// device_sync запись реплицируется на связанные устройства.
+    WRITE_DB = 37,
+    /// Читать клиентские записи: [tag u8 (0xFF = все)][limit u32 (0 → 50,
+    /// ≤ 200)][offset u32] → [total u32][count u32] × {[rec_id u32][ts_ms u64]
+    /// [tag u8][data str16]} — старые → новые.
+    READ_DB = 38,
+    /// Удалить клиентскую запись: [rec_id u32] → ∅. Идемпотентно (tombstone
+    /// лога); память освобождается при компакции.
+    DELETE_DB = 39,
 };
 
 /// Коды статуса ответа (u16 на проводе, имена SCREAMING_SNAKE — контракт;
@@ -152,6 +177,8 @@ pub const Status = enum(u16) {
     NO_RELAY = 15,
     /// Транспорт не поднялся (dial/рукопожатие).
     TRANSPORT_FAILED = 16,
+    /// Tor SOCKS5-прокси недоступен (use_tor_mask включён).
+    TOR_UNAVAILABLE = 17,
     /// Внутренняя ошибка ядра.
     INTERNAL = 255,
 };
@@ -186,6 +213,12 @@ pub const Event = enum(u16) {
     /// [cid u32 (кто прислал)][name str16][bundle 64][addr str16
     /// (пусто = неизвестен)].
     CONTACT_CARD = 12,
+    /// Ответ на сообщение: [cid][msg_id][reply_to][ts][name][body][entities].
+    REPLY_RECEIVED = 13,
+    /// Конфигурация ядра изменилась (SET_CONFIG, в т.ч. применённая с
+    /// другого устройства через device_sync): payload — новый blob
+    /// [ver u8][flags u32][server_addr str16][tor_addr str16].
+    CONFIG_CHANGED = 14,
 };
 
 /// Состояние звонка для события CALL_STATE.
@@ -403,8 +436,18 @@ test "method ids стабильны (контракт провода)" {
     try std.testing.expectEqual(@as(u16, 30), @backingInt(Method.PIN_MESSAGE));
     try std.testing.expectEqual(@as(u16, 31), @backingInt(Method.UNPIN_MESSAGE));
     try std.testing.expectEqual(@as(u16, 32), @backingInt(Method.GET_PINNED_MESSAGES));
+    try std.testing.expectEqual(@as(u16, 33), @backingInt(Method.SEND_REPLY_MESSAGE));
+    try std.testing.expectEqual(@as(u16, 34), @backingInt(Method.GET_REACTIONS));
+    // конфигурация и клиентская БД — 2.4.0
+    try std.testing.expectEqual(@as(u16, 35), @backingInt(Method.GET_CONFIG));
+    try std.testing.expectEqual(@as(u16, 36), @backingInt(Method.SET_CONFIG));
+    try std.testing.expectEqual(@as(u16, 37), @backingInt(Method.WRITE_DB));
+    try std.testing.expectEqual(@as(u16, 38), @backingInt(Method.READ_DB));
+    try std.testing.expectEqual(@as(u16, 39), @backingInt(Method.DELETE_DB));
     // событие CONTACT_CARD — 2.2.0
     try std.testing.expectEqual(@as(u16, 12), @backingInt(Event.CONTACT_CARD));
+    // событие CONFIG_CHANGED — 2.4.0
+    try std.testing.expectEqual(@as(u16, 14), @backingInt(Event.CONFIG_CHANGED));
 }
 
 test "reader/writer round-trip" {

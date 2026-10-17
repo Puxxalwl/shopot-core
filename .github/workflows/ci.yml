@@ -1,0 +1,41 @@
+name: ci
+
+# Tests + release build on every branch push and PR.
+# Tag builds (zig-v*) stay in release-zig.yml.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-linux
+            zig_target: x86_64-linux-musl
+          - os: macos-14
+            target: aarch64-macos
+            zig_target: native
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig 0.17.0
+        run: |
+          curl -sL https://ziglang.org/download/0.17.0/zig-${{ matrix.target }}-0.17.0.tar.xz -o zig.tar.xz
+          tar xJf zig.tar.xz
+          echo "$PWD/zig-${{ matrix.target }}-0.17.0" >> $GITHUB_PATH
+      - name: Test
+        working-directory: zig
+        run: zig build test --summary all
+      - name: Build (ReleaseFast)
+        working-directory: zig
+        run: zig build -Doptimize=ReleaseFast -Dcpu=baseline -Dtarget=${{ matrix.zig_target }}
+      - name: Smoke test
+        working-directory: zig
+        run: ./zig-out/bin/shopot-zig 2>&1 | head -1
